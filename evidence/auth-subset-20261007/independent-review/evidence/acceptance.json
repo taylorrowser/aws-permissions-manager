@@ -1,0 +1,14 @@
+{
+  "decision": "ACCEPTED_NARROW_CODE_REVIEW_ONLY",
+  "source_fingerprint_sha256": "bc8f5165f33fcdd7ea5436c790ac3b2cb3bf65bdab2e45ac9b4ca14f77c2c29c",
+  "scoped_hashes_verified": 11,
+  "focused_tests_passed": 106,
+  "independent_adversarial_tests_passed": 9,
+  "skipped": 0,
+  "live_auth": "NOT_RUN",
+  "aws": "NOT_RUN",
+  "report": "/workspace/shared/workos-independent-review-20261007/REVIEW.md",
+  "evidence": "/workspace/shared/workos-independent-review-20261007/evidence/final-focused-tests.txt",
+  "separate_user_approval_required": true,
+  "nonblocking_caveat": "provider_refresh_attempted is adapter-call telemetry, not definitive HTTP dispatch proof"
+}

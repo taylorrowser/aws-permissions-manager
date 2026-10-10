@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Node
+node_modules/
+
+# Local databases (offline fixture server, session stores)
+*.sqlite3
+*.sqlite3-*
+
+# Secrets and credentials: never commit
+.env
+.env.*
+*.pem
+*.key
+credentials
+.aws/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

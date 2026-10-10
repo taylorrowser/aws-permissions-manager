@@ -1,0 +1,18 @@
+test_jwks_outage_after_refresh_is_not_terminal (__main__.ReviewAdversarial.test_jwks_outage_after_refresh_is_not_terminal) ... ERROR
+test_unexpected_rejection_indistinguishable_from_invalid_grant (__main__.ReviewAdversarial.test_unexpected_rejection_indistinguishable_from_invalid_grant) ... ok
+
+======================================================================
+ERROR: test_jwks_outage_after_refresh_is_not_terminal (__main__.ReviewAdversarial.test_jwks_outage_after_refresh_is_not_terminal)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/shared/workos-independent-review-20261007/adversarial.py", line 13, in test_jwks_outage_after_refresh_is_not_terminal
+    client.refresh(old.refresh_token)
+  File "/workspace/shared/workos-independent-review-20261007/initial/integration/workos.py", line 566, in refresh
+    raise WorkOSReconnectRequired() from None
+integration.workos.WorkOSReconnectRequired: WorkOS authentication ended or was rejected; sign in again
+
+----------------------------------------------------------------------
+Ran 2 tests in 2.926s
+
+FAILED (errors=1)
+REPRO: invalid_grant, HTTP 403 policy denial, malformed HTTP 200 are identical public refresh results

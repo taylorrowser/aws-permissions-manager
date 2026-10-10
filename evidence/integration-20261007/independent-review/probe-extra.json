@@ -1,0 +1,9 @@
+{
+  "execute": "exact approved temporary start missed; fresh human revision required",
+  "new_request": "role has an unresolved approved transition",
+  "revise": "role has an unresolved approved transition",
+  "pinned_mapping_arn_binding": {
+    "approved_arn": "arn:aws:iam::111122223333:role/broker-existing-ec2-7ca6cc48c0a4",
+    "issued_for_arn": "arn:aws:iam::111122223333:role/broker-unapproved-other-role"
+  }
+}

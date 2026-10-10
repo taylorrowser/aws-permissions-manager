@@ -1,0 +1,12 @@
+test_clear_memory_prevents_local_refresh_or_revocation_claim (__main__.IndependentChecks.test_clear_memory_prevents_local_refresh_or_revocation_claim) ... ok
+test_device_response_survives_jwks_outage_without_repolling_consumed_code (__main__.IndependentChecks.test_device_response_survives_jwks_outage_without_repolling_consumed_code) ... ok
+test_exact_invalid_grant_distinguished_from_policy_or_parse_failure (__main__.IndependentChecks.test_exact_invalid_grant_distinguished_from_policy_or_parse_failure) ... ok
+test_identity_rejection_never_becomes_provider_invalid_grant (__main__.IndependentChecks.test_identity_rejection_never_becomes_provider_invalid_grant) ... ok
+test_rotated_candidate_survives_jwks_outage_without_second_refresh (__main__.IndependentChecks.test_rotated_candidate_survives_jwks_outage_without_second_refresh) ... ok
+test_rotated_new_kid_waits_through_recent_successful_cache_cooldown (__main__.IndependentChecks.test_rotated_new_kid_waits_through_recent_successful_cache_cooldown) ... ok
+test_unknown_key_refresh_retains_fresh_good_key_then_stops_at_ttl (__main__.IndependentChecks.test_unknown_key_refresh_retains_fresh_good_key_then_stops_at_ttl) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.753s
+
+OK
