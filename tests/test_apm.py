@@ -58,6 +58,8 @@ class FakeIAM:
             raise Missing()
 
     def list_role_policies(self, RoleName):
+        if RoleName not in self.roles:
+            raise Missing()
         return {"PolicyNames": [p for r, p in self.policies if r == RoleName]}
 
     def delete_role(self, RoleName):
@@ -93,7 +95,7 @@ class FakeTable:
             raise NotImplementedError(ConditionExpression)
         self.items[Item["pk"]] = json.loads(json.dumps(Item))
 
-    def get_item(self, Key):
+    def get_item(self, Key, ConsistentRead=False):
         item = self.items.get(Key["pk"])
         return {"Item": json.loads(json.dumps(item))} if item else {}
 
@@ -130,7 +132,8 @@ class FakeTable:
 def make_app(http=None):
     settings = web.Settings("apm.test", "client_test", OWNER, "VAPIDPUB", "session-secret-for-tests")
     iam, sts = FakeIAM(), FakeSTS()
-    app = web.App(settings, Store(FakeTable()), Broker(ACCOUNT, "us-east-1", iam=iam, sts=sts), http=http)
+    store = Store(FakeTable())
+    app = web.App(settings, store, Broker(ACCOUNT, "us-east-1", iam=iam, sts=sts, marks=store), http=http)
     return app, iam, sts
 
 
@@ -220,6 +223,16 @@ class ProtectApmTests(unittest.TestCase):
         self.assertIn("route53:ChangeResourceRecordSets", sids["DenyApmDnsRecords"]["Action"])
         self.assertIn("AllowPassAgentRoles", sids)
 
+    def test_recursive_ssm_read_of_the_root_is_denied(self):
+        stmt = next(s for s in policy.boundary(ACCOUNT)["Statement"] if s["Sid"] == "DenyRecursiveReadOfRoot")
+        self.assertEqual(stmt["Action"], "ssm:GetParametersByPath")
+        for path_arn in [f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/", f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter"]:
+            self.assertTrue(any(fnmatch.fnmatchcase(path_arn, p) for p in stmt["Resource"]))
+        # /apm itself is covered by DenyApmInfrastructure; other paths stay readable.
+        self.assertTrue(self.denied(f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/apm"))
+        self.assertFalse(any(fnmatch.fnmatchcase(f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/myapp", p)
+                             for p in stmt["Resource"]))
+
     def test_boundary_fits_a_managed_policy(self):
         self.assertLess(len(json.dumps(policy.boundary(ACCOUNT), separators=(",", ":"))), 6144)
 
@@ -241,23 +254,87 @@ class LeaseTests(unittest.TestCase):
             self.assertNotEqual(s.t.items["lease#myapp"]["token"], "dead")
         self.assertNotIn("lease#myapp", s.t.items)
 
-    def test_broker_changes_hold_the_project_lease(self):
-        held = []
+    def test_every_grant_change_runs_under_the_project_lease(self):
+        app, iam, _ = make_app()
+        key = app.store.create_key("k")
+        held, real = [], app.store.lease
 
-        class Lease:
-            def __init__(self, project):
-                self.project = project
+        def lease(project, **kw):
+            held.append(project)
+            return real(project, **kw)
+        app.store.lease = lease
+        rid = app.store.add("myapp", ["s3:GetObject"], ["*"], "x", "k")
+        app.decide({"op": "approve", "id": str(rid), "digest": app.store.get(rid)["digest"]})
+        app.decide({"op": "revoke", "project": "myapp", "sid": f"Req{rid}"})
+        app.decide({"op": "remove_project", "project": "myapp"})
+        self.assertEqual(held, ["myapp"] * 3)
+        self.assertNotIn("lease#myapp", app.store.t.items)
 
-            def __enter__(self):
-                held.append(self.project)
 
-            def __exit__(self, *a):
-                held.append("released")
-        broker = Broker(ACCOUNT, "us-east-1", iam=FakeIAM(), sts=FakeSTS(), lease=Lease)
-        broker.approve({"id": 1, "project": "myapp", "actions": ["s3:GetObject"], "resources": ["*"]})
-        broker.revoke("myapp", "Req1")
-        broker.remove_project("myapp")
-        self.assertEqual(held, ["myapp", "released"] * 3)
+class GrantConsistencyTests(unittest.TestCase):
+    def setUp(self):
+        self.app, self.iam, _ = make_app()
+
+    def add(self, project="myapp"):
+        rid = self.app.store.add(project, ["s3:GetObject"], ["*"], "x", "k")
+        return self.app.store.get(rid)
+
+    def names(self):
+        return sorted(p for r, p in self.iam.policies if r == "apm-myapp")
+
+    def test_each_grant_is_its_own_policy(self):
+        r1, r2 = self.add(), self.add()
+        for r in (r1, r2):
+            self.app.decide({"op": "approve", "id": str(r["id"]), "digest": r["digest"]})
+        self.assertEqual(self.names(), ["apm-grants-Req1", "apm-grants-Req2"])
+        self.assertEqual([s["Sid"] for s in self.app.broker.grants("myapp")["Statement"]], ["Req1", "Req2"])
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
+        self.assertEqual(self.names(), ["apm-grants-Req2"])
+
+    def test_stale_iam_read_cannot_bring_back_a_revoked_grant(self):
+        r1, r2 = self.add(), self.add()
+        self.app.decide({"op": "approve", "id": str(r1["id"]), "digest": r1["digest"]})
+        stale = dict(self.iam.policies)
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
+        real_get, real_list = self.iam.get_role_policy, self.iam.list_role_policies
+        # IAM is eventually consistent: reads still show Req1.
+        self.iam.list_role_policies = lambda RoleName: {"PolicyNames": [p for r, p in stale if r == RoleName]}
+        self.iam.get_role_policy = lambda RoleName, PolicyName: {"PolicyDocument": stale[RoleName, PolicyName]}
+        self.app.decide({"op": "approve", "id": str(r2["id"]), "digest": r2["digest"]})
+        self.iam.get_role_policy, self.iam.list_role_policies = real_get, real_list
+        self.assertEqual(self.names(), ["apm-grants-Req2"])
+
+    def test_a_late_approval_sees_the_request_was_already_decided(self):
+        r = self.add()
+        self.app.decide({"op": "approve", "id": str(r["id"]), "digest": r["digest"]})
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
+        real_get = self.app.store.get
+        # An eventually consistent read still says pending; the consistent re-read under the lease doesn't.
+        self.app.store.get = lambda rid, consistent=False: {**real_get(rid), "status": "pending"} if not consistent else real_get(rid, True)
+        msg = self.app.decide({"op": "approve", "id": str(r["id"]), "digest": r["digest"]})
+        self.assertEqual(msg, "That request is no longer pending.")
+        self.assertEqual(self.names(), [])
+
+    def test_legacy_single_policy_is_split_once(self):
+        self.iam.roles["apm-myapp"] = {}
+        legacy = policy.doc(policy.statement(1, ["s3:GetObject"], ["*"]), policy.statement(2, ["s3:PutObject"], ["*"]))
+        self.iam.policies["apm-myapp", "apm-grants"] = legacy
+        self.app.broker.revoke("myapp", "Req1")
+        self.assertEqual(self.names(), ["apm-grants-Req2"])
+        self.assertTrue(self.app.store.is_marked("split#myapp"))
+        # A stale read of the deleted legacy policy is never split again.
+        self.iam.policies["apm-myapp", "apm-grants"] = legacy
+        self.app.broker.revoke("myapp", "Req2")
+        self.assertNotIn(("apm-myapp", "apm-grants-Req1"), self.iam.policies)
+
+    def test_inline_size_limit_counts_all_grant_policies(self):
+        from apm.broker import BrokerError
+        big = ["arn:aws:s3:::bucket-" + "x" * 60 + f"-{i}/*" for i in range(60)]
+        rid = self.app.store.add("myapp", ["s3:GetObject"], big, "x", "k")
+        self.app.broker.approve(self.app.store.get(rid))
+        rid = self.app.store.add("myapp", ["s3:PutObject"], big, "x", "k")
+        with self.assertRaises(BrokerError):
+            self.app.broker.approve(self.app.store.get(rid))
 
 
 class PushTests(unittest.TestCase):

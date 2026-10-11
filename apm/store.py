@@ -74,6 +74,14 @@ class Store:
                 if getattr(e, "response", {}).get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                     raise  # ours lapsed and someone else holds it now; leave theirs alone
 
+    # ---------- marks: one-way flags, read strongly consistent ----------
+
+    def is_marked(self, key):
+        return bool(self.t.get_item(Key={"pk": f"mark#{key}"}, ConsistentRead=True).get("Item"))
+
+    def mark(self, key):
+        self.t.put_item(Item={"pk": f"mark#{key}", "kind": "mark", "created_at": int(time.time())})
+
     # ---------- requests ----------
 
     def add(self, project, actions, resources, reason, requester=""):
@@ -86,8 +94,8 @@ class Store:
             "note": "", "created_at": int(time.time()), "decided_at": 0})
         return rid
 
-    def get(self, request_id):
-        item = self.t.get_item(Key={"pk": f"req#{int(request_id)}"}).get("Item")
+    def get(self, request_id, consistent=False):
+        item = self.t.get_item(Key={"pk": f"req#{int(request_id)}"}, ConsistentRead=consistent).get("Item")
         return _view(_plain(item)) if item else None
 
     def list(self, status=None, project=None):

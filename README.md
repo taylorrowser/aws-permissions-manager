@@ -13,7 +13,7 @@ you (phone/desktop web app, WorkOS sign-in) ── approve ───────
 agent ── aws --profile apm-<project> ── credential_process ──────▶ └─ STS: AssumeRole → 1-hour credentials
 ```
 
-- **One IAM role per project**: `apm-<project>` under path `/agents/`. Approved requests become statements in its inline policy `apm-grants`.
+- **One IAM role per project**: `apm-<project>` under path `/agents/`. Each approved request becomes its own inline policy, `apm-grants-Req<id>` (roles from before this change are split the first time they're edited).
 - **`apm-agent-boundary`**: a permissions boundary on every agent role. Even an approved grant can never give IAM writes, `sts:AssumeRole`, Organizations, account, SSO/identity or billing access. `iam:PassRole` is allowed only for other agent roles.
 - **`apm-broker` role (the Lambda)**: its permissions are limited to these:
   - create roles under `/agents/`, and only with the boundary attached;
@@ -93,7 +93,8 @@ The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `ap
 ## Security notes
 
 - Agents can never touch apm itself, whatever you approve. The boundary denies its SSM parameters (`/apm*`, including the session secret and push key), its Lambda, table, stack, `apm-*` buckets and logs, anything tagged `managed-by=apm`, and its DNS record. Without this, approving `ssm:GetParameter` or `lambda:UpdateFunctionCode` on `*` would let an agent forge your sign-in or replace the approval code. A boundary change takes effect only after a redeploy.
-- Approving, revoking and deleting a project hold a per-project lease in DynamoDB, so two Lambda instances can't overwrite each other's policy changes.
+- Each approve, reject, revoke or project deletion runs entirely under a per-project lease in DynamoDB and re-reads the request strongly consistent inside it, so concurrent Lambda instances can't interleave. Because every grant is its own policy, approving and revoking never rewrite other grants from a possibly stale IAM read.
+- `ssm:GetParametersByPath` on the root path `/` is denied too, since a recursive read of `/` would otherwise return `/apm/*`.
 - Approving `iam:PassRole` lets a project hand *another* agent role to a service. Approving `s3:*` on `*` means every bucket. Read the resources line; the dashboard flags wildcards.
 - Revoking removes the permission from the role immediately. Credentials already issued keep working until they expire (≤1 hour), but only with the role's *current* permissions.
 - An API key lets its holder use every approved project. Delete a leaked key in the dashboard. Keys are stored only as SHA-256 hashes.

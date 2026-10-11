@@ -76,6 +76,11 @@ def boundary(account):
         # IAM is excluded so agents can still read and pass agent roles, which carry the same tag.
         {"Sid": "DenyApmTaggedResources", "Effect": "Deny", "NotAction": "iam:*", "Resource": "*",
          "Condition": {"StringEquals": {"aws:ResourceTag/managed-by": "apm"}}},
+        # GetParametersByPath is authorized against the requested path, so reading "/" recursively
+        # would return /apm/* despite the deny above. Only the root (and an empty path) can
+        # contain /apm; paths like /myapp stay usable.
+        {"Sid": "DenyRecursiveReadOfRoot", "Effect": "Deny", "Action": "ssm:GetParametersByPath",
+         "Resource": [f"arn:aws:ssm:*:{account}:parameter/", f"arn:aws:ssm:*:{account}:parameter"]},
         {"Sid": "DenyApmDnsRecords", "Effect": "Deny", "Action": "route53:ChangeResourceRecordSets", "Resource": "*",
          "Condition": {"ForAnyValue:StringLike": {
              "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["apm.*", "*.apm.*"]}}},
@@ -147,6 +152,13 @@ def validate_request(project, actions, resources, reason):
 
 def sid(request_id):
     return f"Req{request_id}"
+
+
+def grant_policy_name(statement_sid):
+    """Each approved request is its own inline policy on the project role, so approving and
+    revoking are single writes, never a read-modify-write of a shared document (IAM reads are
+    eventually consistent, and a stale read would bring a revoked grant back)."""
+    return f"{GRANTS_POLICY}-{statement_sid}"
 
 
 def statement(request_id, actions, resources):
