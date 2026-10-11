@@ -58,8 +58,27 @@ function relativeTime(date, now) {
   return date.toLocaleDateString([], { month: "short", day: "numeric", year: date.getFullYear() === now.getFullYear() ? undefined : "numeric" }) + ` ${clock}`;
 }
 
+// If the server's push key changed, replace this device's subscription and register the new one
+// as replacing the old. A replacement the server doesn't accept is dropped (never kept), so the
+// link to the old endpoint, and any removal of it, can't be lost. Returns the current subscription.
+async function rotateIfKeyChanged(registration, key, register) {
+  let sub = await registration.pushManager.getSubscription();
+  if (sub && key && !sameKey(sub.options?.applicationServerKey, key)) {
+    const old = sub.endpoint;
+    await sub.unsubscribe();
+    sub = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(key) });
+    try {
+      await register(sub, old);
+    } catch (err) {
+      await sub.unsubscribe().catch(() => {});
+      throw err;
+    }
+  }
+  return sub;
+}
+
 if (typeof module !== "undefined") {
-  module.exports = { isIOS, pushState, deniedHelp, keyBytes, sameKey, legacyTarget, relativeTime };
+  module.exports = { isIOS, pushState, deniedHelp, keyBytes, sameKey, legacyTarget, relativeTime, rotateIfKeyChanged };
 }
 
 // ---------- page behaviour ----------
@@ -196,18 +215,10 @@ if (typeof document !== "undefined") {
     return device;
   }
 
-  // Keeps the server's copy current: re-adds a device the server lost, and moves to a new
-  // subscription if the server's push key was rotated.
-  async function currentSubscription(registration, key) {
-    let sub = await registration.pushManager.getSubscription();
-    if (sub && key && !sameKey(sub.options?.applicationServerKey, key)) {
-      const old = sub.endpoint;
-      await sub.unsubscribe();
-      sub = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(key) });
-      await save(sub, old, true);
-    }
-    return sub;
-  }
+  // Keeps the server's copy current: moves to a new subscription if the server's push key was
+  // rotated (see rotateIfKeyChanged).
+  const currentSubscription = (registration, key) =>
+    rotateIfKeyChanged(registration, key, (sub, old) => save(sub, old, true));
 
   function render(state, message) {
     if (!status) return;

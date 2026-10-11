@@ -371,12 +371,12 @@ class GrantConsistencyTests(unittest.TestCase):
         msg = self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
         self.assertTrue(msg.startswith("Error: recorded the revoke"))
         self.assertEqual(self.sids(), ["Req1", "Req2"])  # IAM still grants it...
-        page = self.app(web.Request("GET", "/", cookies=session_cookie(self.app))).body
+        page = self.app(web.Request("GET", "/projects", cookies=session_cookie(self.app))).body
         self.assertIn("match your decisions", page)  # ...and the dashboard says so
         del self.iam.put_role_policy
         self.app.decide({"op": "sync_project", "project": "myapp"})
         self.assertEqual(self.sids(), ["Req2"])
-        page = self.app(web.Request("GET", "/", cookies=session_cookie(self.app))).body
+        page = self.app(web.Request("GET", "/projects", cookies=session_cookie(self.app))).body
         self.assertNotIn("match your decisions", page)
 
     def test_remove_project_continues_past_a_stale_listing(self):

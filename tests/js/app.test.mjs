@@ -61,3 +61,25 @@ test("times read naturally", () => {
   assert.match(app.relativeTime(new Date(2026, 9, 11, 9, 5), now), /^today /);
   assert.match(app.relativeTime(new Date(2026, 9, 2, 9, 5), now), /Oct 2/);
 });
+
+test("a page-driven key rotation the server didn't accept is dropped, not kept", async () => {
+  const key = "BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const fresh = () => {
+    const log = [];
+    const old = { endpoint: "https://p/old", options: { applicationServerKey: new Uint8Array(65).fill(7).buffer }, unsubscribe: async () => log.push("old") };
+    const neu = { endpoint: "https://p/new", unsubscribe: async () => log.push("new") };
+    const registration = { pushManager: { getSubscription: async () => old, subscribe: async () => neu } };
+    return { log, registration };
+  };
+  for (const failure of [new Error("offline"), Object.assign(new Error("signed out"), { status: 401 }), Object.assign(new Error("boom"), { status: 500 })]) {
+    const { log, registration } = fresh();
+    await assert.rejects(app.rotateIfKeyChanged(registration, key, async () => { throw failure; }));
+    assert.deepEqual(log, ["old", "new"], failure.message);
+  }
+  const { log, registration } = fresh();
+  const seen = [];
+  const sub = await app.rotateIfKeyChanged(registration, key, async (s, old) => seen.push([s.endpoint, old]));
+  assert.equal(sub.endpoint, "https://p/new");
+  assert.deepEqual(seen, [["https://p/new", "https://p/old"]]);
+  assert.deepEqual(log, ["old"]);
+});

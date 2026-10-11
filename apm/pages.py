@@ -250,6 +250,11 @@ def projects_page(app, owner, msg=""):
         out.append('<div class=empty><p><b>No projects yet.</b></p><p class=muted>A project is created the first '
                    'time you approve a request for it.</p></div>')
     for project in projects:
+        if not broker.in_sync(project, store.approved(project)):
+            out.append(f'<div class="warn" role="alert"><p><b>{e(project)}: IAM doesn\'t match your decisions.</b> An IAM '
+                       'update failed or was interrupted, so the grants below may differ from what you approved or '
+                       'revoked.</p>' + _form({"op": "sync_project", "project": project}, "Re-apply decisions",
+                                              "primary", "", "/projects") + "</div>")
         grants = broker.grants(project)
         statements = grants["Statement"] if grants else []
         out.append(f'<article class=card id="project-{e(project)}"><div class=card-head><h2>{e(project)}</h2>'
