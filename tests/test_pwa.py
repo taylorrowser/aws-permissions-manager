@@ -380,7 +380,9 @@ class DeadlineTests(unittest.TestCase):
 @unittest.skipUnless(shutil.which("node"), "node is not installed")
 class ServiceWorkerTests(unittest.TestCase):
     def test_node_suite(self):
-        out = subprocess.run(["node", "--test", str(ROOT / "tests" / "js")], capture_output=True, text=True)
+        # Explicit files: older Node (e.g. 20 on GitHub runners) doesn't accept a directory here.
+        files = sorted(str(p) for p in (ROOT / "tests" / "js").glob("*.test.mjs"))
+        out = subprocess.run(["node", "--test", *files], capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stdout[-3000:] + out.stderr[-2000:])
 
 

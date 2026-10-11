@@ -119,7 +119,7 @@ The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `ap
 .venv/bin/python -m unittest discover -s tests
 ```
 
-These use fake IAM, STS and DynamoDB. They also run the plugin's MCP server and CLI with the system `python3` against the app served locally. If `node` is installed, they also run the service worker and page-script tests in `tests/js` (`node --test tests/js`).
+These use fake IAM, STS and DynamoDB. They also run the plugin's MCP server and CLI with the system `python3` against the app served locally. If `node` is installed, they also run the service worker and page-script tests in `tests/js` (`node --test tests/js/*.test.mjs`).
 
 To try the web app locally against the same fakes (no AWS or WorkOS), with seeded requests:
 
