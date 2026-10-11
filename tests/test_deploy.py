@@ -21,6 +21,22 @@ ACCOUNT = "654654478411"
 # single-stage deploy.py (commit bf98c18 on baseline/hosted-apm) before stages were added.
 PROD_ARGS = (ACCOUNT, "us-east-1", "apm.taylorrowser.com", "Z0EXAMPLE", "owner@example.com", "client_EXAMPLE",
              "VAPIDPUB", "apm-artifacts-654654478411-us-east-1", "lambda/0123456789abcdef.zip")
+# The only boundary statements prod gained since the fixture was captured (baseline commit 290bf35).
+PROD_BOUNDARY_DENIES = [
+    {"Sid": "DenyApmInfrastructure", "Effect": "Deny", "Action": "*", "Resource": [
+        f"arn:aws:ssm:*:{ACCOUNT}:parameter/apm*",
+        f"arn:aws:lambda:*:{ACCOUNT}:function:apm*",
+        f"arn:aws:dynamodb:*:{ACCOUNT}:table/apm*",
+        f"arn:aws:cloudformation:*:{ACCOUNT}:stack/apm*",
+        f"arn:aws:logs:*:{ACCOUNT}:log-group:/aws/lambda/apm*",
+        "arn:aws:s3:::apm-*",
+        "arn:aws:apigateway:*::/domainnames/*apm*"]},
+    {"Sid": "DenyApmTaggedResources", "Effect": "Deny", "NotAction": "iam:*", "Resource": "*",
+     "Condition": {"StringEquals": {"aws:ResourceTag/managed-by": "apm"}}},
+    {"Sid": "DenyApmDnsRecords", "Effect": "Deny", "Action": "route53:ChangeResourceRecordSets", "Resource": "*",
+     "Condition": {"ForAnyValue:StringLike": {
+         "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["apm.*", "*.apm.*"]}}},
+]
 NONPROD = ["dev", "pr-1", "pr-12", "pr-123"]
 # Prod project names chosen to collide with naive nonprod naming.
 TRICKY_PROJECTS = ["myapp", "dev", "dev-broker", "broker", "pr-1", "pr-12-app", "agents", "dev-agent-boundary"]
@@ -40,10 +56,28 @@ class ProdCompatibility(unittest.TestCase):
     def test_prod_template_matches_pre_stage_template(self):
         before = json.loads((ROOT / "tests/fixtures/prod_template_before_stages.json").read_text())
         expected = copy.deepcopy(before)
-        # The one intended change: the Lambda learns its stage (the PWA badge and policy.py read it).
+        # Intended change 1: the Lambda learns its stage (the PWA badge and policy.py read it).
         expected["Resources"]["Function"]["Properties"]["Environment"]["Variables"]["APM_STAGE"] = "prod"
+        # Intended change 2: the baseline security fix (290bf35) appended three Deny statements to the
+        # agent boundary. Spelled out literally so any other boundary drift fails this test.
+        expected["Resources"]["Boundary"]["Properties"]["PolicyDocument"]["Statement"] += PROD_BOUNDARY_DENIES
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS))), expected)
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS, stage="prod"))), expected)
+
+    def test_prod_resource_names_byte_identical(self):
+        before = json.loads((ROOT / "tests/fixtures/prod_template_before_stages.json").read_text())
+        after = json.loads(json.dumps(deploy.template(*PROD_ARGS)))
+        self.assertEqual(sorted(after["Resources"]), sorted(before["Resources"]))
+
+        def names(t):
+            out = {}
+            for logical, r in t["Resources"].items():
+                for k, v in r.get("Properties", {}).items():
+                    if k.endswith("Name") or k in ("Path", "DomainName", "Bucket"):
+                        out[(logical, k)] = json.dumps(v, sort_keys=True)
+            return out
+        self.assertEqual(names(after), names(before))
+        self.assertTrue(names(before))
 
     def test_prod_names_unchanged(self):
         n = policy.Names("prod")
