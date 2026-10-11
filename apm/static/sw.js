@@ -93,7 +93,9 @@ self.addEventListener("notificationclick", (event) => {
 });
 
 // The browser rotated or expired the subscription: subscribe again and tell the server, replacing
-// the old one. Needs a signed-in session; if there isn't one the page re-registers on next open.
+// the old one. If the server doesn't accept it (removed device, signed out, offline, error), drop
+// the new subscription. Keeping it would lose the link to the old endpoint, so a removed device
+// could re-register on the next page sync. The owner turns notifications on again instead.
 self.addEventListener("pushsubscriptionchange", (event) => {
   event.waitUntil((async () => {
     const old = event.oldSubscription;
@@ -104,7 +106,6 @@ self.addEventListener("pushsubscriptionchange", (event) => {
       method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ subscription: sub.toJSON(), label: self.navigator.userAgent, replaces: old?.endpoint || "", auto: true }),
     }).catch(() => null);
-    // 410: the owner removed this device. Drop the new subscription instead of keeping it.
-    if (resp?.status === 410) await sub.unsubscribe().catch(() => {});
+    if (!resp?.ok) await sub.unsubscribe().catch(() => {});
   })());
 });

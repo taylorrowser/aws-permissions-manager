@@ -185,10 +185,12 @@ test("a rotated subscription is re-registered, replacing the old one", async () 
   assert.equal(call.init.credentials, "same-origin");
 });
 
-test("a rotated subscription the owner removed is dropped, not kept", async () => {
-  const sw = load({ status: 410 });
-  await sw.fire("pushsubscriptionchange", { oldSubscription: { endpoint: "https://push.example/old", options: { applicationServerKey: new ArrayBuffer(65) } } });
-  assert.deepEqual(sw.unsubscribed, ["new"]);
+test("a rotated subscription the server didn't accept is dropped, not kept", async () => {
+  for (const options of [{ status: 410 }, { status: 401 }, { status: 500 }, { online: false }]) {
+    const sw = load(options);
+    await sw.fire("pushsubscriptionchange", { oldSubscription: { endpoint: "https://push.example/old", options: { applicationServerKey: new ArrayBuffer(65) } } });
+    assert.deepEqual(sw.unsubscribed, ["new"], JSON.stringify(options));
+  }
   const ok = load();
   await ok.fire("pushsubscriptionchange", { oldSubscription: { endpoint: "https://push.example/old", options: { applicationServerKey: new ArrayBuffer(65) } } });
   assert.deepEqual(ok.unsubscribed, []);
