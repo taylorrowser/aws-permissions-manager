@@ -564,6 +564,53 @@ class Workflows(unittest.TestCase):
                 self.assertTrue(gated, f"{name}:{job_id}")
 
 
+    def test_git_network_commands_never_rely_on_persisted_credentials(self):
+        problems = [p for name, w in self.wf.items() for job_id, job in w["jobs"].items()
+                    for p in git_auth_problems(job, f"{name}:{job_id}")]
+        self.assertEqual(problems, [])
+
+    def test_git_auth_checker_catches_the_unauthenticated_fetch(self):
+        checkout = {"uses": "actions/checkout@x", "with": {"persist-credentials": False}}
+        full = {"uses": "actions/checkout@x", "with": {"fetch-depth": 0, "persist-credentials": False}}
+        bad_fetch = {"run": "git fetch --no-tags origin main\ngit merge-base --is-ancestor \"$SHA\" origin/main"}
+        self.assertTrue(git_auth_problems({"steps": [checkout, bad_fetch]}, "j"))
+        self.assertTrue(git_auth_problems({"steps": [full, bad_fetch]}, "j"))  # the fetch itself still fails
+        self.assertTrue(git_auth_problems({"steps": [checkout, {"run": "git ls-remote origin"}]}, "j"))
+        self.assertTrue(git_auth_problems({"steps": [checkout, {"run": "git -C x push origin HEAD"}]}, "j"))
+        # origin/<branch> without a fetch needs the full-history checkout to exist at all.
+        self.assertTrue(git_auth_problems({"steps": [checkout, {"run": "git merge-base --is-ancestor a origin/main"}]}, "j"))
+        self.assertEqual(git_auth_problems({"steps": [full, {"run": "git merge-base --is-ancestor a origin/main"}]}, "j"), [])
+        authed = {"run": 'git -c http.extraheader="AUTHORIZATION: basic $B" fetch origin main', "env": {"GITHUB_TOKEN": "t"}}
+        self.assertEqual(git_auth_problems({"steps": [checkout, authed]}, "j"), [])
+        # With persisted credentials (the checkout default) a fetch is fine.
+        self.assertEqual(git_auth_problems({"steps": [{"uses": "actions/checkout@x"}, bad_fetch]}, "j"), [])
+
+
+GIT_NETWORK = re.compile(r"\bgit\b(?:\s+-[cC]\s+(?:\"[^\"]*\"|'[^']*'|\S+)|\s+--?[\w-]+(?:=\S+)?)*\s+"
+                         r"(fetch|pull|push|ls-remote|clone|remote\s+update)\b")
+
+
+def git_auth_problems(job, where):
+    """Network git commands in a job whose checkout dropped its credentials must authenticate
+    explicitly (http.extraheader), and origin/<branch> refs need a full-history checkout."""
+    problems, no_creds, full_history = [], False, False
+    for step in job.get("steps", []):
+        if "actions/checkout" in step.get("uses", ""):
+            w = step.get("with", {}) or {}
+            no_creds = no_creds or w.get("persist-credentials") is False
+            full_history = full_history or str(w.get("fetch-depth")) == "0"
+            continue
+        lines = step.get("run", "").splitlines()
+        fetches = any(GIT_NETWORK.search(line) for line in lines)
+        for line in lines:
+            label = f"{where}:{step.get('name')}: {line.strip()}"
+            if no_creds and GIT_NETWORK.search(line) and "http.extraheader" not in line.lower():
+                problems.append(f"unauthenticated git network command after persist-credentials: false: {label}")
+            if re.search(r"\borigin/[\w.-]+", line) and not (full_history or fetches):
+                problems.append(f"origin/<branch> used without a fetch-depth: 0 checkout: {label}")
+    return problems
+
+
 
 # ---------- review finding 4: GitHub API failures must not delete previews ----------
 

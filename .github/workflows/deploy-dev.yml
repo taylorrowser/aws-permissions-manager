@@ -74,6 +74,9 @@ jobs:
           fi
 
       # Deploy tooling from this main commit (reviewed), which is also the commit being deployed.
+      # fetch-depth: 0 makes checkout fetch every branch into refs/remotes/origin/*, so origin/main
+      # is present without a later `git fetch` (which would have no credentials: this is a private
+      # repo and the token is not persisted).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
@@ -82,7 +85,8 @@ jobs:
 
       - name: Commit must be on main
         run: |
-          git fetch --no-tags origin main
+          git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null || {
+            echo "::error::checkout did not fetch origin/main"; exit 1; }
           git merge-base --is-ancestor "$SHA" origin/main
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

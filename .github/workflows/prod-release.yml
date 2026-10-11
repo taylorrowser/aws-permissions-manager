@@ -130,8 +130,11 @@ jobs:
       - name: Released commit must be on main
         env:
           GIT_SHA: ${{ steps.resolve.outputs.git_sha }}
+        # origin/main comes from the fetch-depth: 0 checkout above (no credentials are persisted,
+        # so a `git fetch` here would fail on this private repo).
         run: |
-          git fetch --no-tags origin main
+          git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null || {
+            echo "::error::checkout did not fetch origin/main"; exit 1; }
           git merge-base --is-ancestor "$GIT_SHA" origin/main || {
             echo "::error::${GIT_SHA} is not an ancestor of origin/main"; exit 1; }
 

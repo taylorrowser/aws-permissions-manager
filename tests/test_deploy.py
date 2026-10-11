@@ -278,9 +278,10 @@ class PreviewCannotReachReleaseArtifacts(unittest.TestCase):
                 self.assertEqual(boundary_decision(b, "ssm:GetParametersByPath",
                                                    f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/{prefix}"), "deny")
 
-    def test_broker_can_manage_per_grant_policies_on_its_own_stage_roles(self):
-        # Each grant is its own inline policy (apm-grants-Req<id>): the broker lists, reads, puts and
-        # deletes them, and creates, tags and deletes the role, all on its own stage's agent roles.
+    def test_broker_can_sync_grants_and_remove_projects_on_its_own_stage_roles(self):
+        # Broker.sync reads, rewrites or deletes the role's single grants policy and creates (and tags)
+        # the role on first grant; remove_project pages through ListRolePolicies, deletes each inline
+        # policy and then the role. All of it only on the broker's own stage's agent roles.
         needed = ["iam:ListRolePolicies", "iam:GetRolePolicy", "iam:PutRolePolicy", "iam:DeleteRolePolicy",
                   "iam:GetRole", "iam:CreateRole", "iam:DeleteRole", "iam:TagRole"]
         for stage in ["prod"] + NONPROD:
