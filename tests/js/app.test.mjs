@@ -1,4 +1,4 @@
-// Pure helpers from the page script. Run: node --test tests/js
+// Pure helpers from the page script. Run: node --test tests/js/*.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";

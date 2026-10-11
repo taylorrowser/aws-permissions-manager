@@ -1,4 +1,4 @@
-// Service worker behaviour with fake browser APIs. Run: node --test tests/js
+// Service worker behaviour with fake browser APIs. Run: node --test tests/js/*.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
