@@ -1,5 +1,6 @@
 """DynamoDB state: the request queue, agent API keys and push subscriptions. AWS IAM is the
 source of truth for what is granted, so editing this table cannot grant anything."""
+import contextlib
 import hashlib
 import json
 import secrets
@@ -10,6 +11,7 @@ PENDING_LIMIT = 20  # per API key, so a runaway agent can't flood the owner
 CONNECT_LIMIT = 5  # unexpired connect requests at once; that endpoint needs no API key
 CONNECT_SECONDS = 900
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+LEASE_SECONDS = 45  # longer than the Lambda timeout, so a crashed holder's lease always lapses
 
 
 class Conflict(Exception):
@@ -42,6 +44,35 @@ class Store:
             if "LastEvaluatedKey" not in page:
                 return [_plain(i) for i in items]
             kw["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+    # ---------- leases: one writer per project policy across Lambda instances ----------
+
+    @contextlib.contextmanager
+    def lease(self, name, wait=10.0, poll=0.2):
+        pk, token = f"lease#{name}", secrets.token_hex(8)
+        deadline = time.time() + wait
+        while True:
+            now = time.time()
+            try:
+                self.t.put_item(Item={"pk": pk, "kind": "lease", "token": token, "expires_at": int(now) + LEASE_SECONDS},
+                                ConditionExpression="attribute_not_exists(pk) OR expires_at < :now",
+                                ExpressionAttributeValues={":now": int(now)})
+                break
+            except Exception as e:
+                if getattr(e, "response", {}).get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                    raise
+                if now > deadline:
+                    raise Conflict(f"another change to {name} is in progress; try again in a moment")
+                time.sleep(poll)
+        try:
+            yield
+        finally:
+            try:
+                self.t.delete_item(Key={"pk": pk}, ConditionExpression="#t = :t",
+                                   ExpressionAttributeNames={"#t": "token"}, ExpressionAttributeValues={":t": token})
+            except Exception as e:
+                if getattr(e, "response", {}).get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                    raise  # ours lapsed and someone else holds it now; leave theirs alone
 
     # ---------- requests ----------
 

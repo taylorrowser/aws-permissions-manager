@@ -1,10 +1,16 @@
 """Everything that touches IAM and STS. Runs inside the Lambda as the apm-broker role."""
+import contextlib
 import json
 import threading
 
 from . import policy
 
 _lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _no_lease(project):
+    yield
 
 
 class BrokerError(Exception):
@@ -16,8 +22,12 @@ def _is_missing(err):
 
 
 class Broker:
-    def __init__(self, account, region, iam=None, sts=None):
+    def __init__(self, account, region, iam=None, sts=None, lease=None):
+        """`lease(project)` is a context manager that serializes changes to one project's policy
+        across Lambda instances (Store.lease). IAM has no conditional writes, so without it two
+        instances can read the same policy and the later write undoes the earlier one."""
         self.account, self.region = account, region
+        self.lease = lease or _no_lease
         if iam is None or sts is None:
             import boto3
             iam, sts = iam or boto3.client("iam"), sts or boto3.client("sts", region_name=region)
@@ -37,7 +47,7 @@ class Broker:
     def approve(self, request):
         project = request["project"]
         stmt = policy.statement(request["id"], request["actions"], request["resources"])
-        with _lock:
+        with _lock, self.lease(project):
             self._ensure_role(project)
             new = policy.with_statement(self.grants(project), stmt)
             body = policy.dumps(new)
@@ -46,7 +56,7 @@ class Broker:
             self.iam.put_role_policy(RoleName=policy.role_name(project), PolicyName=policy.GRANTS_POLICY, PolicyDocument=body)
 
     def revoke(self, project, statement_sid):
-        with _lock:
+        with _lock, self.lease(project):
             new = policy.without_sid(self.grants(project), statement_sid)
             name = policy.role_name(project)
             if new["Statement"]:
@@ -60,7 +70,7 @@ class Broker:
 
     def remove_project(self, project):
         name = policy.role_name(project)
-        with _lock:
+        with _lock, self.lease(project):
             try:
                 for p in self.iam.list_role_policies(RoleName=name)["PolicyNames"]:
                     self.iam.delete_role_policy(RoleName=name, PolicyName=p)

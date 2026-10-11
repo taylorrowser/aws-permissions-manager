@@ -484,5 +484,6 @@ def handler(event, context):
         account = context.invoked_function_arn.split(":")[4]
         region = os.environ.get("AWS_REGION", "us-east-1")
         table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
-        _app = App(Settings.from_env(), Store(table), Broker(account, region))
+        store = Store(table)
+        _app = App(Settings.from_env(), store, Broker(account, region, lease=store.lease))
     return _app(Request.from_lambda(event)).lambda_result()

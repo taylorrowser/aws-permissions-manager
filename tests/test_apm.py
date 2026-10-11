@@ -1,5 +1,6 @@
 import base64
 import datetime
+import fnmatch
 import json
 import os
 import subprocess
@@ -83,14 +84,24 @@ class FakeTable:
     def __init__(self):
         self.items = {}
 
-    def put_item(self, Item):
+    def put_item(self, Item, ConditionExpression=None, ExpressionAttributeValues=None):
+        if ConditionExpression == "attribute_not_exists(pk) OR expires_at < :now":
+            held = self.items.get(Item["pk"])
+            if held and held["expires_at"] >= ExpressionAttributeValues[":now"]:
+                raise ConditionFailed()
+        elif ConditionExpression:
+            raise NotImplementedError(ConditionExpression)
         self.items[Item["pk"]] = json.loads(json.dumps(Item))
 
     def get_item(self, Key):
         item = self.items.get(Key["pk"])
         return {"Item": json.loads(json.dumps(item))} if item else {}
 
-    def delete_item(self, Key):
+    def delete_item(self, Key, ConditionExpression=None, ExpressionAttributeNames=None, ExpressionAttributeValues=None):
+        if ConditionExpression:
+            field = (ExpressionAttributeNames or {}).get("#t", "token")
+            if self.items.get(Key["pk"], {}).get(field) != ExpressionAttributeValues[":t"]:
+                raise ConditionFailed()
         self.items.pop(Key["pk"], None)
 
     def scan(self, FilterExpression, ExpressionAttributeValues, **kw):
@@ -169,6 +180,84 @@ class PolicyTests(unittest.TestCase):
         sids = [s.get("Sid") for s in role["Policies"][0]["PolicyDocument"]["Statement"]]
         self.assertIn("VendAgentCredentials", sids)
         self.assertEqual(t["Resources"]["Boundary"]["Properties"]["PolicyDocument"], policy.boundary(ACCOUNT))
+
+
+class ProtectApmTests(unittest.TestCase):
+    """Approved grants are capped by the boundary; none may reach apm's own secrets or code."""
+
+    def denied(self, arn):
+        stmt = next(s for s in policy.boundary(ACCOUNT)["Statement"] if s["Sid"] == "DenyApmInfrastructure")
+        return stmt["Action"] == "*" and any(fnmatch.fnmatchcase(arn, p) for p in stmt["Resource"])
+
+    def test_apm_infrastructure_is_denied_to_agents(self):
+        for arn in [f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/apm/session-secret",
+                    f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/apm/vapid-private-key",
+                    f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/apm-dev/session-secret",
+                    f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:apm",
+                    f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:apm:live",
+                    f"arn:aws:dynamodb:us-east-1:{ACCOUNT}:table/apm",
+                    f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:stack/apm/abc",
+                    f"arn:aws:logs:us-east-1:{ACCOUNT}:log-group:/aws/lambda/apm:log-stream:x",
+                    f"arn:aws:s3:::apm-artifacts-{ACCOUNT}-us-east-1",
+                    f"arn:aws:s3:::apm-artifacts-{ACCOUNT}-us-east-1/lambda/x.zip",
+                    "arn:aws:apigateway:us-east-1::/domainnames/apm.taylorrowser.com"]:
+            with self.subTest(arn=arn):
+                self.assertTrue(self.denied(arn))
+
+    def test_ordinary_project_resources_stay_allowed(self):
+        for arn in [f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/myapp/db-url",
+                    f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:myapp-api",
+                    f"arn:aws:dynamodb:us-east-1:{ACCOUNT}:table/orders",
+                    "arn:aws:s3:::example-site/index.html"]:
+            with self.subTest(arn=arn):
+                self.assertFalse(self.denied(arn))
+
+    def test_tagged_resources_and_dns_denied_but_agent_roles_still_passable(self):
+        sids = {s["Sid"]: s for s in policy.boundary(ACCOUNT)["Statement"]}
+        tagged = sids["DenyApmTaggedResources"]
+        self.assertEqual((tagged["NotAction"], tagged["Condition"]),
+                         ("iam:*", {"StringEquals": {"aws:ResourceTag/managed-by": "apm"}}))
+        self.assertIn("route53:ChangeResourceRecordSets", sids["DenyApmDnsRecords"]["Action"])
+        self.assertIn("AllowPassAgentRoles", sids)
+
+    def test_boundary_fits_a_managed_policy(self):
+        self.assertLess(len(json.dumps(policy.boundary(ACCOUNT), separators=(",", ":"))), 6144)
+
+
+class LeaseTests(unittest.TestCase):
+    def test_one_holder_at_a_time_and_lapsed_leases_are_taken_over(self):
+        from apm import store as store_mod
+        s = Store(FakeTable())
+        with s.lease("myapp"):
+            with self.assertRaises(store_mod.Conflict):
+                with s.lease("myapp", wait=0.3, poll=0.05):
+                    pass
+            with s.lease("other", wait=0):  # other projects aren't blocked
+                pass
+        with s.lease("myapp", wait=0):  # released
+            pass
+        s.t.items["lease#myapp"] = {"pk": "lease#myapp", "kind": "lease", "token": "dead", "expires_at": 1}
+        with s.lease("myapp", wait=0):  # a crashed holder's lease lapses
+            self.assertNotEqual(s.t.items["lease#myapp"]["token"], "dead")
+        self.assertNotIn("lease#myapp", s.t.items)
+
+    def test_broker_changes_hold_the_project_lease(self):
+        held = []
+
+        class Lease:
+            def __init__(self, project):
+                self.project = project
+
+            def __enter__(self):
+                held.append(self.project)
+
+            def __exit__(self, *a):
+                held.append("released")
+        broker = Broker(ACCOUNT, "us-east-1", iam=FakeIAM(), sts=FakeSTS(), lease=Lease)
+        broker.approve({"id": 1, "project": "myapp", "actions": ["s3:GetObject"], "resources": ["*"]})
+        broker.revoke("myapp", "Req1")
+        broker.remove_project("myapp")
+        self.assertEqual(held, ["myapp", "released"] * 3)
 
 
 class PushTests(unittest.TestCase):

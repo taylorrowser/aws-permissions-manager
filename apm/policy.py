@@ -48,6 +48,21 @@ def doc(*statements):
     return {"Version": "2012-10-17", "Statement": list(statements)}
 
 
+def apm_resources(account):
+    """ARN patterns for apm's own infrastructure (every stage): its secrets, Lambda, table, stack,
+    buckets and logs. An agent that could read the session secret or change the Lambda could
+    forge the owner's sign-in or replace the approval logic, so the boundary denies them all."""
+    return [
+        f"arn:aws:ssm:*:{account}:parameter/apm*",
+        f"arn:aws:lambda:*:{account}:function:apm*",
+        f"arn:aws:dynamodb:*:{account}:table/apm*",
+        f"arn:aws:cloudformation:*:{account}:stack/apm*",
+        f"arn:aws:logs:*:{account}:log-group:/aws/lambda/apm*",
+        "arn:aws:s3:::apm-*",
+        "arn:aws:apigateway:*::/domainnames/*apm*",
+    ]
+
+
 def boundary(account):
     """Permissions boundary on every agent role: the most an agent role can ever do."""
     return doc(
@@ -55,6 +70,15 @@ def boundary(account):
         {"Sid": "AllowIamRead", "Effect": "Allow", "Action": ["iam:Get*", "iam:List*"], "Resource": "*"},
         {"Sid": "AllowPassAgentRoles", "Effect": "Allow", "Action": "iam:PassRole",
          "Resource": agent_roles_arn(account)},
+        # Whatever is approved, agents can't touch apm itself.
+        {"Sid": "DenyApmInfrastructure", "Effect": "Deny", "Action": "*", "Resource": apm_resources(account)},
+        # The CloudFormation stack tags everything it creates (certificate, API, ...) managed-by=apm.
+        # IAM is excluded so agents can still read and pass agent roles, which carry the same tag.
+        {"Sid": "DenyApmTaggedResources", "Effect": "Deny", "NotAction": "iam:*", "Resource": "*",
+         "Condition": {"StringEquals": {"aws:ResourceTag/managed-by": "apm"}}},
+        {"Sid": "DenyApmDnsRecords", "Effect": "Deny", "Action": "route53:ChangeResourceRecordSets", "Resource": "*",
+         "Condition": {"ForAnyValue:StringLike": {
+             "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["apm.*", "*.apm.*"]}}},
     )
 
 
