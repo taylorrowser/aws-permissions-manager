@@ -741,6 +741,60 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(oct(key_file.stat().st_mode & 0o777), "0o600")
         self.assertFalse((self.tmp / "apm" / "pending-key").exists())
 
+    def test_mcp_server_survives_unexpected_errors(self):
+        (self.tmp / "aws-config").mkdir()  # unreadable as a file: an OSError inside the tool
+        proc = subprocess.Popen([self.python, str(CLIENT), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                env=self.env, text=True)
+        def stop():
+            proc.stdin.close()
+            proc.wait(5)
+            proc.stdout.close()
+        self.addCleanup(stop)
+
+        def rpc(i, method, params=None):
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params or {}}) + "\n")
+            proc.stdin.flush()
+            return json.loads(proc.stdout.readline())
+
+        def tool(i, name, **args):
+            return rpc(i, "tools/call", {"name": name, "arguments": args})["result"]
+
+        tool(1, "request_permissions", project="myapp", actions=["s3:ListAllMyBuckets"], reason="list buckets")
+        self.approve_all()
+        broken = tool(2, "get_aws_credentials", project="myapp")
+        self.assertTrue(broken["isError"])
+        self.assertIn("IsADirectoryError", broken["content"][0]["text"])
+        unknown = tool(3, "no_such_tool")
+        self.assertTrue(unknown["isError"])
+        self.assertIn("unknown tool", unknown["content"][0]["text"])
+        # Still serving after both.
+        self.assertIn("myapp", tool(4, "list_projects")["content"][0]["text"])
+        self.assertIsNone(proc.poll())
+
+    def test_profile_update_keeps_the_rest_of_aws_config(self):
+        config = self.tmp / "aws-config"
+        original = ("# keep this comment\n[default]\nregion = eu-west-1\n\n"
+                    "[profile apm-web]\ncredential_process = stale command\noutput = json\n\n"
+                    "[profile other]\nregion = ap-south-1\n")
+        config.write_text(original)
+        config.chmod(0o600)
+        run = lambda *a: subprocess.run([self.python, str(CLIENT), *a], env=self.env, capture_output=True, text=True)
+        run("request", "--project", "web", "-a", "s3:GetObject", "--reason", "read")
+        self.approve_all()
+        for _ in range(2):  # a second `use` leaves the file unchanged
+            r = run("use", "web")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        text = config.read_text()
+        self.assertTrue(text.startswith("# keep this comment\n[default]\nregion = eu-west-1\n"))
+        self.assertIn("[profile other]\nregion = ap-south-1\n", text)
+        self.assertIn("output = json", text)
+        self.assertNotIn("stale command", text)
+        self.assertEqual(text.count("[profile apm-web]"), 1)
+        self.assertEqual(text.count("credential_process"), 1)
+        self.assertIn("credentials web", text)
+        self.assertEqual(oct(config.stat().st_mode & 0o777), "0o600")
+        self.assertEqual((self.tmp / "aws-config.apm-backup").read_text(), original)
+
     def test_cli(self):
         run = lambda *a: subprocess.run([self.python, str(CLIENT), *a], env=self.env, capture_output=True, text=True)
         r = run("request", "--project", "web", "-a", "s3:GetObject", "--reason", "read")

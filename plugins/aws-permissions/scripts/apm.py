@@ -12,7 +12,6 @@
 Settings: APM_URL and APM_API_KEY override ~/.apm/client.json and ~/.apm/api-key.
 """
 import argparse
-import configparser
 import getpass
 import hashlib
 import json
@@ -28,7 +27,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 DEFAULT_URL = "https://apm.taylorrowser.com"
 HOME = Path(os.environ.get("APM_HOME", Path.home() / ".apm"))
 CLIENT_FILE = HOME / "client.json"
@@ -40,6 +39,10 @@ AWS_CONFIG = Path(os.environ.get("AWS_CONFIG_FILE", Path.home() / ".aws" / "conf
 
 
 class ApmError(Exception):
+    pass
+
+
+class UnknownMethod(Exception):
     pass
 
 
@@ -167,20 +170,59 @@ def use(project):
     fetch_credentials(project, refresh=True)  # fails clearly if nothing is granted yet
     script = _stable_copy()
     region = call("GET", "/api/whoami").get("region", "us-east-1")
-    ini = configparser.RawConfigParser()
-    ini.read(AWS_CONFIG)
-    section = f"profile {profile_name(project)}"
-    if not ini.has_section(section):
-        ini.add_section(section)
-    ini.set(section, "credential_process", f'"{sys.executable}" "{script}" credentials {project}')
-    ini.set(section, "region", region)
-    AWS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    backup = AWS_CONFIG.with_name(AWS_CONFIG.name + ".apm-backup")
-    if AWS_CONFIG.exists() and not backup.exists():
-        shutil.copy2(AWS_CONFIG, backup)
-    with open(AWS_CONFIG, "w") as f:
-        ini.write(f)
+    text = AWS_CONFIG.read_text() if AWS_CONFIG.exists() else ""
+    new = upsert_profile(text, f"profile {profile_name(project)}", {
+        "credential_process": f'"{sys.executable}" "{script}" credentials {project}', "region": region})
+    if new != text:
+        AWS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        backup = AWS_CONFIG.with_name(AWS_CONFIG.name + ".apm-backup")
+        if AWS_CONFIG.exists() and not backup.exists():
+            shutil.copy2(AWS_CONFIG, backup)
+        _replace_file(AWS_CONFIG, new)
     return profile_name(project)
+
+
+def upsert_profile(text, section, values):
+    """Set `values` in [section] of an AWS config file's text. Only that section's matching keys
+    change (or the section is appended); every other line, comment and profile is kept as it was."""
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    start = next((i for i, l in enumerate(lines) if l.strip() == f"[{section}]"), None)
+    if start is None:
+        block = [f"[{section}]\n"] + [f"{k} = {v}\n" for k, v in values.items()]
+        return "".join(lines + (["\n"] if lines and lines[-1].strip() else []) + block)
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
+    body, todo, skipping = [], dict(values), False
+    for line in lines[start + 1:end]:
+        if skipping and line[:1] in (" ", "\t") and line.strip():
+            continue  # continuation of a value being replaced
+        skipping = False
+        key = line.split("=", 1)[0].strip().lower() if "=" in line and line[:1] not in (" ", "\t") else None
+        if key in values:
+            skipping = True
+            if key in todo:
+                body.append(f"{key} = {todo.pop(key)}\n")
+            continue
+        body.append(line)
+    last = max((i for i, l in enumerate(body) if l.strip()), default=-1) + 1
+    body[last:last] = [f"{k} = {v}\n" for k, v in todo.items()]
+    return "".join(lines[:start + 1] + body + lines[end:])
+
+
+def _replace_file(path, text):
+    """Write `text` to `path` atomically, keeping its permissions (0600 for a new file)."""
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    tmp = path.with_name(f".{path.name}.apm-{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _stable_copy():
@@ -391,9 +433,12 @@ class McpServer:
             try:
                 result = self.dispatch(msg["method"], msg.get("params") or {})
                 self._send({"jsonrpc": "2.0", "id": msg["id"], "result": result})
-            except KeyError:
+            except UnknownMethod:
                 self._send({"jsonrpc": "2.0", "id": msg["id"],
                             "error": {"code": -32601, "message": f"unknown method {msg['method']}"}})
+            except Exception as e:  # keep serving: one bad request mustn't take the tools away
+                self._send({"jsonrpc": "2.0", "id": msg["id"],
+                            "error": {"code": -32603, "message": f"internal error: {e}"}})
 
     def _send(self, msg):
         sys.stdout.write(json.dumps(msg) + "\n")
@@ -414,14 +459,18 @@ class McpServer:
             return {"tools": TOOLS}
         if method == "tools/call":
             return self.call_tool(params.get("name"), params.get("arguments") or {})
-        raise KeyError(method)
+        raise UnknownMethod(method)
 
     def call_tool(self, name, args):
         try:
-            text = getattr(self, "tool_" + str(name))(**args)
+            handler = getattr(self, "tool_" + str(name), None)
+            if handler is None:
+                raise ApmError(f"unknown tool {name}")
+            text = handler(**args)
             return {"content": [{"type": "text", "text": text}]}
-        except (ApmError, TypeError, ValueError, AttributeError) as e:
-            return {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}
+        except Exception as e:  # e.g. an unreadable ~/.aws/config: report it, don't crash the server
+            message = str(e) if isinstance(e, ApmError) else f"{type(e).__name__}: {e}"
+            return {"content": [{"type": "text", "text": f"Error: {message}"}], "isError": True}
 
     def tool_connect(self, wait_seconds=0):
         status, code, url = connect(max(0, min(int(wait_seconds), 120)))
