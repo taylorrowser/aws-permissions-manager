@@ -899,6 +899,21 @@ class AwsConfigEditTests(unittest.TestCase):
         self.assertNotIn("SECRETVALUE", str(e.exception))
         self.assertIn("left unchanged", str(e.exception))
 
+    def test_use_reports_a_broken_config_even_when_the_profile_is_already_right(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config"
+            good = self.client.upsert_profile("", self.SECTION, self.VALUES)
+            config.write_text(good + "[default]\nregion = 1\nregion = 2\n")
+            before = config.read_text()
+            with mock.patch.object(self.client, "AWS_CONFIG", config), \
+                 mock.patch.object(self.client, "fetch_credentials"), \
+                 mock.patch.object(self.client, "_stable_copy", return_value="/x/apm.py"), \
+                 mock.patch.object(self.client, "call", return_value={"region": "us-east-1"}), \
+                 mock.patch.object(self.client.sys, "executable", "python3"):
+                with self.assertRaises(self.client.ApmError):
+                    self.client.use("a")
+            self.assertEqual(config.read_text(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

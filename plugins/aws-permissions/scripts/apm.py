@@ -183,8 +183,8 @@ def use(project):
     section = f"profile {profile_name(project)}"
     values = {"credential_process": f'"{sys.executable}" "{script}" credentials {project}', "region": region}
     new = upsert_profile(text, section, values)
+    _check_config(new, section, values)  # never leave (or write) a file the AWS CLI can't read
     if new != text:
-        _check_config(new, section, values)  # never write a file the AWS CLI can't read
         target.parent.mkdir(parents=True, exist_ok=True)
         backup = target.with_name(target.name + ".apm-backup")
         if target.exists() and not backup.exists():
