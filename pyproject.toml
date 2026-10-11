@@ -16,4 +16,4 @@ build-backend = "setuptools.build_meta"
 packages = ["apm"]
 
 [tool.setuptools.package-data]
-apm = ["static/*"]
+apm = ["static/*", "lambda-requirements.txt"]

@@ -34,6 +34,7 @@ agent ── aws --profile apm-<project> ── credential_process ────�
 | `apm/static/` | Web app: manifest, service worker, icons, `app.js` |
 | `plugins/aws-permissions/` | The plugin for Claude Code and Codex: MCP server + `apm` CLI in one stdlib-only script (`scripts/apm.py`), `skills/aws-access`, manifests for both tools |
 | `.claude-plugin/marketplace.json`, `.agents/plugins/marketplace.json` | Marketplaces so both tools can install the plugin from this repo |
+| `.github/workflows/`, `infra/`, `docs/deployment.md` | CI/CD workflows, OIDC bootstrap template (applied manually), deployment contract following the org deployment policy |
 
 ## Deploy (owner)
 
@@ -52,6 +53,8 @@ Settings are saved to `~/.apm/deploy.json`, so later deploys are just `apm-admin
 - creates `/apm/session-secret` and the VAPID push keys in SSM Parameter Store (values never printed);
 - builds the Lambda bundle and uploads it to `apm-artifacts-<account>-<region>`;
 - creates the `apm` CloudFormation stack: boundary, broker role, Lambda, DynamoDB table, HTTP API, ACM certificate and DNS record.
+
+CI/CD follows the org deployment policy and is described in [docs/deployment.md](docs/deployment.md): PR checks without cloud credentials, opt-in per-PR previews, continuous deploy to dev with a recorded release, manual promotion of that same artifact to prod, and a separate manual rollback. Previews run PR code, so put dev and previews in a separate nonprod AWS account with no write path to anything prod reads; promotion also re-verifies each dev release against GitHub (CI run, build digest, dev deploy run) before deploying it. Its cloud workflows stay disabled until the one-time bootstrap there is done; `apm-admin deploy` keeps working as above. `apm-admin --help` lists the commands they use. `tests/test_deploy.py` and `tests/test_pipeline.py` cover stage isolation, prod template compatibility, release records, the preview cleanup allowlist and workflow hygiene, without AWS or network; the bootstrap-template checks need `cfn-lint` installed.
 
 If your WorkOS application requires a client secret, store it without echoing it, then redeploy:
 
