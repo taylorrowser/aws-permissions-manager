@@ -12,15 +12,18 @@
 Settings: APM_URL and APM_API_KEY override ~/.apm/client.json and ~/.apm/api-key.
 """
 import argparse
+import configparser
 import getpass
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -46,12 +49,17 @@ class UnknownMethod(Exception):
     pass
 
 
+def redact(text):
+    """Unexpected errors can quote request headers; never show an API key in tool output."""
+    return re.sub(r"apm_[A-Za-z0-9_\-]+", "apm_[redacted]", text)
+
+
 # ---------- settings and HTTP ----------
 
 def _settings():
     saved = json.loads(CLIENT_FILE.read_text()) if CLIENT_FILE.exists() else {}
     url = (os.environ.get("APM_URL") or saved.get("url") or DEFAULT_URL).rstrip("/")
-    key = os.environ.get("APM_API_KEY") or (KEY_FILE.read_text().strip() if KEY_FILE.exists() else "")
+    key = (os.environ.get("APM_API_KEY") or "").strip() or (KEY_FILE.read_text().strip() if KEY_FILE.exists() else "")
     return url, key
 
 
@@ -170,58 +178,105 @@ def use(project):
     fetch_credentials(project, refresh=True)  # fails clearly if nothing is granted yet
     script = _stable_copy()
     region = call("GET", "/api/whoami").get("region", "us-east-1")
-    text = AWS_CONFIG.read_text() if AWS_CONFIG.exists() else ""
-    new = upsert_profile(text, f"profile {profile_name(project)}", {
-        "credential_process": f'"{sys.executable}" "{script}" credentials {project}', "region": region})
+    target = AWS_CONFIG.resolve() if AWS_CONFIG.is_symlink() else AWS_CONFIG  # write through a symlink
+    text = _read_keeping_newlines(target)
+    section = f"profile {profile_name(project)}"
+    values = {"credential_process": f'"{sys.executable}" "{script}" credentials {project}', "region": region}
+    new = upsert_profile(text, section, values)
     if new != text:
-        AWS_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        backup = AWS_CONFIG.with_name(AWS_CONFIG.name + ".apm-backup")
-        if AWS_CONFIG.exists() and not backup.exists():
-            shutil.copy2(AWS_CONFIG, backup)
-        _replace_file(AWS_CONFIG, new)
+        _check_config(new, section, values)  # never write a file the AWS CLI can't read
+        target.parent.mkdir(parents=True, exist_ok=True)
+        backup = target.with_name(target.name + ".apm-backup")
+        if target.exists() and not backup.exists():
+            shutil.copy2(target, backup)
+        _replace_file(target, new)
     return profile_name(project)
+
+
+# configparser's own patterns (botocore reads ~/.aws/config with RawConfigParser).
+_SECTION_RE = re.compile(r"\[(?P<header>.+)\]")
+_OPTION_RE = re.compile(r"(?P<option>.*?)\s*[=:]")
+
+
+def _header(line):
+    m = _SECTION_RE.match(line.strip())
+    return m.group("header").strip() if m else None
 
 
 def upsert_profile(text, section, values):
     """Set `values` in [section] of an AWS config file's text. Only that section's matching keys
-    change (or the section is appended); every other line, comment and profile is kept as it was."""
+    change (or the section is appended); every other line, comment and profile is kept as it was.
+    Indented lines that continue another value are left alone, as configparser reads them."""
+    nl = "\r\n" if "\r\n" in text else "\n"
     lines = text.splitlines(keepends=True)
-    if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
-    start = next((i for i, l in enumerate(lines) if l.strip() == f"[{section}]"), None)
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += nl
+    start = next((i for i, l in enumerate(lines) if _header(l) == section), None)
     if start is None:
-        block = [f"[{section}]\n"] + [f"{k} = {v}\n" for k, v in values.items()]
-        return "".join(lines + (["\n"] if lines and lines[-1].strip() else []) + block)
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")), len(lines))
-    body, todo, skipping = [], dict(values), False
+        block = [f"[{section}]{nl}"] + [f"{k} = {v}{nl}" for k, v in values.items()]
+        return "".join(lines + ([nl] if lines and lines[-1].strip() else []) + block)
+    end = next((i for i in range(start + 1, len(lines)) if _header(lines[i])), len(lines))
+    body, todo = [], dict(values)
+    indent, seen_option, skipping = "", False, False
     for line in lines[start + 1:end]:
-        if skipping and line[:1] in (" ", "\t") and line.strip():
-            continue  # continuation of a value being replaced
-        skipping = False
-        key = line.split("=", 1)[0].strip().lower() if "=" in line and line[:1] not in (" ", "\t") else None
-        if key in values:
-            skipping = True
+        stripped = line.strip()
+        lead = line[:len(line) - len(line.lstrip())]
+        if not stripped or stripped[0] in "#;":
+            body.append(line)
+            continue
+        if seen_option and len(lead) > len(indent):  # continuation of the previous value
+            if not skipping:
+                body.append(line)
+            continue
+        m = _OPTION_RE.match(stripped)
+        key = m.group("option").strip().lower() if m else None
+        if key:
+            seen_option, indent = True, lead
+        skipping = key in values
+        if skipping:
             if key in todo:
-                body.append(f"{key} = {todo.pop(key)}\n")
+                body.append(f"{lead}{key} = {todo.pop(key)}{nl}")
             continue
         body.append(line)
     last = max((i for i, l in enumerate(body) if l.strip()), default=-1) + 1
-    body[last:last] = [f"{k} = {v}\n" for k, v in todo.items()]
+    body[last:last] = [f"{indent}{k} = {v}{nl}" for k, v in todo.items()]
     return "".join(lines[:start + 1] + body + lines[end:])
+
+
+def _check_config(text, section, values):
+    """Refuse (leaving the file untouched) unless the AWS CLI's parser reads `values` back."""
+    ini = configparser.RawConfigParser()
+    try:
+        ini.read_string(text)
+        ok = all(ini.get(section, k, fallback=None) == v for k, v in values.items())
+    except configparser.Error as e:  # its message can quote a line of the file, so don't echo it
+        ok, line = False, getattr(e, "lineno", None) or getattr(e, "errors", [(None,)])[0][0]
+        if line:
+            raise ApmError(f"{AWS_CONFIG} can't be parsed ({type(e).__name__} near line {line}); it was left "
+                           "unchanged. Fix it, then call get_aws_credentials again.")
+    if not ok:
+        raise ApmError(f"couldn't add profile [{section}] to {AWS_CONFIG} cleanly; it was left unchanged. "
+                       "Check that section by hand, then call get_aws_credentials again.")
+
+
+def _read_keeping_newlines(path):
+    if not path.exists():
+        return ""
+    with open(path, newline="") as f:
+        return f.read()
 
 
 def _replace_file(path, text):
     """Write `text` to `path` atomically, keeping its permissions (0600 for a new file)."""
     mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
-    tmp = path.with_name(f".{path.name}.apm-{os.getpid()}")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.apm-")
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", newline="") as f:
             f.write(text)
         os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        Path(tmp).unlink(missing_ok=True)
         raise
 
 
@@ -428,6 +483,9 @@ class McpServer:
             except ValueError:
                 self._send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
                 continue
+            if not isinstance(msg, dict):
+                self._send({"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}})
+                continue
             if "id" not in msg or "method" not in msg:
                 continue  # notifications and responses need no reply
             try:
@@ -438,7 +496,7 @@ class McpServer:
                             "error": {"code": -32601, "message": f"unknown method {msg['method']}"}})
             except Exception as e:  # keep serving: one bad request mustn't take the tools away
                 self._send({"jsonrpc": "2.0", "id": msg["id"],
-                            "error": {"code": -32603, "message": f"internal error: {e}"}})
+                            "error": {"code": -32603, "message": redact(f"internal error: {e}")}})
 
     def _send(self, msg):
         sys.stdout.write(json.dumps(msg) + "\n")
@@ -469,7 +527,7 @@ class McpServer:
             text = handler(**args)
             return {"content": [{"type": "text", "text": text}]}
         except Exception as e:  # e.g. an unreadable ~/.aws/config: report it, don't crash the server
-            message = str(e) if isinstance(e, ApmError) else f"{type(e).__name__}: {e}"
+            message = str(e) if isinstance(e, ApmError) else redact(f"{type(e).__name__}: {e}")
             return {"content": [{"type": "text", "text": f"Error: {message}"}], "isError": True}
 
     def tool_connect(self, wait_seconds=0):
