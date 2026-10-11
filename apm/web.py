@@ -269,15 +269,17 @@ class App:
             return redirect("/?msg=" + _q(f"Error: {e}"))
 
     def decide(self, form):
-        """Every change to a project's grants runs entirely under that project's lease, re-reading
-        the request strongly consistent inside it, so concurrent Lambda instances can't interleave
-        (e.g. a slow approval writing a grant back after it was revoked)."""
+        """Grant changes run entirely under the project's lease. The decision is recorded in
+        DynamoDB first (conditional, strongly consistent), then the role's policy is rewritten
+        from the project's approved requests, so IAM never holds a grant for a request that
+        isn't approved and a stale IAM read can't bring a revoked grant back."""
         op = form.get("op")
         if op in ("approve", "reject"):
             seen = self.store.get(int(form["id"]))
             if not seen:
                 return "That request is no longer pending."
-            with self.store.lease(seen["project"]):
+            project = seen["project"]
+            with self.store.lease(project):
                 r = self.store.get(seen["id"], consistent=True)
                 if not r or r["status"] != "pending":
                     return "That request is no longer pending."
@@ -286,22 +288,29 @@ class App:
                 if op == "reject":
                     self.store.set_status(r["id"], "rejected", form.get("note", "")[:500], expect="pending")
                     return f"Rejected request #{r['id']}."
-                self.broker.approve(r)
                 self.store.set_status(r["id"], "approved", expect="pending")
-                return f"Approved request #{r['id']} for {r['project']}."
+                try:
+                    self.broker.sync(project, self.store.approved(project))
+                except Exception:
+                    self.store.set_status(r["id"], "pending", expect="approved")  # IAM wasn't changed for it
+                    raise
+                return f"Approved request #{r['id']} for {project}."
         if op == "revoke":
             project, sid = form["project"], form["sid"]
             with self.store.lease(project):
-                self.broker.revoke(project, sid)
-                if sid.startswith("Req") and sid[3:].isdigit() and self.store.get(int(sid[3:]), consistent=True):
-                    self.store.set_status(int(sid[3:]), "revoked")
+                if sid.startswith("Req") and sid[3:].isdigit():
+                    r = self.store.get(int(sid[3:]), consistent=True)
+                    if r and r["project"] == project and r["status"] == "approved":
+                        self.store.set_status(r["id"], "revoked", expect="approved")
+                # Rewriting from the approved requests drops this grant (and anything else not approved).
+                self.broker.sync(project, self.store.approved(project))
             return f"Revoked {sid} from {project}."
         if op == "remove_project":
             project = form["project"]
             with self.store.lease(project):
+                for r in self.store.approved(project):
+                    self.store.set_status(r["id"], "revoked", "project removed", expect="approved")
                 self.broker.remove_project(project)
-                for r in self.store.list(status="approved", project=project):
-                    self.store.set_status(r["id"], "revoked", "project removed")
             return f"Removed project {project} and its role."
         if op == "delete_key":
             self.store.delete_key(form.get("pk", ""))
@@ -494,5 +503,5 @@ def handler(event, context):
         region = os.environ.get("AWS_REGION", "us-east-1")
         table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
         store = Store(table)
-        _app = App(Settings.from_env(), store, Broker(account, region, marks=store))
+        _app = App(Settings.from_env(), store, Broker(account, region))
     return _app(Request.from_lambda(event)).lambda_result()

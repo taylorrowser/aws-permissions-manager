@@ -154,11 +154,9 @@ def sid(request_id):
     return f"Req{request_id}"
 
 
-def grant_policy_name(statement_sid):
-    """Each approved request is its own inline policy on the project role, so approving and
-    revoking are single writes, never a read-modify-write of a shared document (IAM reads are
-    eventually consistent, and a stale read would bring a revoked grant back)."""
-    return f"{GRANTS_POLICY}-{statement_sid}"
+def grants_document(requests):
+    """The project role's whole grants policy, built from its approved requests."""
+    return doc(*[statement(r["id"], r["actions"], r["resources"]) for r in sorted(requests, key=lambda r: r["id"])])
 
 
 def statement(request_id, actions, resources):

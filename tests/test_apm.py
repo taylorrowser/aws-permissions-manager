@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -133,7 +134,7 @@ def make_app(http=None):
     settings = web.Settings("apm.test", "client_test", OWNER, "VAPIDPUB", "session-secret-for-tests")
     iam, sts = FakeIAM(), FakeSTS()
     store = Store(FakeTable())
-    app = web.App(settings, store, Broker(ACCOUNT, "us-east-1", iam=iam, sts=sts, marks=store), http=http)
+    app = web.App(settings, store, Broker(ACCOUNT, "us-east-1", iam=iam, sts=sts), http=http)
     return app, iam, sts
 
 
@@ -272,69 +273,102 @@ class LeaseTests(unittest.TestCase):
 
 
 class GrantConsistencyTests(unittest.TestCase):
+    """The role's policy is always rebuilt from approved requests, never from an IAM read."""
+
     def setUp(self):
         self.app, self.iam, _ = make_app()
 
-    def add(self, project="myapp"):
-        rid = self.app.store.add(project, ["s3:GetObject"], ["*"], "x", "k")
+    def add(self, project="myapp", actions=("s3:GetObject",), resources=("*",)):
+        rid = self.app.store.add(project, list(actions), list(resources), "x", "k")
         return self.app.store.get(rid)
 
-    def names(self):
-        return sorted(p for r, p in self.iam.policies if r == "apm-myapp")
+    def approve(self, r):
+        return self.app.decide({"op": "approve", "id": str(r["id"]), "digest": r["digest"]})
 
-    def test_each_grant_is_its_own_policy(self):
-        r1, r2 = self.add(), self.add()
-        for r in (r1, r2):
-            self.app.decide({"op": "approve", "id": str(r["id"]), "digest": r["digest"]})
-        self.assertEqual(self.names(), ["apm-grants-Req1", "apm-grants-Req2"])
-        self.assertEqual([s["Sid"] for s in self.app.broker.grants("myapp")["Statement"]], ["Req1", "Req2"])
-        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
-        self.assertEqual(self.names(), ["apm-grants-Req2"])
+    def sids(self):
+        doc = self.iam.policies.get(("apm-myapp", "apm-grants"))
+        return [s["Sid"] for s in doc["Statement"]] if doc else []
 
     def test_stale_iam_read_cannot_bring_back_a_revoked_grant(self):
         r1, r2 = self.add(), self.add()
-        self.app.decide({"op": "approve", "id": str(r1["id"]), "digest": r1["digest"]})
-        stale = dict(self.iam.policies)
+        self.approve(r1)
+        stale = self.iam.policies["apm-myapp", "apm-grants"]
         self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
-        real_get, real_list = self.iam.get_role_policy, self.iam.list_role_policies
-        # IAM is eventually consistent: reads still show Req1.
-        self.iam.list_role_policies = lambda RoleName: {"PolicyNames": [p for r, p in stale if r == RoleName]}
-        self.iam.get_role_policy = lambda RoleName, PolicyName: {"PolicyDocument": stale[RoleName, PolicyName]}
-        self.app.decide({"op": "approve", "id": str(r2["id"]), "digest": r2["digest"]})
-        self.iam.get_role_policy, self.iam.list_role_policies = real_get, real_list
-        self.assertEqual(self.names(), ["apm-grants-Req2"])
+        self.iam.get_role_policy = lambda RoleName, PolicyName: {"PolicyDocument": stale}  # IAM still shows Req1
+        self.approve(r2)
+        self.assertEqual(self.sids(), ["Req2"])
 
     def test_a_late_approval_sees_the_request_was_already_decided(self):
         r = self.add()
-        self.app.decide({"op": "approve", "id": str(r["id"]), "digest": r["digest"]})
+        self.approve(r)
         self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
         real_get = self.app.store.get
-        # An eventually consistent read still says pending; the consistent re-read under the lease doesn't.
-        self.app.store.get = lambda rid, consistent=False: {**real_get(rid), "status": "pending"} if not consistent else real_get(rid, True)
-        msg = self.app.decide({"op": "approve", "id": str(r["id"]), "digest": r["digest"]})
-        self.assertEqual(msg, "That request is no longer pending.")
-        self.assertEqual(self.names(), [])
+        self.app.store.get = lambda rid, consistent=False: (
+            real_get(rid, True) if consistent else {**real_get(rid), "status": "pending"})
+        self.assertEqual(self.approve(r), "That request is no longer pending.")
+        self.assertEqual(self.sids(), [])
 
-    def test_legacy_single_policy_is_split_once(self):
-        self.iam.roles["apm-myapp"] = {}
-        legacy = policy.doc(policy.statement(1, ["s3:GetObject"], ["*"]), policy.statement(2, ["s3:PutObject"], ["*"]))
-        self.iam.policies["apm-myapp", "apm-grants"] = legacy
-        self.app.broker.revoke("myapp", "Req1")
-        self.assertEqual(self.names(), ["apm-grants-Req2"])
-        self.assertTrue(self.app.store.is_marked("split#myapp"))
-        # A stale read of the deleted legacy policy is never split again.
-        self.iam.policies["apm-myapp", "apm-grants"] = legacy
-        self.app.broker.revoke("myapp", "Req2")
-        self.assertNotIn(("apm-myapp", "apm-grants-Req1"), self.iam.policies)
+    def test_failed_iam_write_leaves_the_request_pending_and_nothing_granted(self):
+        r = self.add()
+        self.iam.put_role_policy = mock.Mock(side_effect=RuntimeError("throttled"))
+        with self.assertRaises(RuntimeError):
+            self.approve(r)
+        self.assertEqual(self.app.store.get(r["id"])["status"], "pending")
+        # Rejecting it afterwards leaves nothing behind in IAM.
+        self.app.decide({"op": "reject", "id": str(r["id"]), "digest": r["digest"]})
+        self.assertEqual(self.sids(), [])
 
-    def test_inline_size_limit_counts_all_grant_policies(self):
+    def test_failed_status_write_after_iam_cannot_hide_a_grant(self):
+        r = self.add()
+        real = self.app.store.set_status
+        calls = []
+
+        def flaky(rid, status, note="", expect=None):
+            calls.append(status)
+            if status == "approved":
+                raise RuntimeError("dynamodb down")
+            return real(rid, status, note, expect)
+        self.app.store.set_status = flaky
+        with self.assertRaises(RuntimeError):
+            self.approve(r)
+        self.assertEqual(self.sids(), [])  # status is written before IAM, so IAM was never touched
+
+    def test_revoke_drops_grants_that_are_no_longer_approved(self):
+        r1, r2 = self.add(), self.add()
+        self.approve(r1)
+        self.approve(r2)
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
+        self.assertEqual(self.sids(), ["Req2"])
+        self.assertEqual(self.app.store.get(1)["status"], "revoked")
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req2"})
+        self.assertNotIn(("apm-myapp", "apm-grants"), self.iam.policies)
+
+    def test_too_large_approval_is_refused_and_stays_pending(self):
         from apm.broker import BrokerError
         big = ["arn:aws:s3:::bucket-" + "x" * 60 + f"-{i}/*" for i in range(60)]
-        rid = self.app.store.add("myapp", ["s3:GetObject"], big, "x", "k")
-        self.app.broker.approve(self.app.store.get(rid))
-        rid = self.app.store.add("myapp", ["s3:PutObject"], big, "x", "k")
-        with self.assertRaises(BrokerError):
-            self.app.broker.approve(self.app.store.get(rid))
+        self.approve(self.add(resources=big))
+        r = self.add(actions=["s3:PutObject"], resources=big)
+        msg = self.app.action({"op": "approve", "id": str(r["id"]), "digest": r["digest"]}, "owner")
+        self.assertIn("inline+policy+limit", msg.headers["Location"])
+        self.assertEqual(self.app.store.get(r["id"])["status"], "pending")
+        self.assertEqual(self.sids(), ["Req1"])
+
+    def test_remove_project_deletes_every_page_of_policies(self):
+        self.iam.roles["apm-myapp"] = {}
+        for i in range(5):
+            self.iam.policies["apm-myapp", f"extra-{i}"] = {}
+        real = self.iam.list_role_policies
+
+        def paged(RoleName, Marker=None):
+            names = real(RoleName)["PolicyNames"]
+            start = int(Marker or 0)
+            page = names[start:start + 2]
+            more = start + 2 < len(names)
+            return {"PolicyNames": page, "IsTruncated": more, **({"Marker": str(start + 2)} if more else {})}
+        self.iam.list_role_policies = paged
+        self.app.broker.remove_project("myapp")
+        self.assertEqual(self.iam.policies, {})
+        self.assertNotIn("apm-myapp", self.iam.roles)
 
 
 class PushTests(unittest.TestCase):

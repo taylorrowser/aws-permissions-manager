@@ -13,7 +13,7 @@ you (phone/desktop web app, WorkOS sign-in) ── approve ───────
 agent ── aws --profile apm-<project> ── credential_process ──────▶ └─ STS: AssumeRole → 1-hour credentials
 ```
 
-- **One IAM role per project**: `apm-<project>` under path `/agents/`. Each approved request becomes its own inline policy, `apm-grants-Req<id>` (roles from before this change are split the first time they're edited).
+- **One IAM role per project**: `apm-<project>` under path `/agents/`. Its inline policy `apm-grants` holds one statement per approved request.
 - **`apm-agent-boundary`**: a permissions boundary on every agent role. Even an approved grant can never give IAM writes, `sts:AssumeRole`, Organizations, account, SSO/identity or billing access. `iam:PassRole` is allowed only for other agent roles.
 - **`apm-broker` role (the Lambda)**: its permissions are limited to these:
   - create roles under `/agents/`, and only with the boundary attached;
@@ -24,7 +24,7 @@ agent ── aws --profile apm-<project> ── credential_process ────�
   It can't remove a boundary or touch any other IAM resource, and no long-lived broker key exists anywhere.
 - **Agents hold only an API key.** It lets them list projects, request permissions and get credentials. Approving needs your WorkOS sign-in. Any key can use any approved project; you tell each agent which one to use.
 - **Credentials never reach the model.** `get_aws_credentials` writes an AWS profile whose `credential_process` fetches 1-hour credentials on demand. The agent sees only the profile name.
-- **AWS is the source of truth.** Grants are read live from IAM. DynamoDB holds only requests, hashed API keys and push subscriptions, so editing it can't grant anything.
+- **IAM enforces, DynamoDB records decisions.** The dashboard reads grants live from IAM. Each approve or revoke is recorded in DynamoDB first, then the role's policy is rewritten from that project's approved requests, read strongly consistent. Only the broker Lambda and account admins can write the table, and the boundary denies agents any access to it. Even a tampered table can only grant what the boundary allows.
 
 ## Layout
 
@@ -93,7 +93,7 @@ The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `ap
 ## Security notes
 
 - Agents can never touch apm itself, whatever you approve. The boundary denies its SSM parameters (`/apm*`, including the session secret and push key), its Lambda, table, stack, `apm-*` buckets and logs, anything tagged `managed-by=apm`, and its DNS record. Without this, approving `ssm:GetParameter` or `lambda:UpdateFunctionCode` on `*` would let an agent forge your sign-in or replace the approval code. A boundary change takes effect only after a redeploy.
-- Each approve, reject, revoke or project deletion runs entirely under a per-project lease in DynamoDB and re-reads the request strongly consistent inside it, so concurrent Lambda instances can't interleave. Because every grant is its own policy, approving and revoking never rewrite other grants from a possibly stale IAM read.
+- Each approve, reject, revoke or project deletion runs entirely under a per-project lease in DynamoDB and re-reads the request strongly consistent inside it, so concurrent Lambda instances can't interleave. The policy is never rebuilt from an IAM read, which can be stale, so a revoked grant can't come back. If the IAM write fails, an approval goes back to pending; a revoke reports the error and can be retried.
 - `ssm:GetParametersByPath` on the root path `/` is denied too, since a recursive read of `/` would otherwise return `/apm/*`.
 - Approving `iam:PassRole` lets a project hand *another* agent role to a service. Approving `s3:*` on `*` means every bucket. Read the resources line; the dashboard flags wildcards.
 - Revoking removes the permission from the role immediately. Credentials already issued keep working until they expire (≤1 hour), but only with the role's *current* permissions.

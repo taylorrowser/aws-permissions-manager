@@ -36,8 +36,9 @@ class Store:
     def __init__(self, table):
         self.t = table
 
-    def _scan(self, kind):
-        items, kw = [], {"FilterExpression": "kind = :k", "ExpressionAttributeValues": {":k": kind}}
+    def _scan(self, kind, consistent=False):
+        items, kw = [], {"FilterExpression": "kind = :k", "ExpressionAttributeValues": {":k": kind},
+                         "ConsistentRead": consistent}
         while True:
             page = self.t.scan(**kw)
             items += page["Items"]
@@ -74,14 +75,6 @@ class Store:
                 if getattr(e, "response", {}).get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                     raise  # ours lapsed and someone else holds it now; leave theirs alone
 
-    # ---------- marks: one-way flags, read strongly consistent ----------
-
-    def is_marked(self, key):
-        return bool(self.t.get_item(Key={"pk": f"mark#{key}"}, ConsistentRead=True).get("Item"))
-
-    def mark(self, key):
-        self.t.put_item(Item={"pk": f"mark#{key}", "kind": "mark", "created_at": int(time.time())})
-
     # ---------- requests ----------
 
     def add(self, project, actions, resources, reason, requester=""):
@@ -102,6 +95,11 @@ class Store:
         rows = [_view(r) for r in self._scan("req")
                 if (not status or r["status"] == status) and (not project or r["project"] == project)]
         return sorted(rows, key=lambda r: r["id"], reverse=True)
+
+    def approved(self, project):
+        """Approved requests for a project, read strongly consistent: what its role must grant."""
+        return [_view(r) for r in self._scan("req", consistent=True)
+                if r["project"] == project and r["status"] == "approved"]
 
     def projects(self):
         return sorted({r["project"] for r in self._scan("req") if r["status"] in ("approved", "revoked")})
