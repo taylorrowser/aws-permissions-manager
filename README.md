@@ -30,6 +30,7 @@ agent ── aws --profile apm-<project> ── credential_process ────�
 
 | Path | What |
 |---|---|
+| `.github/workflows/`, `infra/`, `docs/deployment.md` | CI/CD workflows, OIDC bootstrap template (applied manually), deployment contract |
 | `apm/` | Hosted service (Lambda): `web.py` routes and auth, `pages.py` dashboard, `broker.py` IAM/STS, `store.py` DynamoDB, `push.py` Web Push, `policy.py` policies and validation, `deploy.py` + `cli.py` (`apm-admin`) owner deploy |
 | `apm/static/` | Web app: manifest, service worker, icons, `app.js` |
 | `plugins/aws-permissions/` | The plugin for Claude Code and Codex: MCP server + `apm` CLI in one stdlib-only script (`scripts/apm.py`), `skills/aws-access`, manifests for both tools |
@@ -52,6 +53,8 @@ Settings are saved to `~/.apm/deploy.json`, so later deploys are just `apm-admin
 - creates `/apm/session-secret` and the VAPID push keys in SSM Parameter Store (values never printed);
 - builds the Lambda bundle and uploads it to `apm-artifacts-<account>-<region>`;
 - creates the `apm` CloudFormation stack: boundary, broker role, Lambda, DynamoDB table, HTTP API, ACM certificate and DNS record.
+
+CI/CD (PR checks, opt-in per-PR previews, continuous deploy to dev, manual promotion of the same artifact to prod) is described in [docs/deployment.md](docs/deployment.md). Its cloud workflows stay disabled until the one-time bootstrap there is done; `apm-admin deploy` keeps working as above. `apm-admin --help` lists the build/verify/deploy-artifact/destroy/smoke commands they use.
 
 If your WorkOS application requires a client secret, store it without echoing it, then redeploy:
 
@@ -108,7 +111,7 @@ The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `ap
 .venv/bin/python -m unittest discover -s tests
 ```
 
-These use fake IAM, STS and DynamoDB. They also run the plugin's MCP server and CLI with the system `python3` against the app served locally.
+These use fake IAM, STS and DynamoDB. They also run the plugin's MCP server and CLI with the system `python3` against the app served locally. `tests/test_deploy.py` covers stage naming and isolation, prod template compatibility and artifact verification, without AWS or network.
 
 ## Legacy
 

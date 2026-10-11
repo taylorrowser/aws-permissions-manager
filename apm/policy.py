@@ -1,15 +1,101 @@
 """IAM policy documents and request validation. Pure functions, no AWS calls."""
 import fnmatch
 import json
+import os
 import re
+from dataclasses import dataclass
 
-ROLE_PATH = "/agents/"
-ROLE_PREFIX = "apm-"
 GRANTS_POLICY = "apm-grants"
-BOUNDARY_NAME = "apm-agent-boundary"
-BROKER_ROLE = "apm-broker"
-BROKER_ROLE_PATH = "/apm/"
 MAX_INLINE_POLICY_CHARS = 10240
+
+PROD = "prod"
+# prod, dev, or pr-<number>. Short enough that every derived IAM name stays under 64 chars.
+STAGE_RE = re.compile(r"^(prod|dev|pr-[1-9][0-9]{0,6})$")
+
+
+@dataclass(frozen=True)
+class Names:
+    """Every AWS name for one deployment stage. "prod" is byte-identical to the original single-stage
+    names. Other stages get isolated names that prod's IAM patterns can't match, and vice versa:
+
+    - agent roles live under /agents-<stage>/ (prod's broker only touches role/agents/*);
+    - nonprod IAM names use "_" after the stage, which a project name (and so a prod role
+      "apm-<project>") can never contain, so role/apm-<stage>_* never matches a prod role and
+      role/apm-pr-1_* never matches stage pr-12;
+    - SSM lives under /apm-<stage>/ (prod reads parameter/apm/*).
+    """
+    stage: str = PROD
+
+    def __post_init__(self):
+        if not STAGE_RE.match(self.stage or ""):
+            raise ValueError(f"invalid stage {self.stage!r}; use prod, dev or pr-<number>")
+
+    @property
+    def is_prod(self):
+        return self.stage == PROD
+
+    @property
+    def is_preview(self):
+        return self.stage.startswith("pr-")
+
+    @property
+    def base(self):  # stack, table, function, API, SSM prefix, log group
+        return "apm" if self.is_prod else f"apm-{self.stage}"
+
+    @property
+    def stack(self):
+        return self.base
+
+    @property
+    def table(self):
+        return self.base
+
+    @property
+    def function(self):
+        return self.base
+
+    @property
+    def param_prefix(self):
+        return "/" + self.base
+
+    @property
+    def role_path(self):
+        return "/agents/" if self.is_prod else f"/agents-{self.stage}/"
+
+    @property
+    def role_prefix(self):
+        return "apm-" if self.is_prod else f"apm-{self.stage}_"
+
+    @property
+    def boundary_name(self):
+        return "apm-agent-boundary" if self.is_prod else f"apm-{self.stage}_agent-boundary"
+
+    @property
+    def broker_role(self):
+        # "__" can't collide with an agent role apm-<stage>_<project>: projects start with a letter.
+        return "apm-broker" if self.is_prod else f"apm-{self.stage}__broker"
+
+    @property
+    def broker_role_path(self):
+        return "/apm/" if self.is_prod else f"/apm-{self.stage}/"
+
+    def artifact_bucket(self, account, region):
+        # Content-addressed keys, so all stages in one account can share it; prod's name is unchanged.
+        return f"apm-artifacts-{account}-{region}"
+
+
+def current_stage():
+    """The stage this process runs as. The Lambda gets APM_STAGE from the template; unset means prod,
+    which is what Lambdas deployed before stages existed run as."""
+    return os.environ.get("APM_STAGE") or PROD
+
+
+NAMES = Names(current_stage())
+ROLE_PATH = NAMES.role_path
+ROLE_PREFIX = NAMES.role_prefix
+BOUNDARY_NAME = NAMES.boundary_name
+BROKER_ROLE = NAMES.broker_role
+BROKER_ROLE_PATH = NAMES.broker_role_path
 
 PROJECT_RE = re.compile(r"^[a-z][a-z0-9-]{1,40}$")
 ACTION_RE = re.compile(r"^[a-z0-9-]+:[A-Za-z0-9*?]+$")
@@ -24,24 +110,25 @@ BLOCKED_ACTIONS = [
 IAM_ALLOWED = ["iam:Get*", "iam:List*", "iam:PassRole"]
 
 
-def role_name(project):
-    return ROLE_PREFIX + project
+def role_name(project, names=None):
+    return (names or NAMES).role_prefix + project
 
 
-def role_arn(account, project):
-    return f"arn:aws:iam::{account}:role{ROLE_PATH}{role_name(project)}"
+def role_arn(account, project, names=None):
+    return f"arn:aws:iam::{account}:role{(names or NAMES).role_path}{role_name(project, names)}"
 
 
-def agent_roles_arn(account):
-    return f"arn:aws:iam::{account}:role{ROLE_PATH}*"
+def agent_roles_arn(account, names=None):
+    return f"arn:aws:iam::{account}:role{(names or NAMES).role_path}*"
 
 
-def boundary_arn(account):
-    return f"arn:aws:iam::{account}:policy/{BOUNDARY_NAME}"
+def boundary_arn(account, names=None):
+    return f"arn:aws:iam::{account}:policy/{(names or NAMES).boundary_name}"
 
 
-def broker_role_arn(account):
-    return f"arn:aws:iam::{account}:role{BROKER_ROLE_PATH}{BROKER_ROLE}"
+def broker_role_arn(account, names=None):
+    n = names or NAMES
+    return f"arn:aws:iam::{account}:role{n.broker_role_path}{n.broker_role}"
 
 
 def doc(*statements):
@@ -63,13 +150,13 @@ def apm_resources(account):
     ]
 
 
-def boundary(account):
+def boundary(account, names=None):
     """Permissions boundary on every agent role: the most an agent role can ever do."""
     return doc(
         {"Sid": "AllowNonAdminServices", "Effect": "Allow", "NotAction": BLOCKED_ACTIONS, "Resource": "*"},
         {"Sid": "AllowIamRead", "Effect": "Allow", "Action": ["iam:Get*", "iam:List*"], "Resource": "*"},
         {"Sid": "AllowPassAgentRoles", "Effect": "Allow", "Action": "iam:PassRole",
-         "Resource": agent_roles_arn(account)},
+         "Resource": agent_roles_arn(account, names)},
         # Whatever is approved, agents can't touch apm itself.
         {"Sid": "DenyApmInfrastructure", "Effect": "Deny", "Action": "*", "Resource": apm_resources(account)},
         # The CloudFormation stack tags everything it creates (certificate, API, ...) managed-by=apm.
@@ -87,30 +174,31 @@ def boundary(account):
     )
 
 
-def broker_policy(account):
+def broker_policy(account, names=None):
     """The broker (the Lambda's role) can only create and edit agent roles, only with the
     boundary attached, and assume them to hand agents short-lived credentials."""
-    roles = agent_roles_arn(account)
+    n = names or NAMES
+    roles = agent_roles_arn(account, n)
     return doc(
         {"Sid": "CreateAgentRolesWithBoundary", "Effect": "Allow", "Action": "iam:CreateRole",
-         "Resource": roles, "Condition": {"StringEquals": {"iam:PermissionsBoundary": boundary_arn(account)}}},
+         "Resource": roles, "Condition": {"StringEquals": {"iam:PermissionsBoundary": boundary_arn(account, n)}}},
         {"Sid": "EditAgentRoles", "Effect": "Allow", "Resource": roles, "Action": [
             "iam:GetRole", "iam:TagRole", "iam:DeleteRole", "iam:ListRolePolicies", "iam:GetRolePolicy",
             "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:ListAttachedRolePolicies"]},
         {"Sid": "VendAgentCredentials", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": roles},
         # Lookups of a role that doesn't exist yet are authorized against an ARN without the path.
         {"Sid": "LookUpAgentRoles", "Effect": "Allow",
-         "Resource": f"arn:aws:iam::{account}:role/{ROLE_PREFIX}*",
+         "Resource": f"arn:aws:iam::{account}:role/{n.role_prefix}*",
          "Action": ["iam:GetRole", "iam:GetRolePolicy", "iam:ListRolePolicies"]},
         {"Sid": "NeverRemoveBoundary", "Effect": "Deny", "Resource": "*",
          "Action": ["iam:DeleteRolePermissionsBoundary", "iam:PutRolePermissionsBoundary"]},
     )
 
 
-def agent_role_trust(account):
+def agent_role_trust(account, names=None):
     """Only the broker can assume agent roles; agents get the resulting session credentials."""
     return doc({"Effect": "Allow", "Action": "sts:AssumeRole",
-                "Principal": {"AWS": broker_role_arn(account)}})
+                "Principal": {"AWS": broker_role_arn(account, names)}})
 
 
 def is_blocked(action):

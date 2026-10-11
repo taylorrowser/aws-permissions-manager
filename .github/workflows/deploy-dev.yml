@@ -1,0 +1,140 @@
+# Continuous deploy to dev (https://dev.apm.taylorrowser.com) after CI passes on main.
+# Deploys the exact artifact CI built for the commit (build once), smoke tests it, and records it
+# as eligible for promotion by uploading it as the `release-<sha>` artifact of this run.
+#
+# Disabled until bootstrap: nothing runs unless the repository variable APM_DEV_ENABLED is 'true'.
+# See docs/deployment.md.
+name: Deploy dev
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  # One dev deploy at a time; never cancel one in progress (CloudFormation would be left mid-update).
+  group: deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      vars.APM_DEV_ENABLED == 'true' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ${{ vars.APM_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    environment:
+      name: dev
+      url: https://dev.${{ vars.APM_BASE_DOMAIN || 'apm.taylorrowser.com' }}
+    permissions:
+      contents: read
+      actions: read # download the artifact from the CI run
+      id-token: write # GitHub OIDC -> AWS dev deploy role
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      CI_RUN_ID: ${{ github.event.workflow_run.id }}
+      STAGE: dev
+      DOMAIN: dev.${{ vars.APM_BASE_DOMAIN || 'apm.taylorrowser.com' }}
+      AWS_REGION: ${{ vars.APM_NONPROD_REGION || 'us-east-1' }}
+      ACCOUNT: ${{ vars.APM_NONPROD_ACCOUNT_ID }}
+      ROLE_ARN: ${{ vars.APM_DEV_ROLE_ARN }}
+      OWNER_EMAILS: ${{ vars.APM_OWNER_EMAILS }}
+      WORKOS_CLIENT_ID: ${{ vars.APM_STAGING_WORKOS_CLIENT_ID }}
+      ZONE_ID: ${{ vars.APM_DEV_ZONE_ID }}
+      CERT_ARN: ${{ vars.APM_DEV_CERT_ARN }}
+    steps:
+      - name: Check configuration
+        run: |
+          missing=()
+          for v in ACCOUNT ROLE_ARN OWNER_EMAILS WORKOS_CLIENT_ID; do [ -n "${!v}" ] || missing+=("$v"); done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::APM_DEV_ENABLED is true but these settings are empty: ${missing[*]} (see docs/deployment.md)"
+            exit 1
+          fi
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad head sha"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Commit must be on main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$SHA" origin/main
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install deploy tooling
+        run: python -m pip install --disable-pip-version-check -e .
+
+      - name: Download the artifact CI built for this commit
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lambda-${{ env.SHA }}
+          path: dist/lambda
+          run-id: ${{ env.CI_RUN_ID }}
+          github-token: ${{ github.token }}
+      - name: Verify artifact
+        run: apm-admin verify --artifact dist/lambda --git-sha "$SHA"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: apm-dev-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.ACCOUNT }}
+
+      - name: Skip if dev already runs a newer commit
+        id: order
+        run: |
+          bucket="apm-artifacts-${ACCOUNT}-${AWS_REGION}"
+          current=$(aws s3 cp "s3://${bucket}/deployments/dev/current.json" - 2>/dev/null \
+            | python -c 'import json,sys; print(json.load(sys.stdin)["git_sha"])' || true)
+          if [ -n "$current" ] && [ "$current" != "$SHA" ] && git merge-base --is-ancestor "$SHA" "$current" 2>/dev/null; then
+            echo "::notice::dev already runs ${current}, which contains ${SHA}; not deploying an older commit"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy to dev
+        if: steps.order.outputs.skip != 'true'
+        run: |
+          args=()
+          [ -n "$ZONE_ID" ] && args+=(--zone-id "$ZONE_ID")
+          [ -n "$CERT_ARN" ] && args+=(--certificate-arn "$CERT_ARN")
+          apm-admin deploy-artifact --stage "$STAGE" --artifact dist/lambda --git-sha "$SHA" \
+            --account "$ACCOUNT" --region "$AWS_REGION" --domain "$DOMAIN" \
+            --owner-email "$OWNER_EMAILS" --workos-client-id "$WORKOS_CLIENT_ID" "${args[@]}"
+
+      - name: Smoke test
+        if: steps.order.outputs.skip != 'true'
+        run: apm-admin smoke --url "https://${DOMAIN}"
+
+      - name: Record release candidate
+        if: steps.order.outputs.skip != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          # promote-prod.yml only accepts `release-<sha>` artifacts from successful runs of this workflow.
+          name: release-${{ env.SHA }}
+          path: dist/lambda/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summary
+        if: steps.order.outputs.skip != 'true'
+        run: |
+          {
+            echo "### Deployed to dev"
+            echo "- URL: https://${DOMAIN}"
+            echo "- Commit: \`${SHA}\`"
+            echo "- Artifact sha256: \`$(python -c 'import json; print(json.load(open("dist/lambda/manifest.json"))["sha256"])')\`"
+            echo "- Promote: run **Promote to prod** on main with sha \`${SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

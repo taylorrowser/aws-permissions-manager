@@ -1,0 +1,13 @@
+# Lambda bundle dependencies, locked with hashes. Installed by apm.deploy.build_zip() with
+#   pip install --require-hashes --no-deps --only-binary=:all: \
+#     --platform manylinux2014_aarch64 --python-version 3.13 --implementation cp
+# boto3 is not bundled: the Lambda runtime provides it.
+# To update: bump the versions, then take the sha256 of each wheel pip selects for that platform
+# (`pip download` with the same flags, then `shasum -a 256 *.whl`) and cross-check against PyPI.
+cryptography==50.0.2 \
+    --hash=sha256:79def8d059362e7831389ed3be0ecdf58a89386e1271e35dd9f5af84e81bffd0 \
+    --hash=sha256:c5e67125c7dca78d199ec4e116aa93dbb83494808ecbb8211a2cb09b1bf41dbd
+cffi==2.1.1 \
+    --hash=sha256:f16c709686a78c727bbbf059f92b0bf41c6fc60deec706d2dc19f529175a6125
+pycparser==3.11 \
+    --hash=sha256:51d5a8ba2be0bbe440b99d2112604c95bbbc3c2748a64260186c541e1729cd80

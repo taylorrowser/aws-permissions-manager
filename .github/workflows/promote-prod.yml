@@ -1,0 +1,170 @@
+# Manual promotion to prod (https://apm.taylorrowser.com): deploys the SAME artifact that dev
+# deployed and smoke tested for a commit on main. Rollback = run this again with an older
+# known-good sha whose release-<sha> artifact still exists (90-day retention).
+#
+# Gate: workflow_dispatch from main only, plus the checks in `validate`. Required environment
+# reviewers are not available for private repos on GitHub Free/Pro/Team, so this workflow does
+# not rely on them. Disabled until bootstrap: needs the repository variable
+# APM_PROD_DEPLOY_ENABLED == 'true'. See docs/deployment.md.
+name: Promote to prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full 40-character commit sha on main that dev deployed successfully
+        required: true
+        type: string
+      sha256:
+        description: Optional expected artifact sha256 (from the dev run summary)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: vars.APM_PROD_DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.APM_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read # look up the dev run and its artifact
+    outputs:
+      run_id: ${{ steps.release.outputs.run_id }}
+    env:
+      SHA: ${{ inputs.sha }}
+      SHA256: ${{ inputs.sha256 }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Check input
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be a full 40-character lowercase commit sha"; exit 1; }
+          [ -z "$SHA256" ] || [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::sha256 must be 64 hex characters"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Commit must be on main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$SHA" origin/main || {
+            echo "::error::${SHA} is not an ancestor of origin/main"; exit 1; }
+
+      - name: Find the release artifact from a successful dev deploy
+        id: release
+        run: |
+          # Newest unexpired release-<sha> artifact. Only deploy-dev.yml uploads these, and only
+          # after its dev deploy and smoke test passed; the run checks below confirm that.
+          found=$(gh api "repos/${REPO}/actions/artifacts?name=release-${SHA}&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .workflow_run.id // empty')
+          if [ -z "$found" ]; then
+            echo "::error::no unexpired release-${SHA} artifact: dev never deployed this commit successfully, or it expired (90 days)"
+            exit 1
+          fi
+          run=$(gh api "repos/${REPO}/actions/runs/${found}" \
+            --jq '[.path, .conclusion, .event, .head_branch, .head_repository.full_name] | @tsv')
+          IFS=$'\t' read -r path conclusion event branch repo <<< "$run"
+          if [ "$path" != ".github/workflows/deploy-dev.yml" ] || [ "$conclusion" != "success" ] \
+             || [ "$event" != "workflow_run" ] || [ "$branch" != "main" ] || [ "$repo" != "$REPO" ]; then
+            echo "::error::run ${found} is not a successful deploy-dev run on main (${path} ${conclusion} ${event} ${branch} ${repo})"
+            exit 1
+          fi
+          echo "run_id=${found}" >> "$GITHUB_OUTPUT"
+          echo "Dev deploy run: ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${found}"
+
+  deploy:
+    needs: validate
+    runs-on: ${{ vars.APM_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    environment:
+      name: production
+      url: https://${{ vars.APM_BASE_DOMAIN || 'apm.taylorrowser.com' }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write # GitHub OIDC -> AWS prod deploy role
+    env:
+      SHA: ${{ inputs.sha }}
+      SHA256: ${{ inputs.sha256 }}
+      DEV_RUN_ID: ${{ needs.validate.outputs.run_id }}
+      DOMAIN: ${{ vars.APM_BASE_DOMAIN || 'apm.taylorrowser.com' }}
+      AWS_REGION: ${{ vars.APM_PROD_REGION || 'us-east-1' }}
+      ACCOUNT: ${{ vars.APM_PROD_ACCOUNT_ID }}
+      ROLE_ARN: ${{ vars.APM_PROD_ROLE_ARN }}
+      OWNER_EMAILS: ${{ vars.APM_OWNER_EMAILS }}
+      WORKOS_CLIENT_ID: ${{ vars.APM_PROD_WORKOS_CLIENT_ID }}
+      ZONE_ID: ${{ vars.APM_PROD_ZONE_ID }}
+    steps:
+      - name: Check configuration
+        run: |
+          missing=()
+          for v in ACCOUNT ROLE_ARN OWNER_EMAILS WORKOS_CLIENT_ID DEV_RUN_ID; do [ -n "${!v}" ] || missing+=("$v"); done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::these settings are empty: ${missing[*]} (see docs/deployment.md)"
+            exit 1
+          fi
+
+      # Deploy tooling from the commit being promoted, the same code dev deployed it with.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install deploy tooling
+        run: python -m pip install --disable-pip-version-check -e .
+
+      - name: Download the dev-tested artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-${{ inputs.sha }}
+          path: dist/lambda
+          run-id: ${{ needs.validate.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify artifact digest
+        run: |
+          args=(--artifact dist/lambda --git-sha "$SHA")
+          [ -n "$SHA256" ] && args+=(--sha256 "$SHA256")
+          apm-admin verify "${args[@]}"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: apm-prod-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.ACCOUNT }}
+
+      - name: Deploy to prod
+        run: |
+          args=()
+          [ -n "$ZONE_ID" ] && args+=(--zone-id "$ZONE_ID")
+          [ -n "$SHA256" ] && args+=(--sha256 "$SHA256")
+          apm-admin deploy-artifact --stage prod --artifact dist/lambda --git-sha "$SHA" \
+            --account "$ACCOUNT" --region "$AWS_REGION" --domain "$DOMAIN" \
+            --owner-email "$OWNER_EMAILS" --workos-client-id "$WORKOS_CLIENT_ID" "${args[@]}"
+
+      - name: Smoke test
+        run: apm-admin smoke --url "https://${DOMAIN}" --attempts 12
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Promote to prod: ${{ job.status }}"
+            echo "- URL: https://${DOMAIN}"
+            echo "- Commit: \`${SHA}\`"
+            [ -f dist/lambda/manifest.json ] && \
+              echo "- Artifact sha256: \`$(python -c 'import json; print(json.load(open("dist/lambda/manifest.json"))["sha256"])')\`"
+            echo "- Dev run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${DEV_RUN_ID}"
+            echo "- Rollback: run this workflow again with an older known-good sha"
+          } >> "$GITHUB_STEP_SUMMARY"
