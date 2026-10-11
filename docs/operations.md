@@ -2,12 +2,13 @@
 
 What to do when something goes wrong in prod: a bad deploy, damaged data, or a leaked key, session or device. Every AWS command here uses your own admin login (`aws login`), not an agent's `apm-*` profile, because agent roles are denied all of apm's infrastructure on purpose.
 
-Prod values used below:
+Start every session with these. The last line prints a warning if the credentials are for any other account; if you see it, stop:
 
 ```sh
+export AWS_REGION=us-east-1          # also set AWS_PROFILE if your admin login isn't the default profile
 ACCOUNT=654654478411
-REGION=us-east-1
-BUCKET=apm-artifacts-$ACCOUNT-$REGION
+BUCKET=apm-artifacts-$ACCOUNT-$AWS_REGION
+[ "$(aws sts get-caller-identity --query Account --output text)" = "$ACCOUNT" ] || echo "WRONG AWS ACCOUNT: stop here"
 ```
 
 ## Deploy prod (owner path)
@@ -56,7 +57,7 @@ The `apm` table holds every decision, key and device, and each project's IAM pol
 
 **Never let apm run on an empty or re-created `apm` table.** Request numbers would restart at 1, and the next approval for a project would rewrite its role policy from the new table alone, removing grants that are still in IAM.
 
-To restore, AWS can't restore in place, so restore to a new table, check it, then swap it in under the same name:
+To restore, AWS can't restore in place, so restore to a new table and check it. Then, with apm paused, swap it in under the same name and reconcile IAM before reopening:
 
 ```sh
 T=apm-restore-$(date -u +%Y%m%d%H%M)
@@ -65,16 +66,35 @@ aws dynamodb restore-table-to-point-in-time --source-table-name apm --target-tab
 aws dynamodb wait table-exists --table-name $T
 aws dynamodb scan --table-name $T --select COUNT                    # sanity check; inspect items as needed
 BACKUP=$(aws dynamodb create-backup --table-name $T --backup-name $T --query BackupDetails.BackupArn --output text)
-# Downtime starts: the dashboard and credential vending fail; IAM grants already in place keep working.
+until [ "$(aws dynamodb describe-backup --backup-arn "$BACKUP" \
+           --query BackupDescription.BackupDetails.BackupStatus --output text)" = AVAILABLE ]; do sleep 10; done
+
+# Pause apm: no request reaches the Lambda until the end. IAM grants already in place keep working.
+aws lambda put-function-concurrency --function-name apm --reserved-concurrent-executions 0
 aws dynamodb delete-table --table-name apm
 aws dynamodb wait table-not-exists --table-name apm
 aws dynamodb restore-table-from-backup --target-table-name apm --backup-arn "$BACKUP"
 aws dynamodb wait table-exists --table-name apm
 aws dynamodb update-continuous-backups --table-name apm \
   --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true   # restores don't keep PITR
+aws dynamodb tag-resource --resource-arn arn:aws:dynamodb:$AWS_REGION:$ACCOUNT:table/apm \
+  --tags Key=managed-by,Value=apm                                           # restores don't keep tags either
 ```
 
-Then open **Projects**. If any project shows "IAM doesn't match your decisions", press **Re-apply decisions**. Finally, delete `$T` and its backup.
+The restored table only knows what happened before the restore time, so reconcile IAM before reopening:
+
+1. **Roles the table doesn't know.** List the agent roles with `aws iam list-roles --path-prefix /agents/ --query 'Roles[].RoleName'`. Then compare them with the restored projects: `aws dynamodb scan --table-name apm --filter-expression "kind = :r" --expression-attribute-values '{":r":{"S":"req"}}' --projection-expression project`. A role with no restored project would keep its grants, but the dashboard would never show it. Remove it by hand:
+
+   ```sh
+   aws iam delete-role-policy --role-name apm-<project> --policy-name apm-grants
+   aws iam delete-role --role-name apm-<project>
+   ```
+
+2. **Reopen apm** with `aws lambda delete-function-concurrency --function-name apm`, then right away check two things:
+   - **Projects:** press **Re-apply decisions** on any project flagged "IAM doesn't match your decisions". Revoke again anything you revoked after the restore time, because the restore brought it back.
+   - **Keys** and **Notifications:** delete again any key or device you deleted after the restore time.
+
+Finally, delete `$T` and its backup.
 
 ## Something leaked
 
@@ -82,7 +102,7 @@ Then open **Projects**. If any project shows "IAM doesn't match your decisions",
 |---|---|---|
 | An agent API key | **Keys** → Delete it. Then reconnect that machine (`connect` tool or `apm login`). | The key stops working on its next call. Credentials it already fetched last up to 1 hour, but only with each role's current permissions. To cut those off now, revoke the grants they could use. |
 | A grant was too broad | **Projects** → Revoke it. | The role's policy changes immediately, and that applies to sessions already issued too. |
-| Your phone or a browser session | **Notifications** → Remove the device, then rotate the session secret (below). | Signs every browser out. Sign back in with WorkOS. |
+| Your phone or a browser session | **Notifications** → Remove the device. Rotate the session secret (below). In the WorkOS dashboard (production environment), revoke your user's sessions. Secure the email account too, since sign-in codes go there. | Signs every browser out of apm. A stolen device can't simply sign back in through a WorkOS session that's still open. |
 | The session secret | Rotate it as below. | All dashboard sessions end. |
 
 Rotate the session secret (the value is generated locally and never printed):
@@ -93,7 +113,10 @@ aws ssm put-parameter --name /apm/session-secret --type SecureString --overwrite
 # The Lambda reads it once per instance; a configuration change replaces running instances.
 aws lambda update-function-configuration --function-name apm \
   --description "session secret rotated $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+aws lambda wait function-updated-v2 --function-name apm     # fails if the update failed
 ```
+
+Then reload the dashboard on a signed-in device: it should ask you to sign in again.
 
 ## Where to look
 
