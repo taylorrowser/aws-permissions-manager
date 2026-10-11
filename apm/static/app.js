@@ -182,12 +182,14 @@ if (typeof document !== "undefined") {
   async function post(path, body) {
     const resp = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data.error || `server returned ${resp.status}`);
+    if (!resp.ok) throw Object.assign(new Error(data.error || `server returned ${resp.status}`), { status: resp.status });
     return data;
   }
 
-  async function save(subscription, replaces) {
-    const { device } = await post("/push/subscribe", { subscription: subscription.toJSON(), label: navigator.userAgent, replaces });
+  // auto: a background re-sync rather than the owner tapping Turn on. The server refuses those
+  // (410) for a device the owner removed, so a removal sticks.
+  async function save(subscription, replaces, auto = false) {
+    const { device } = await post("/push/subscribe", { subscription: subscription.toJSON(), label: navigator.userAgent, replaces, auto });
     for (const li of document.querySelectorAll("[data-device]")) {
       li.querySelector(".chip.this").hidden = li.dataset.device !== device;
     }
@@ -202,7 +204,7 @@ if (typeof document !== "undefined") {
       const old = sub.endpoint;
       await sub.unsubscribe();
       sub = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(key) });
-      await save(sub, old);
+      await save(sub, old, true);
     }
     return sub;
   }
@@ -257,21 +259,27 @@ if (typeof document !== "undefined") {
       return render(state);
     }
     const registration = await swReady;
-    let sub = null;
+    let sub = null, removedHere = false;
     try {
       sub = e.permission === "granted" ? await currentSubscription(registration, vapid) : null;
       // Re-register now and then (always on this screen) in case the server lost or removed it.
       const last = Number(localStorage.getItem("apm-push-sync") || 0);
       if (sub && (status || Date.now() - last > 3600000)) {
-        await save(sub);
+        await save(sub, undefined, true);
         localStorage.setItem("apm-push-sync", String(Date.now()));
       }
     } catch (err) {
-      console.warn("couldn't sync push subscription", err);
+      if (err.status === 410) {
+        await (await registration.pushManager.getSubscription())?.unsubscribe().catch(() => {});
+        sub = null;
+        removedHere = true;
+      } else {
+        console.warn("couldn't sync push subscription", err);
+      }
     }
     state = pushState({ ...e, subscribed: Boolean(sub) });
     if ($("push-nudge")) $("push-nudge").hidden = state !== "off";
-    render(state);
+    render(state, removedHere ? "This device was removed from notifications. Turn them on again to get alerts here." : undefined);
     if (!status) return;
 
     $("push-enable").onclick = async () => {

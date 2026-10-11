@@ -95,6 +95,8 @@ def deliver(subscriptions, message, private_pem, subject, ttl=86400, budget=10):
 
     def one(s):
         status = None
+        if time.monotonic() >= deadline:  # queued behind slow sends past the budget
+            return "failed", None
         for attempt in (1, 2):
             try:
                 status = send(s["sub"], message, private_pem, subject, ttl=ttl, timeout=4)
@@ -117,4 +119,5 @@ def deliver(subscriptions, message, private_pem, subject, ttl=86400, budget=10):
     futures = {s["pk"]: pool.submit(one, s) for s in subscriptions}
     wait(futures.values(), timeout=max(0, deadline - time.monotonic()))
     pool.shutdown(wait=False, cancel_futures=True)  # don't hold the response for a hung send
-    return {pk: f.result() if f.done() else ("failed", None) for pk, f in futures.items()}
+    # Cancelled futures also count as done, but have no result.
+    return {pk: f.result() if f.done() and not f.cancelled() else ("failed", None) for pk, f in futures.items()}

@@ -180,6 +180,7 @@ test("a rotated subscription is re-registered, replacing the old one", async () 
   const call = sw.fetched.find((f) => f.url === "/push/subscribe");
   const body = JSON.parse(call.init.body);
   assert.equal(body.replaces, "https://push.example/old");
+  assert.equal(body.auto, true);
   assert.equal(body.subscription.endpoint, "https://push.example/new");
   assert.equal(call.init.credentials, "same-origin");
 });

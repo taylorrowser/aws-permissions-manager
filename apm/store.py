@@ -222,6 +222,19 @@ class Store:
         if pk.startswith("sub#"):
             self.t.delete_item(Key={"pk": pk})
 
+    def remove_device(self, pk):
+        """The owner removed a device: delete it and remember that, so the device's browser,
+        which still holds its subscription, can't quietly sign itself up again."""
+        if pk.startswith("sub#"):
+            self.delete_subscription(pk)
+            self.t.put_item(Item={"pk": "subgone#" + pk[4:], "kind": "subgone", "created_at": int(time.time())})
+
+    def device_removed(self, pk):
+        return bool(self.t.get_item(Key={"pk": "subgone#" + pk[4:]}).get("Item"))
+
+    def clear_removed(self, pk):
+        self.t.delete_item(Key={"pk": "subgone#" + pk[4:]})
+
     def record_delivery(self, pk, ok, status):
         """Remember the last push outcome per device so the dashboard can show broken devices."""
         now = int(time.time())

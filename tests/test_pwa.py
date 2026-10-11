@@ -202,6 +202,24 @@ class PushApiTests(Base):
         self.post_json("/push/subscribe", {"subscription": new, "replaces": SUB["endpoint"]})
         self.assertEqual([s["sub"]["endpoint"] for s in self.app.store.subscriptions()], [new["endpoint"]])
 
+    def test_removed_device_cannot_silently_resubscribe(self):
+        _, data = self.post_json("/push/subscribe", {"subscription": SUB})
+        self.action({"op": "delete_device", "pk": data["device"], "back": "/devices"})
+        self.assertEqual(self.app.store.subscriptions(), [])
+        # The phone's browser still holds its subscription; background syncs are refused...
+        self.assertEqual(self.post_json("/push/subscribe", {"subscription": SUB, "auto": True})[0], 410)
+        rotated = {**SUB, "endpoint": "https://push.example/rotated"}
+        self.assertEqual(self.post_json("/push/subscribe", {"subscription": rotated, "replaces": SUB["endpoint"],
+                                                            "auto": True})[0], 410)
+        self.assertEqual(self.app.store.subscriptions(), [])
+        # ...until the owner taps Turn on there, which clears the removal.
+        self.assertEqual(self.post_json("/push/subscribe", {"subscription": SUB})[0], 200)
+        self.assertEqual(self.post_json("/push/subscribe", {"subscription": SUB, "auto": True})[0], 200)
+
+    def test_lost_device_still_resyncs_automatically(self):
+        # Not removed by the owner (e.g. the push service said gone, or the table lost it).
+        self.assertEqual(self.post_json("/push/subscribe", {"subscription": SUB, "auto": True})[0], 200)
+
     def test_unsubscribe(self):
         self.post_json("/push/subscribe", {"subscription": SUB})
         self.assertEqual(self.post_json("/push/unsubscribe", {"endpoint": SUB["endpoint"]})[0], 200)
@@ -335,6 +353,20 @@ class DeadlineTests(unittest.TestCase):
         release.set()
         self.assertLess(time.monotonic() - start, 2)
         self.assertEqual(out, {"sub#fast": ("delivered", 201), "sub#slow": ("failed", None)})
+
+    def test_sends_queued_past_the_budget_are_failed_not_raised(self):
+        import threading
+        release = threading.Event()
+        subs = [{"pk": f"sub#{i}", "sub": {**SUB, "endpoint": f"https://p/{i}"}} for i in range(20)]
+
+        def blocked(sub, *a, **k):
+            release.wait(5)
+            return 201
+        with mock.patch("apm.push.send", side_effect=blocked):
+            out = push.deliver(subs, {}, "pem", ORIGIN, budget=0.3)
+        release.set()
+        self.assertEqual(len(out), 20)
+        self.assertTrue(all(v == ("failed", None) for v in out.values()))
 
     def test_no_retry_once_the_budget_is_nearly_spent(self):
         with mock.patch("apm.push.send", return_value=503) as send:

@@ -373,7 +373,7 @@ class App:
             self.store.delete_key(form.get("pk", ""))
             return "Deleted the API key. Agents using it can no longer connect."
         if op == "delete_device":
-            self.store.delete_subscription(form.get("pk", ""))
+            self.store.remove_device(form.get("pk", ""))
             return "Removed the device from notifications."
         return "Unknown action."
 
@@ -417,7 +417,14 @@ class App:
             if not str(sub.get("endpoint", "")).startswith("https://") or not isinstance(sub.get("keys"), dict) \
                     or not sub["keys"].get("p256dh") or not sub["keys"].get("auth"):
                 raise ApiError(400, "invalid subscription")
-            replaces = str(body.get("replaces", ""))
+            device, replaces = subscription_id(sub["endpoint"]), str(body.get("replaces", ""))
+            removed = [d for d in (device, subscription_id(replaces) if replaces else None)
+                       if d and self.store.device_removed(d)]
+            if body.get("auto") and removed:
+                # Background re-syncs must not undo a removal; only tapping Turn on does.
+                raise ApiError(410, "this device was removed from notifications")
+            for d in removed:
+                self.store.clear_removed(d)
             if replaces and replaces != sub["endpoint"]:
                 self.store.delete_subscription(subscription_id(replaces))
             device = self.store.add_subscription(sub, str(body.get("label", "device")))

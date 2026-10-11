@@ -102,7 +102,7 @@ self.addEventListener("pushsubscriptionchange", (event) => {
     if (!sub) return;
     await fetch("/push/subscribe", {
       method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ subscription: sub.toJSON(), label: self.navigator.userAgent, replaces: old?.endpoint || "" }),
+      body: JSON.stringify({ subscription: sub.toJSON(), label: self.navigator.userAgent, replaces: old?.endpoint || "", auto: true }),
     }).catch(() => {});
   })());
 });
