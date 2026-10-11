@@ -59,7 +59,7 @@ The `apm` table holds every decision, key and device, and each project's IAM pol
 
 A restored table only knows what happened before the restore time. Keys deleted, grants revoked and projects approved after that would come back wrong. So **a restore resets access**: it keeps the history, but every grant is revoked, every key and device is removed, and agents connect and ask again. All of it happens while apm is paused.
 
-AWS can't restore a table in place, so restore to a new table, check it, then swap it in under the same name:
+AWS can't restore a table in place. So restore to a new table and check it. Then pause apm, swap the copy in under the same name, and reset access on the final table before reopening.
 
 ```sh
 T=apm-restore-$(date -u +%Y%m%d%H%M)
@@ -68,30 +68,11 @@ aws dynamodb restore-table-to-point-in-time --source-table-name apm --target-tab
 aws dynamodb wait table-exists --table-name $T
 aws dynamodb scan --table-name $T --select COUNT                    # sanity check; inspect items as needed
 
-# 1. Pause apm: from here on no request reaches the Lambda.
+# 1. Pause apm and let running requests finish (the Lambda timeout is 29 s).
 aws lambda put-function-concurrency --function-name apm --reserved-concurrent-executions 0
+sleep 60
 
-# 2. Reset access in the restored copy: approved -> revoked; drop keys, connect requests and devices.
-for pk in $(aws dynamodb scan --table-name $T --filter-expression "kind = :r AND #s = :a" \
-    --expression-attribute-names '{"#s":"status"}' \
-    --expression-attribute-values '{":r":{"S":"req"},":a":{"S":"approved"}}' \
-    --projection-expression pk --query 'Items[].pk.S' --output text); do
-  aws dynamodb update-item --table-name $T --key "{\"pk\":{\"S\":\"$pk\"}}" \
-    --update-expression "SET #s = :v, note = :n" --expression-attribute-names '{"#s":"status"}' \
-    --expression-attribute-values '{":v":{"S":"revoked"},":n":{"S":"revoked by table restore"}}'
-done
-for pk in $(aws dynamodb scan --table-name $T --filter-expression "kind IN (:k, :c, :d)" \
-    --expression-attribute-values '{":k":{"S":"key"},":c":{"S":"connect"},":d":{"S":"sub"}}' \
-    --projection-expression pk --query 'Items[].pk.S' --output text); do
-  aws dynamodb delete-item --table-name $T --key "{\"pk\":{\"S\":\"$pk\"}}"
-done
-
-# 3. Remove every grant from every agent role, including roles the restored table doesn't know.
-for role in $(aws iam list-roles --path-prefix /agents/ --query 'Roles[].RoleName' --output text); do
-  aws iam delete-role-policy --role-name "$role" --policy-name apm-grants 2>/dev/null || true
-done
-
-# 4. Swap the restored copy in as `apm`, once its backup is usable.
+# 2. Swap the copy in as `apm`. Nothing has written to $T since it was restored.
 BACKUP=$(aws dynamodb create-backup --table-name $T --backup-name $T --query BackupDetails.BackupArn --output text)
 until [ "$(aws dynamodb describe-backup --backup-arn "$BACKUP" \
            --query BackupDescription.BackupDetails.BackupStatus --output text)" = AVAILABLE ]; do sleep 10; done
@@ -103,10 +84,52 @@ aws dynamodb update-continuous-backups --table-name apm \
   --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true   # restores don't keep PITR
 aws dynamodb tag-resource --resource-arn "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT}:table/apm" \
   --tags Key=managed-by,Value=apm                                           # or tags
-
-# 5. Reopen.
-aws lambda delete-function-concurrency --function-name apm
 ```
+
+Step 3 resets access. It runs in bash with `-euo pipefail`, so it stops at the first failure and apm stays paused. It ends by checking the result:
+
+```sh
+AWS_REGION=$AWS_REGION bash -euo pipefail <<'RESET'
+key() { printf '{"pk":{"S":"%s"}}' "$1"; }
+status='{"#s":"status"}'
+# Approved -> revoked (the history stays). Consistent reads, so nothing just written is missed.
+approved=$(aws dynamodb scan --table-name apm --consistent-read --filter-expression "kind = :r AND #s = :a" \
+  --expression-attribute-names "$status" \
+  --expression-attribute-values '{":r":{"S":"req"},":a":{"S":"approved"}}' \
+  --projection-expression pk --query 'Items[].pk.S' --output text)
+for pk in $approved; do
+  aws dynamodb update-item --table-name apm --key "$(key "$pk")" \
+    --update-expression "SET #s = :v, note = :n" --expression-attribute-names "$status" \
+    --expression-attribute-values '{":v":{"S":"revoked"},":n":{"S":"revoked by table restore"}}'
+done
+# Remove keys, connect requests and devices: agents reconnect, the phone turns notifications back on.
+access=$(aws dynamodb scan --table-name apm --consistent-read --filter-expression "kind IN (:k, :c, :d)" \
+  --expression-attribute-values '{":k":{"S":"key"},":c":{"S":"connect"},":d":{"S":"sub"}}' \
+  --projection-expression pk --query 'Items[].pk.S' --output text)
+for pk in $access; do
+  aws dynamodb delete-item --table-name apm --key "$(key "$pk")"
+done
+# Remove every grant from every agent role, including roles the restored table doesn't know.
+roles=$(aws iam list-roles --path-prefix /agents/ --query 'Roles[].RoleName' --output text)
+for role in $roles; do
+  has=$(aws iam list-role-policies --role-name "$role" --query "contains(PolicyNames, 'apm-grants')" --output text)
+  if [ "$has" = True ]; then aws iam delete-role-policy --role-name "$role" --policy-name apm-grants; fi
+done
+# Verify before reopening.
+left=$(aws dynamodb scan --table-name apm --consistent-read --select COUNT \
+  --filter-expression "(kind = :r AND #s = :a) OR kind IN (:k, :c, :d)" --expression-attribute-names "$status" \
+  --expression-attribute-values '{":r":{"S":"req"},":a":{"S":"approved"},":k":{"S":"key"},":c":{"S":"connect"},":d":{"S":"sub"}}' \
+  --query Count --output text)
+[ "$left" = 0 ] || { echo "table still grants access ($left items); apm stays paused"; exit 1; }
+for role in $roles; do
+  [ "$(aws iam list-role-policies --role-name "$role" --query "contains(PolicyNames, 'apm-grants')" --output text)" = False ] \
+    || { echo "$role still has apm-grants; apm stays paused"; exit 1; }
+done
+echo "Access reset and verified."
+RESET
+```
+
+4. Only after it prints `Access reset and verified.`, reopen apm with `aws lambda delete-function-concurrency --function-name apm`.
 
 After reopening:
 - Projects show only revoked grants, with no mismatch warnings.
