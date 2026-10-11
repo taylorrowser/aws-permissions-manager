@@ -250,8 +250,9 @@ Measured locally (Apple Silicon, warm pip cache):
 - the 41 tests take about 3 s;
 - an artifact build takes about 2 s.
 
-On a GitHub-hosted runner, a CI run is dominated by setup: checkout, Python, `pip install`. Expect
-roughly 1–2 minutes per job, 2 jobs per run. Deploy jobs mostly wait on CloudFormation: ~1–3
+On a GitHub-hosted runner, a CI run is dominated by setup: checkout, Python, `pip install`. The
+first real run (PR #2, `ubuntu-24.04`) took 29 s for `test` and 18 s for `build`, so about 1
+billed minute per job and about 2 per CI run. Deploy jobs mostly wait on CloudFormation: ~1–3
 minutes for a code-only update, 5+ minutes when a new ACM certificate is created.
 
 | | Included (private repos) | Overage / price |
