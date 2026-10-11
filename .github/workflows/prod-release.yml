@@ -5,7 +5,7 @@
 # <owner>/<repo>/.github/workflows/prod-release.yml@refs/heads/main, which the prod role trust
 # can require (see infra/github-oidc-bootstrap.yaml and docs/deployment.md).
 #
-# Flow: resolve (read-only creds) -> validate record, digest and ancestry -> deploy the SAME bytes
+# Flow: resolve (read-only creds) -> validate record, digest, GitHub provenance and ancestry -> deploy the SAME bytes
 # (no rebuild) with the prod role -> health check -> write a prod release record.
 # Serialization lives in the callers (concurrency group deploy-production, never cancelled).
 name: Prod release (reusable)
@@ -62,6 +62,7 @@ jobs:
     environment: production
     permissions:
       contents: read
+      actions: read # provenance: read CI / deploy runs and download their artifacts
       id-token: write # promote: nonprod release-reader role (read-only); rollback: prod role (reads only here)
     outputs:
       release_id: ${{ steps.resolve.outputs.release_id }}
@@ -114,6 +115,17 @@ jobs:
           [ -n "$SHA256" ] && args+=(--sha256 "$SHA256")
           [ "$MODE" = promote ] && [ "$ALLOW_SUPERSEDED" = true ] && args+=(--allow-superseded)
           apm-admin release resolve "${args[@]}"
+
+      # S3 records alone are not trusted: code running in the nonprod account (a preview runs PR
+      # code there) must never be able to forge a promotable release. Independently confirm with
+      # GitHub that the record's CI run is a successful ci.yml push run on main for this exact
+      # commit in this repository, that the bundle has the digest that run built (fails closed if
+      # the CI artifact expired), and that the dev deploy run recorded this exact release.
+      - name: Verify provenance with the GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: apm-admin release provenance --mode "$MODE" --record dist/lambda/release.json --repo "$REPO"
 
       - name: Released commit must be on main
         env:

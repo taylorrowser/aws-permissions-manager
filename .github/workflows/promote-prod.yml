@@ -39,6 +39,7 @@ jobs:
     uses: ./.github/workflows/prod-release.yml
     permissions:
       contents: read
+      actions: read # provenance checks against the CI and deploy runs
       id-token: write
     with:
       mode: promote

@@ -564,5 +564,306 @@ class Workflows(unittest.TestCase):
                 self.assertTrue(gated, f"{name}:{job_id}")
 
 
+
+# ---------- review finding 4: GitHub API failures must not delete previews ----------
+
+class SweeperFailsSafe(unittest.TestCase):
+    FUTURE, FAR_FUTURE, PAST = "2026-10-20T00:00:00Z", "2099-01-01T00:00:00Z", "2026-10-01T00:00:00Z"
+
+    def test_unknown_state_never_deletes_an_unexpired_preview(self):
+        logs = []
+        stacks = [stack("apm-pr-1", "pr-1", self.FAR_FUTURE), stack("apm-pr-2", "pr-2", self.FUTURE),
+                  stack("apm-pr-3", "pr-3", "not-a-date"), stack("apm-pr-4", "pr-4")]
+        got = preview.sweep_decisions(stacks, lambda n: ("unknown", None), T0, log=logs.append)
+        self.assertEqual(got, [])
+        self.assertEqual(len(logs), 4)
+        self.assertIn("unknown", logs[0])
+
+    def test_expiry_alone_suffices_even_when_github_is_down(self):
+        def broken(n):
+            raise AssertionError("an expired preview needs no GitHub answer")
+        got = dict(preview.sweep_decisions([stack("apm-pr-1", "pr-1", self.PAST)], broken, T0))
+        self.assertEqual(list(got), ["pr-1"])
+        self.assertIn("expired", got["pr-1"])
+
+    def test_only_confirmed_states_delete(self):
+        stacks = [stack(f"apm-pr-{i}", f"pr-{i}", self.FAR_FUTURE) for i in range(1, 7)]
+        info = {1: ("closed", False), 2: ("open", False), 3: ("open", True), 4: ("", None),
+                5: ("merged?", True), 6: ("open", None)}
+        got = dict(preview.sweep_decisions(stacks, lambda n: info[n], T0))
+        self.assertEqual(sorted(got), ["pr-1", "pr-2"])
+
+    def sweep_with(self, api, expires):
+        from unittest import mock
+        stacks = [stack("apm-pr-7", "pr-7", expires)]
+        session = mock.MagicMock()
+        session.client.return_value.get_caller_identity.return_value = {"Account": ACCOUNT}
+        session.client.return_value.get_paginator.return_value.paginate.return_value = [{"Stacks": stacks}]
+        destroyed, logs = [], []
+        with mock.patch("boto3.Session", return_value=session), \
+                mock.patch.object(deploy, "destroy", side_effect=lambda stage, **kw: destroyed.append(stage)):
+            preview.sweep(REPO, api=api, unlabel=lambda *a: None, expected_account=ACCOUNT, log=logs.append)
+        return destroyed, logs
+
+    def test_sweep_api_error_far_future_expiry_is_kept(self):
+        def api(path):
+            raise RuntimeError("HTTP 403: API rate limit exceeded")
+        destroyed, logs = self.sweep_with(api, self.FAR_FUTURE)
+        self.assertEqual(destroyed, [])
+        self.assertTrue(any("rate limit" in m for m in logs), logs)
+        self.assertTrue(any("skipping pr-7" in m for m in logs), logs)
+
+    def test_sweep_api_error_expired_is_deleted(self):
+        def api(path):
+            raise RuntimeError("HTTP 502")
+        destroyed, _ = self.sweep_with(api, self.PAST)
+        self.assertEqual(destroyed, ["pr-7"])
+
+    def test_sweep_malformed_api_answer_is_unknown(self):
+        destroyed, _ = self.sweep_with(lambda path: {"message": "Server Error"}, self.FAR_FUTURE)
+        self.assertEqual(destroyed, [])
+        destroyed, _ = self.sweep_with(lambda path: {"state": "closed", "labels": []}, self.FAR_FUTURE)
+        self.assertEqual(destroyed, ["pr-7"])
+
+    def test_plan_never_removes_on_unexpected_state(self):
+        pr = {"number": 7, "state": None, "labels": [{"name": "preview"}],
+              "head": {"sha": SHA_A, "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}}
+        with self.assertRaises(preview.PlanError):
+            preview.plan("workflow_dispatch", {}, REPO, fake_api(pr), dispatch_pr="7", dispatch_action="deploy")
+
+
+# ---------- review finding 1: promotion re-checks provenance with GitHub ----------
+
+def _zip(files):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, body in files.items():
+            z.writestr(name, body)
+    return buf.getvalue()
+
+
+class FakeGitHub:
+    """Workflow runs, their artifacts and artifact downloads, as the REST API returns them."""
+
+    def __init__(self):
+        self.runs, self.artifacts, self.blobs, self.fail = {}, {}, {}, set()
+        self.next_id = 500
+
+    def add_run(self, run_id, **kw):
+        run = {"id": run_id, "status": "completed", "conclusion": "success", "head_branch": "main",
+               "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO}}
+        run.update(kw)
+        self.runs[run_id] = run
+        return run
+
+    def add_artifact(self, run_id, name, files, expired=False):
+        self.next_id += 1
+        self.artifacts.setdefault(run_id, []).append(
+            {"id": self.next_id, "name": name, "expired": expired, "workflow_run": {"id": run_id}})
+        self.blobs[self.next_id] = _zip(files)
+
+    def api(self, path):
+        if path in self.fail:
+            raise RuntimeError("HTTP 503")
+        m = re.fullmatch(rf"repos/{re.escape(REPO)}/actions/runs/(\d+)", path)
+        if m:
+            if int(m.group(1)) not in self.runs:
+                raise RuntimeError("HTTP 404")
+            return self.runs[int(m.group(1))]
+        m = re.fullmatch(rf"repos/{re.escape(REPO)}/actions/runs/(\d+)/artifacts\?name=([^&]+)&per_page=100", path)
+        if m:
+            arts = [a for a in self.artifacts.get(int(m.group(1)), []) if a["name"] == m.group(2)]
+            return {"total_count": len(arts), "artifacts": arts}
+        raise AssertionError(path)
+
+    def download(self, path):
+        m = re.fullmatch(rf"repos/{re.escape(REPO)}/actions/artifacts/(\d+)/zip", path)
+        return self.blobs[int(m.group(1))]
+
+
+class Provenance(unittest.TestCase):
+    CI_ID, DEPLOY_ID = 11, 22
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.manifest, self.code = make_artifact(Path(tmp.name) / "a")
+        self.bucket = policy.Names("dev").artifact_bucket(ACCOUNT, REGION)
+        self.rec = record("dev", self.manifest, self.bucket, ci_run_id=self.CI_ID)
+        self.gh = FakeGitHub()
+        self.gh.add_run(self.CI_ID, path=".github/workflows/ci.yml", event="push", head_sha=SHA_A)
+        self.gh.add_artifact(self.CI_ID, f"lambda-{SHA_A}",
+                             {"lambda.zip": self.code, "manifest.json": json.dumps(self.manifest)})
+        # workflow_run runs report main's head at trigger time, which may be a later commit.
+        self.gh.add_run(self.DEPLOY_ID, path=".github/workflows/deploy-dev.yml", event="workflow_run", head_sha=SHA_B)
+        self.gh.add_artifact(self.DEPLOY_ID, f"dev-release-{self.rec['release_id']}",
+                             {"release.json": json.dumps(self.rec)})
+
+    def verify(self, rec=None, mode="promote"):
+        return release.verify_provenance(rec or self.rec, REPO, self.gh.api, self.gh.download, mode)
+
+    def assertRejected(self, pattern, rec=None, mode="promote"):
+        with self.assertRaisesRegex(release.ReleaseError, pattern):
+            self.verify(rec, mode)
+
+    def test_genuine_release_passes(self):
+        notes = self.verify()
+        self.assertEqual(len(notes), 3)
+
+    def test_ci_run_wrong_workflow(self):
+        self.gh.runs[self.CI_ID]["path"] = ".github/workflows/preview.yml"
+        self.assertRejected("ran '.github/workflows/preview.yml'")
+
+    def test_ci_run_from_pull_request_event(self):
+        self.gh.runs[self.CI_ID]["event"] = "pull_request"
+        self.assertRejected("triggered by 'pull_request'")
+
+    def test_ci_run_on_another_branch(self):
+        self.gh.runs[self.CI_ID]["head_branch"] = "feature/x"
+        self.assertRejected("branch 'feature/x'")
+
+    def test_ci_run_for_another_sha(self):
+        self.gh.runs[self.CI_ID]["head_sha"] = SHA_B
+        self.assertRejected(f"built '{SHA_B}', not {SHA_A}")
+
+    def test_ci_run_from_another_repo(self):
+        self.gh.runs[self.CI_ID]["repository"] = {"full_name": "attacker/aws-permissions-manager"}
+        self.assertRejected("belongs to 'attacker/aws-permissions-manager'")
+        self.gh.runs[self.CI_ID]["repository"] = {"full_name": REPO}
+        self.gh.runs[self.CI_ID]["head_repository"] = {"full_name": "attacker/aws-permissions-manager"}
+        self.assertRejected("head repository")
+
+    def test_ci_run_not_successful_or_not_finished(self):
+        self.gh.runs[self.CI_ID]["conclusion"] = "failure"
+        self.assertRejected("completed/failure")
+        self.gh.runs[self.CI_ID].update(status="in_progress", conclusion=None)
+        self.assertRejected("in_progress")
+
+    def test_api_returns_a_different_run(self):
+        self.gh.runs[self.CI_ID]["id"] = 12
+        self.assertRejected("returned run 12")
+
+    def test_forged_bundle_claiming_a_real_main_sha(self):
+        # The attack from the review: a preview wrote a bundle + record that claims an existing,
+        # genuinely CI-built main commit and its real CI run. The digests can't both match.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        forged_manifest, _ = make_artifact(Path(tmp.name) / "f", body=b"backdoor")
+        forged = record("dev", forged_manifest, self.bucket, ci_run_id=self.CI_ID)
+        self.assertRejected("CI run 11 built sha256 .*, but the release record and S3 bundle are", forged)
+
+    def test_ci_artifact_digest_mismatch(self):
+        self.gh.artifacts[self.CI_ID] = []
+        self.gh.add_artifact(self.CI_ID, f"lambda-{SHA_A}", {"lambda.zip": b"other bytes",
+                                                             "manifest.json": json.dumps(self.manifest)})
+        self.assertRejected("built sha256")
+
+    def test_ci_artifact_manifest_mismatch(self):
+        self.gh.artifacts[self.CI_ID] = []
+        self.gh.add_artifact(self.CI_ID, f"lambda-{SHA_A}",
+                             {"lambda.zip": self.code, "manifest.json": json.dumps({**self.manifest, "git_sha": SHA_B})})
+        self.assertRejected("manifest does not describe")
+
+    def test_expired_ci_artifact_fails_closed_with_instructions(self):
+        self.gh.artifacts[self.CI_ID][0]["expired"] = True
+        self.assertRejected("has expired.*Rebuild and redeploy dev")
+
+    def test_missing_ci_artifact(self):
+        self.gh.artifacts[self.CI_ID] = []
+        self.assertRejected(f"has no artifact lambda-{SHA_A}")
+
+    def test_github_api_error_fails_closed(self):
+        self.gh.fail.add(f"repos/{REPO}/actions/runs/{self.CI_ID}")
+        self.assertRejected("could not read CI run 11")
+        self.gh.fail = {f"repos/{REPO}/actions/runs/{self.DEPLOY_ID}"}
+        self.assertRejected("could not read dev deploy run 22")
+
+    def test_dev_deploy_run_must_be_deploy_dev_on_main(self):
+        for change, pattern in (({"path": ".github/workflows/preview.yml"}, "ran"),
+                                ({"event": "workflow_dispatch"}, "triggered by"),
+                                ({"head_branch": "pr-branch"}, "branch"),
+                                ({"conclusion": "failure"}, "failure"),
+                                ({"repository": {"full_name": "attacker/x"}}, "belongs to")):
+            with self.subTest(change=change):
+                original = dict(self.gh.runs[self.DEPLOY_ID])
+                self.gh.runs[self.DEPLOY_ID].update(change)
+                self.assertRejected(f"dev deploy run 22 does not prove this release: .*{pattern}")
+                self.gh.runs[self.DEPLOY_ID] = original
+
+    def test_record_points_at_the_ci_run_as_its_deploy_run(self):
+        rec = dict(self.rec, deploy_run={"id": str(self.CI_ID), "url": "x"})
+        self.assertRejected("dev deploy run 11 does not prove", rec)
+
+    def test_dev_deploy_run_recorded_a_different_release(self):
+        self.gh.artifacts[self.DEPLOY_ID] = []
+        other = json.loads(json.dumps(self.rec))
+        other["artifact"]["sha256"] = "f" * 64
+        self.gh.add_artifact(self.DEPLOY_ID, f"dev-release-{self.rec['release_id']}",
+                             {"release.json": json.dumps(other)})
+        self.assertRejected("dev deploy run 22 recorded")
+        self.gh.artifacts[self.DEPLOY_ID] = []
+        self.assertRejected("has no artifact dev-release-")
+
+    def test_wrong_stage_record(self):
+        prod = record("prod", self.manifest, "b", source=self.rec["release_id"], ci_run_id=self.CI_ID)
+        self.assertRejected("not a dev release", prod)
+
+    def test_rollback_checks_ci_run_and_prod_release_run(self):
+        prod = record("prod", self.manifest, "b", source=self.rec["release_id"], ci_run_id=self.CI_ID)
+        self.gh.artifacts[self.CI_ID][0]["expired"] = True  # normal by rollback time; not required
+        self.gh.add_run(22, path=".github/workflows/promote-prod.yml", event="workflow_dispatch", head_sha=SHA_B)
+        self.assertEqual(len(self.verify(prod, "rollback")), 2)
+        self.gh.runs[22]["path"] = ".github/workflows/deploy-dev.yml"
+        self.assertRejected("prod release run 22 does not prove", prod, "rollback")
+        self.gh.runs[22]["path"] = ".github/workflows/promote-prod.yml"
+        self.gh.runs[self.CI_ID]["event"] = "pull_request"
+        self.assertRejected("CI run 11", prod, "rollback")
+
+    def test_cli_requires_a_token_and_fails_closed(self):
+        import os
+        from contextlib import redirect_stderr
+        from unittest import mock
+        from apm import cli
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(self.rec, f)
+        self.addCleanup(os.unlink, f.name)
+        env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")}
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), redirect_stderr(err):
+            self.assertEqual(cli.main(["release", "provenance", "--mode", "promote", "--record", f.name,
+                                       "--repo", REPO]), 1)
+        self.assertIn("GH_TOKEN", err.getvalue())
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "t"}), redirect_stderr(io.StringIO()), \
+                mock.patch.object(release, "github_client", return_value=(self.gh.api, self.gh.download)):
+            self.assertEqual(cli.main(["release", "provenance", "--mode", "promote", "--record", f.name,
+                                       "--repo", REPO]), 0)
+            self.gh.runs[self.CI_ID]["event"] = "pull_request"
+            self.assertEqual(cli.main(["release", "provenance", "--mode", "promote", "--record", f.name,
+                                       "--repo", REPO]), 1)
+
+    def test_invalid_repo(self):
+        with self.assertRaises(release.ReleaseError):
+            release.verify_provenance(self.rec, "../x", self.gh.api, self.gh.download)
+
+    def test_prod_release_workflow_checks_provenance_before_deploying(self):
+        if yaml is None:
+            self.skipTest("PyYAML not installed")
+        wf = yaml.safe_load((WORKFLOWS / "prod-release.yml").read_text())
+        resolve = wf["jobs"]["resolve"]
+        self.assertEqual(resolve["permissions"].get("actions"), "read")
+        names = [s.get("name") for s in resolve["steps"]]
+        i = names.index("Verify provenance with the GitHub API")
+        self.assertLess(names.index("Resolve and verify the recorded artifact"), i)
+        self.assertIn("apm-admin release provenance", resolve["steps"][i]["run"])
+        self.assertTrue(any("upload-artifact" in str(s.get("uses")) for s in resolve["steps"][i + 1:]))
+        self.assertEqual(wf["jobs"]["deploy"]["needs"], "resolve")
+        for caller in ("promote-prod.yml", "rollback-prod.yml"):
+            (job,) = yaml.safe_load((WORKFLOWS / caller).read_text())["jobs"].values()
+            self.assertEqual(job["permissions"].get("actions"), "read", caller)
+        dev = yaml.safe_load((WORKFLOWS / "deploy-dev.yml").read_text())["jobs"]["deploy"]["steps"]
+        upload = [s for s in dev if "upload-artifact" in str(s.get("uses"))]
+        self.assertEqual(len(upload), 1)
+        self.assertEqual(upload[0]["with"]["name"], "dev-release-${{ steps.record.outputs.release_id }}")
+
 if __name__ == "__main__":
     unittest.main()

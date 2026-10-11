@@ -41,6 +41,7 @@ jobs:
     uses: ./.github/workflows/prod-release.yml
     permissions:
       contents: read # the reusable workflow's other jobs declare it; they are skipped in claims mode
+      actions: read # likewise
       id-token: write
     with:
       mode: claims

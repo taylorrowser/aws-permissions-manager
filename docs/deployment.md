@@ -39,7 +39,7 @@ copy them.
 | Plan limits: no claimed gate; no solo-owner deadlock | No approval gate is claimed. See "GitHub plan limits". | below |
 | Staging identity provider for dev and previews; prod redirects exact; never copy prod secrets | WorkOS staging app. `check_workos_copy` refuses to copy into prod or from any prefix other than `/apm-nonprod`. Workflows refuse the prod client id for nonprod. | "WorkOS" below |
 | Environment-owned push/VAPID/session secrets | Generated per stage under `/apm-<stage>`. Push subscriptions live in the stage's own table. | `apm/deploy.py` |
-| Prefer a separate nonprod AWS account | Recommended. A preview deploy refuses to run if the nonprod and prod account variables are equal. Dev only warns in that case. | `preview.yml`, `deploy-dev.yml` |
+| Prefer a separate nonprod AWS account | Strongly recommended: previews run PR code and must live in an account with no write path to anything prod reads. A preview deploy refuses to run if the nonprod and prod account variables are equal. Dev only warns in that case. Promotion re-verifies every dev release against GitHub, so a forged nonprod record can't reach prod even if nonprod is compromised. | `preview.yml`, `deploy-dev.yml`, `apm/release.py` |
 
 ## Workflows
 
@@ -86,9 +86,22 @@ shared bucket, its role could plant a bundle under a key dev later reuses, or fo
 record. Separate buckets plus the role scoping below prevent that. `_upload_code` also re-hashes any
 existing bundle before reusing its key.
 
+**Agent roles can't reach any apm bucket.** Every stage's agent boundary (prod, dev and each
+preview) carries the baseline `DenyApmInfrastructure` statement, which denies all actions on
+`arn:aws:s3:::apm-*`, and so on every artifact bucket: `apm-artifacts-*` (prod),
+`apm-dev-artifacts-*` and `apm-preview-artifacts-*`, including their bundles, manifests and
+release records. This matters most for previews: the preview Lambda runs PR code, and its broker
+can create and assume agent roles. It can create them only under `/agents-pr-N/` and only with the
+`apm-pr-N_agent-boundary` policy from its own stack, and it has no action that edits a boundary,
+attaches a managed policy or writes S3 itself. `tests/test_deploy.py`
+(`PreviewCannotReachReleaseArtifacts`) checks that a preview agent role is denied every write and
+read on the dev and prod buckets and objects, in any region or account.
+
 **Prod compatibility.** `tests/fixtures/prod_template_before_stages.json` was rendered by the
 single-stage `deploy.py`. The test asserts the prod template equals it plus exactly
-`APM_STAGE=prod`. Prod names, bucket, tags and SSM paths are unchanged.
+`APM_STAGE=prod` and the three agent-boundary Deny statements from the baseline security fix
+(`DenyApmInfrastructure`, `DenyApmTaggedResources`, `DenyApmDnsRecords`). A second test checks that
+every resource name is byte-identical. Prod names, bucket, tags and SSM paths are unchanged.
 
 ## Releases: build once, record, promote the same bytes
 
@@ -126,7 +139,8 @@ The release id is `dev-<UTC YYYYMMDDTHHMMSSZ>-<sha12>`. The record holds:
 - `created_at`.
 
 A failed health check is recorded too (and fails the job), so it can never be promoted. The record
-is the release candidate. The run summary prints its id.
+is the release candidate. The run summary prints its id. The run also uploads the same record as
+the artifact `dev-release-<release_id>` (90 days), which promotion uses as GitHub-side evidence.
 
 **3. Promote to prod** (`promote-prod.yml`) takes inputs `release_id` (a dev release), an optional
 `sha256` and `allow_superseded`. The reusable `prod-release.yml` then works in two jobs.
@@ -138,7 +152,22 @@ is the release candidate. The run summary prints its id.
   candidate unless `allow_superseded` is set, which is the explicit selection of an older *recorded,
   tested* release. It never substitutes a different sha.
 - downloads the bundle and manifest and checks the full sha256 against the record (and the input);
+- **verifies provenance through the GitHub API** (`apm-admin release provenance`,
+  `release.verify_provenance`), because an S3 record alone is not trusted:
+  - the record's CI run is a completed, successful run of `.github/workflows/ci.yml`, triggered by
+    `push` on `main`, in this repository, for exactly the record's `git_sha`;
+  - that run's `lambda-<sha>` artifact, downloaded with `GITHUB_TOKEN`, contains a `lambda.zip`
+    with the same sha256 as the S3 bundle (and a manifest naming the same sha and digest). If GitHub
+    has expired the artifact (30 days on `main`), promotion **fails closed** and tells the operator
+    to rebuild and redeploy dev and promote the fresh release;
+  - the record's dev deploy run is a successful `deploy-dev.yml` run (`workflow_run`, `main`, this
+    repository) whose `dev-release-<release_id>` artifact names the same release id, commit, digest
+    and CI run;
+  - any API error fails closed;
 - checks the commit is an ancestor of `main`.
+
+So bytes that didn't come out of CI on `main` can't be promoted, even if something in the nonprod
+account wrote a well-formed record and bundle claiming a real `main` commit and its real CI run.
 
 *deploy* job, using the prod role:
 - re-verifies the digest;
@@ -149,6 +178,10 @@ is the release candidate. The run summary prints its id.
 
 **4. Rollback prod** (`rollback-prod.yml`) takes a **prod** release id whose prod health check passed:
 - it resolves the record and bundle from the prod bucket and re-verifies the digest;
+- it verifies through the GitHub API that the record's CI run is a successful `ci.yml` push run on
+  `main` for that sha, and that its deploy run is a successful promote or rollback run. The CI build
+  artifact has usually expired by then, so its digest isn't required: prod records are written only
+  by the prod role into the prod account's own bucket;
 - it deploys through the same reusable workflow and concurrency group;
 - it records `kind=rollback`.
 
@@ -217,10 +250,14 @@ target.
   Push subscriptions lived in the deleted table. Bundles in the preview bucket expire by lifecycle.
 - **Sweeper (daily, or dispatch `action=sweep`):** it considers only stacks whose name *and*
   `apm:stage` tag both name the same `pr-<digits>` stage, and skips stacks with an operation in
-  progress. It deletes a preview if:
-  - the PR is closed or unlabeled;
-  - the expiry tag has passed; or
-  - the expiry tag is missing or malformed.
+  progress. It deletes a preview only for a confirmed reason:
+  - the expiry tag has passed (checked without GitHub, so this alone suffices);
+  - GitHub confirmed the PR is closed;
+  - GitHub confirmed the PR is open without the `preview` label; or
+  - GitHub confirmed the PR is open and labeled, but the expiry tag is missing or malformed.
+
+  If GitHub can't be read (rate limit, outage, auth error) or returns an unexpected answer, the PR
+  state is *unknown*: an unexpired preview is kept, the error is logged, and the next sweep retries.
 
   For a PR that is still open and labeled, it first removes the label and comments.
 - **Cleanup allowlist:** `policy.cleanup_stage` accepts only `^pr-[0-9]+$` (ASCII, full match, a
@@ -233,7 +270,14 @@ target.
 - **Trust model:** the preview *code* is the PR's own and runs as the preview Lambda in the nonprod
   account. The deploy tooling, template and IAM scoping come from `main`. Anyone who can push a
   branch here can get code into a preview, which is why previews live in nonprod with a role that
-  is denied every dev and prod name.
+  is denied every dev and prod name, and why their agent roles' boundary denies every `apm-*`
+  bucket.
+- **Put previews in a separate nonprod account.** Code from any PR runs there with a broker that
+  can mint roles. That account must have **no write path to anything prod reads**: no prod bucket
+  policy, KMS key, role trust or other resource policy may grant the nonprod account (or any role
+  in it) write access, and prod must never read configuration, artifacts or records from nonprod
+  except through the promotion path, which re-verifies them against GitHub. Sharing the prod
+  account (654654478411) leaves IAM scoping as the only barrier; it is not recommended.
 
 ## Credentials
 
@@ -313,7 +357,7 @@ verified from here. Per [GitHub's docs](https://docs.github.com/en/actions/refer
 
 So this pipeline claims **no approval gate**. The prod controls are:
 - `workflow_dispatch` from `main` only, re-checked inside the reusable workflow;
-- the release record checks (health, currency, digest, ancestry);
+- the release record checks (health, currency, digest, GitHub provenance, ancestry);
 - the exact OIDC trust.
 
 On Pro or Team, add a `production` deployment branch policy limited to `main`. Anyone who can push
@@ -347,7 +391,9 @@ reviewers that only you could satisfy.
 Nothing below is done by this PR, and each step needs its own authorization. In order:
 
 1. **Confirm the GitHub plan** (see "GitHub plan limits"). Decide what gate you rely on.
-2. **Choose the nonprod AWS account.** A separate account is recommended over sharing 654654478411.
+2. **Choose the nonprod AWS account.** Use a separate account, not 654654478411: previews run PR
+   code there. Give the nonprod account no write access to any prod resource (bucket policies, KMS
+   key policies, role trusts), so nothing prod reads can be written from it.
 3. **(Recommended) Set an OIDC subject template that includes `job_workflow_ref`**, for example
    claim keys `repo`, `context` and `job_workflow_ref`, via the repo's OIDC customization API. Do
    this before step 4, because it changes every subject.
@@ -399,7 +445,8 @@ Nothing below is done by this PR, and each step needs its own authorization. In 
        write its isolated state, push to a test device, and confirm prod is unreachable. Then close
        the PR and check that everything was removed.
     3. `APM_PROD_DEPLOY_ENABLED`. Promote the dev release id. The first promotion updates the
-       existing `apm` stack in place; the only template change is `APM_STAGE=prod`. Then rehearse a
+       existing `apm` stack in place; the only template changes are `APM_STAGE=prod` and the
+       agent-boundary Deny statements from the baseline security fix. Then rehearse a
        rollback to that same release.
 
 ## Still unverified
@@ -414,6 +461,10 @@ Nothing below is done by this PR, and each step needs its own authorization. In 
 - WorkOS wildcard redirects for the staging app's preview domain are unverified.
 - The GitHub plan and which environment features apply to this repo are unverified.
 - S3 conditional writes (`If-None-Match`) are assumed available in the chosen region.
+- The provenance check is tested against fake GitHub API responses only. That the runs API reports
+  `path`, `event`, `head_branch` and `head_repository` as assumed, and that artifact downloads
+  (a redirect to blob storage) work with `GITHUB_TOKEN` and `actions: read`, is unverified until
+  the first real promotion.
 - The zip is reproducible on the same host. Cross-host byte identity isn't guaranteed and isn't
   needed, because promotion reuses the recorded bytes.
 - Blacksmith and Depot are not connected for apm. Blacksmith execution is not verified anywhere.

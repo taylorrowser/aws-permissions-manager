@@ -49,6 +49,10 @@ def _release(a):
                 previous_release_id=(prev or {}).get("release_id"))
             r.put_record(s3, bucket, record)
             print(json.dumps(record, indent=2, sort_keys=True))
+            if a.record_out:  # deploy-dev uploads this as run evidence that promotion re-checks
+                os.makedirs(os.path.dirname(os.path.abspath(a.record_out)), exist_ok=True)
+                with open(a.record_out, "w") as f:
+                    f.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
             _github_output(release_id=record["release_id"])
             return 0
         if a.release_cmd == "current":
@@ -57,13 +61,24 @@ def _release(a):
             _github_output(release_id=(pointer or {}).get("release_id", ""),
                            git_sha=(pointer or {}).get("git_sha", ""))
             return 0
+        if a.release_cmd == "provenance":
+            token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+            if not token:
+                raise r.ReleaseError("GH_TOKEN (or GITHUB_TOKEN) is required to check provenance")
+            with open(a.record) as f:
+                record = json.load(f)
+            api, download = r.github_client(token)
+            for note in r.verify_provenance(record, a.repo, api, download, a.mode):
+                print(f"verified: {note}")
+            print(f"OK provenance of {record['release_id']}")
+            return 0
         # resolve
         dev_bucket = r.bucket_for("dev", a.account, a.region) if a.mode == "promote" else None
         prod_bucket = r.bucket_for("prod", a.account, a.region) if a.mode == "rollback" else None
         record, notes = r.resolve(_s3(a.profile, a.region), a.mode, a.release_id, a.out, dev_bucket=dev_bucket,
                                   prod_bucket=prod_bucket, allow_superseded=a.allow_superseded,
                                   expected_sha256=a.sha256 or None)
-    except r.ReleaseError as e:
+    except (r.ReleaseError, OSError, json.JSONDecodeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     for note in notes:
@@ -144,6 +159,7 @@ def main(argv=None):
     for f in ("--ci-run-id", "--ci-run-url", "--deploy-run-id", "--deploy-run-url", "--account", "--domain"):
         x.add_argument(f, required=True)
     x.add_argument("--source-release-id", help="promotion: the dev release; rollback: the prod release")
+    x.add_argument("--record-out", help="also write the record JSON to this file")
     x = rs.add_parser("current", help="print a stage's newest release pointer")
     x.add_argument("--stage", required=True, choices=["dev", "prod"])
     x.add_argument("--account", required=True)
@@ -155,6 +171,11 @@ def main(argv=None):
     x.add_argument("--sha256", help="refuse unless the recorded artifact has this sha256")
     x.add_argument("--allow-superseded", action="store_true",
                    help="promote: explicitly accept a tested dev release that dev has since moved past")
+    x = rs.add_parser("provenance", help="check a resolved record against GitHub: CI run, CI artifact digest, "
+                      "dev deploy run (GH_TOKEN; no AWS calls)")
+    x.add_argument("--mode", required=True, choices=["promote", "rollback"])
+    x.add_argument("--record", required=True, help="release.json written by `release resolve`")
+    x.add_argument("--repo", required=True, help="owner/repo")
     for x in rs.choices.values():
         x.add_argument("--region", default="us-east-1")
         x.add_argument("--profile")

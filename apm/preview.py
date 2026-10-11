@@ -100,8 +100,10 @@ def plan(event_name, event, repo, api, dispatch_pr=None, dispatch_action=None):
     pr = api(f"repos/{repo}/pulls/{number}")
     if not _same_repo(pr, repo):
         return _plan("none", number, "fork PR: previews are same-repository only")
-    if pr.get("state") != "open":
+    if pr.get("state") == "closed":
         return _plan("remove", number, "PR is closed")
+    if pr.get("state") != "open":  # never remove on an unrecognized answer
+        raise PlanError(f"PR {number} has unexpected state {pr.get('state')!r}")
     if event_name != "workflow_dispatch" and LABEL not in _labels(pr):
         return _plan("none", number, f"PR has no {LABEL!r} label")
     head_sha = (pr.get("head") or {}).get("sha", "")
@@ -127,10 +129,16 @@ def _parse_time(value):
         return None
 
 
-def sweep_decisions(stacks, pr_info, now):
+def sweep_decisions(stacks, pr_info, now, log=None):
     """stacks: [{"StackName", "StackStatus", "Tags": [...]}] from describe_stacks.
-    pr_info(number) -> (state, labeled). Returns [(stage, reason)] to delete. Only stacks whose name
-    AND stage tag both name the same preview stage are ever candidates; everything else is ignored."""
+    pr_info(number) -> (state, labeled), where state is "open" or "closed" when GitHub answered and
+    anything else (e.g. "unknown") when it didn't. Returns [(stage, reason)] to delete. Only stacks
+    whose name AND stage tag both name the same preview stage are ever candidates.
+
+    Deletion needs a confirmed reason: the expiry tag has passed (checked without GitHub), or GitHub
+    confirmed the PR is closed, or confirmed it is open without the label. An unknown PR state (API
+    error, rate limit, outage) never deletes an unexpired preview; it is logged and retried next sweep."""
+    log = log or (lambda msg: None)
     out = []
     for stack in stacks:
         try:
@@ -146,15 +154,18 @@ def sweep_decisions(stacks, pr_info, now):
         if str(stack.get("StackStatus", "")).endswith("_IN_PROGRESS"):
             continue  # a deploy or delete is running; next sweep
         expires = _parse_time(tags.get(deploy.EXPIRES_TAG))
+        if expires is not None and expires <= now:
+            out.append((stage, f"expired at {tags[deploy.EXPIRES_TAG]}"))  # needs no GitHub answer
+            continue
         state, labeled = pr_info(int(stage[3:]))
-        if state != "open":
-            out.append((stage, f"PR is {state}"))
-        elif not labeled:
+        if state == "closed":
+            out.append((stage, "PR is closed"))
+        elif state != "open" or labeled not in (True, False):
+            log(f"skipping {stage}: PR state unknown ({state}); not expired, so it is kept until GitHub answers")
+        elif labeled is False:
             out.append((stage, f"no {LABEL!r} label"))
         elif expires is None:
             out.append((stage, "missing or malformed expiry tag"))
-        elif expires <= now:
-            out.append((stage, f"expired at {tags[deploy.EXPIRES_TAG]}"))
     return out
 
 
@@ -181,11 +192,15 @@ def sweep(repo, api=gh_api, unlabel=gh_unlabel, region="us-east-1", profile=None
     def pr_info(number):
         try:
             pr = api(f"repos/{repo}/pulls/{number}")
-        except Exception:
-            return "unknown", False
-        return pr.get("state", "unknown"), LABEL in _labels(pr)
+        except Exception as e:  # rate limit, outage, auth: unknown, which never deletes on its own
+            log(f"GitHub API error reading PR {number}: {e}")
+            return "unknown", None
+        state = pr.get("state") if isinstance(pr, dict) else None
+        if state not in ("open", "closed"):
+            return "unknown", None
+        return state, LABEL in _labels(pr)
 
-    decisions = sweep_decisions(stacks, pr_info, dt.datetime.now(dt.timezone.utc))
+    decisions = sweep_decisions(stacks, pr_info, dt.datetime.now(dt.timezone.utc), log=log)
     failed = []
     for stage, reason in decisions:
         log(f"{'would delete' if dry_run else 'deleting'} {stage}: {reason}")

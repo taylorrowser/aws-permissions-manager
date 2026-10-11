@@ -196,6 +196,99 @@ class StageIsolation(unittest.TestCase):
                 deploy.destroy(stage)
 
 
+def _actions(stmt, key):
+    a = stmt.get(key, [])
+    return [a] if isinstance(a, str) else a
+
+
+def boundary_decision(boundary, action, arn):
+    """Minimal IAM evaluation of a boundary for one unconditioned request: "deny", "allow" or "implicit"."""
+    def matches(stmt):
+        if "Action" in stmt and not any(iam_match(p.lower(), action.lower()) for p in _actions(stmt, "Action")):
+            return False
+        if "NotAction" in stmt and any(iam_match(p.lower(), action.lower()) for p in _actions(stmt, "NotAction")):
+            return False
+        return any(iam_match(p, arn) for p in resources(stmt))
+    stmts = [s for s in boundary["Statement"] if "Condition" not in s]  # conditions only narrow a Deny
+    if any(s["Effect"] == "Deny" and matches(s) for s in stmts):
+        return "deny"
+    return "allow" if any(s["Effect"] == "Allow" and matches(s) for s in stmts) else "implicit"
+
+
+class PreviewCannotReachReleaseArtifacts(unittest.TestCase):
+    """Review finding 1: PR code controls a preview Lambda, whose broker creates (and assumes) agent
+    roles. Those roles must never reach dev or prod bundles, manifests or release records."""
+    REGIONS = ("us-east-1", "eu-west-2")
+    WRITES = ("s3:PutObject", "s3:DeleteObject", "s3:PutObjectAcl", "s3:RestoreObject", "s3:PutBucketPolicy",
+              "s3:PutBucketVersioning", "s3:PutLifecycleConfiguration", "s3:DeleteBucket", "s3:GetObject", "s3:*")
+
+    def artifact_arns(self, stage, account=ACCOUNT):
+        out = []
+        for region in self.REGIONS:
+            bucket = policy.Names(stage).artifact_bucket(account, region)
+            out += [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/lambda/0123456789abcdef.zip",
+                    f"arn:aws:s3:::{bucket}/manifests/{'a' * 64}.json"]
+            if stage in ("dev", "prod"):
+                out += [f"arn:aws:s3:::{bucket}/releases/{stage}/{stage}-20261011T120000Z-aaaaaaaaaaaa.json",
+                        f"arn:aws:s3:::{bucket}/releases/{stage}/current.json"]
+        return out
+
+    def test_every_artifact_bucket_is_an_apm_resource(self):
+        s3_patterns = [p for p in policy.apm_resources(ACCOUNT) if p.startswith("arn:aws:s3:::")]
+        for stage in ["prod"] + NONPROD:
+            for arn in self.artifact_arns(stage):
+                self.assertTrue(any(iam_match(p, arn) for p in s3_patterns), arn)
+
+    def test_preview_agent_boundary_denies_dev_and_prod_artifacts(self):
+        for stage in ("pr-1", "pr-12", "pr-9999999"):
+            b = policy.boundary(ACCOUNT, policy.Names(stage))
+            # Sanity: without the deny the broad allow would cover these writes.
+            self.assertEqual(boundary_decision(b, "s3:PutObject", "arn:aws:s3:::someone-elses-bucket/x"), "allow")
+            for target in ("dev", "prod", "pr-1", stage):
+                # The prod bucket lives in the prod account, the others in nonprod; deny either way.
+                for account in (ACCOUNT, "999988887777"):
+                    for arn in self.artifact_arns(target, account):
+                        for action in self.WRITES:
+                            self.assertEqual(boundary_decision(b, action, arn), "deny", (stage, target, action, arn))
+
+    def test_every_stage_boundary_has_the_apm_denies(self):
+        for stage in ["prod"] + NONPROD:
+            sids = {s["Sid"]: s for s in policy.boundary(ACCOUNT, policy.Names(stage))["Statement"]}
+            for sid in ("DenyApmInfrastructure", "DenyApmTaggedResources", "DenyApmDnsRecords"):
+                self.assertEqual(sids[sid]["Effect"], "Deny", (stage, sid))
+            self.assertEqual(sids["DenyApmInfrastructure"]["Resource"], policy.apm_resources(ACCOUNT))
+            self.assertEqual(sids["DenyApmInfrastructure"]["Action"], "*")
+
+    def test_preview_broker_creates_roles_only_in_its_stage_with_its_boundary(self):
+        for stage in ("pr-1", "pr-12"):
+            n = policy.Names(stage)
+            t = deploy.template(ACCOUNT, "us-east-1", f"{stage}.preview.apm.example.com", "Z1", "o@example.com",
+                                "client_s", "PUB", "b", "k.zip", stage=stage)
+            role_policy = t["Resources"]["BrokerRole"]["Properties"]["Policies"][0]["PolicyDocument"]
+            allows = [s for s in role_policy["Statement"] if s["Effect"] == "Allow"]
+            create = [s for s in allows if "iam:CreateRole" in _actions(s, "Action")]
+            self.assertEqual(len(create), 1)
+            self.assertEqual(create[0]["Resource"], f"arn:aws:iam::{ACCOUNT}:role/agents-{stage}/*")
+            self.assertEqual(create[0]["Condition"],
+                             {"StringEquals": {"iam:PermissionsBoundary": f"arn:aws:iam::{ACCOUNT}:policy/apm-{stage}_agent-boundary"}})
+            # ...and that boundary is this stack's own policy, which carries the apm denies.
+            boundary = t["Resources"]["Boundary"]["Properties"]
+            self.assertEqual(boundary["ManagedPolicyName"], n.boundary_name)
+            self.assertIn("DenyApmInfrastructure", {s["Sid"] for s in boundary["PolicyDocument"]["Statement"]})
+            # The broker can never change a boundary, attach managed policies or write S3 itself.
+            never = ("iam:CreatePolicy", "iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion",
+                     "iam:PutRolePermissionsBoundary", "iam:DeleteRolePermissionsBoundary", "iam:AttachRolePolicy",
+                     "iam:UpdateAssumeRolePolicy", "iam:PassRole", "s3:PutObject")
+            for s in allows:
+                for action in _actions(s, "Action"):
+                    for bad in never:
+                        self.assertFalse(iam_match(action.lower(), bad.lower()), (stage, s["Sid"], action))
+            # Other stages' boundaries (prod, dev) don't satisfy the condition.
+            for other in ("prod", "dev", "pr-2"):
+                self.assertNotEqual(policy.boundary_arn(ACCOUNT, policy.Names(other)),
+                                    create[0]["Condition"]["StringEquals"]["iam:PermissionsBoundary"])
+
+
 class Artifacts(unittest.TestCase):
     def make(self, tmp, body=b"code"):
         buf = io.BytesIO()

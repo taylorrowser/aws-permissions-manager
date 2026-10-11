@@ -145,7 +145,18 @@ jobs:
             --health "$HEALTH" --health-url "https://${DOMAIN}/healthz" \
             --ci-run-id "$CI_RUN_ID" --ci-run-url "$CI_RUN_URL" \
             --deploy-run-id "$GITHUB_RUN_ID" --deploy-run-url "$DEPLOY_RUN_URL" \
-            --account "$ACCOUNT" --region "$AWS_REGION" --domain "$DOMAIN"
+            --account "$ACCOUNT" --region "$AWS_REGION" --domain "$DOMAIN" --record-out dist/release/release.json
+
+      # Run evidence for promotion: prod-release.yml checks that this deploy-dev run uploaded a record
+      # naming the same release, commit, digest and CI run as the S3 record it is asked to promote.
+      - name: Upload the dev release record as run evidence
+        if: always() && steps.record.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dev-release-${{ steps.record.outputs.release_id }}
+          path: dist/release/release.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Summary
         if: always() && steps.record.outcome == 'success'
