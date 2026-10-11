@@ -3,6 +3,7 @@ import datetime
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -113,20 +114,23 @@ class FakeTable:
 
     def update_item(self, Key, UpdateExpression, ExpressionAttributeValues, ExpressionAttributeNames=None,
                     ConditionExpression=None, ReturnValues=None):
-        item = self.items.setdefault(Key["pk"], {"pk": Key["pk"]})
         names = ExpressionAttributeNames or {}
-        if ConditionExpression:
-            field, value = ConditionExpression.split(" = ")
-            if item.get(names.get(field, field)) != ExpressionAttributeValues[value]:
+        if ConditionExpression == "attribute_exists(pk)":
+            if Key["pk"] not in self.items:
                 raise ConditionFailed()
-        verb, rest = UpdateExpression.split(" ", 1)
-        for part in rest.split(","):
-            if verb == "ADD":
-                field, value = part.split()
-                item[field] = item.get(field, 0) + ExpressionAttributeValues[value]
-            else:
-                field, value = [x.strip() for x in part.split("=")]
-                item[names.get(field, field)] = ExpressionAttributeValues[value]
+        elif ConditionExpression:
+            field, value = ConditionExpression.split(" = ")
+            if self.items.get(Key["pk"], {}).get(names.get(field, field)) != ExpressionAttributeValues[value]:
+                raise ConditionFailed()
+        item = self.items.setdefault(Key["pk"], {"pk": Key["pk"]})
+        for verb, rest in re.findall(r"(SET|ADD) (.*?)(?= SET | ADD |$)", UpdateExpression):
+            for part in rest.split(","):
+                if verb == "ADD":
+                    field, value = part.split()
+                    item[field] = item.get(field, 0) + ExpressionAttributeValues[value]
+                else:
+                    field, value = [x.strip() for x in part.split("=")]
+                    item[names.get(field, field)] = ExpressionAttributeValues[value]
         return {"Attributes": dict(item)}
 
 
@@ -489,7 +493,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("Sign in", self.app(web.Request("GET", "/", cookies=forged)).body)
         self.request()
         page = self.app(web.Request("GET", "/", cookies=session_cookie(self.app))).body
-        self.assertIn("Pending requests (1)", page)
+        self.assertIn("<h1>Requests (1)</h1>", page)
 
     def test_owner_posts_need_origin_and_session(self):
         r = self.request()
@@ -539,7 +543,7 @@ class WebTests(unittest.TestCase):
     def test_api_keys_created_shown_once_and_deleted(self):
         resp = self.owner_post({"op": "create_key", "name": "codex"})
         self.assertIn("won't be shown again", resp.body)
-        secret = resp.body.split("<p class=secret>")[1].split("</p>")[0]
+        secret = resp.body.split("<p class=secret id=secret>")[1].split("</p>")[0]
         self.assertEqual(self.api("GET", "/api/whoami", key=secret)[1]["key"], "codex")
         pk = next(k["pk"] for k in self.app.store.keys() if k["name"] == "codex")
         self.owner_post({"op": "delete_key", "pk": pk})
@@ -552,7 +556,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.api("POST", "/api/connect", {**body, "key_hash": "nope"}, key=None)[0], 400)
         status, r = self.api("POST", "/api/connect", body, key=None)
         self.assertEqual(status, 201, r)
-        self.assertTrue(r["url"].endswith(f"#connect-{r['code']}"))
+        self.assertEqual(r["url"], f"{ORIGIN}/connect/{r['code']}")
         self.assertEqual(self.api("POST", "/api/connect", body, key=None)[0], 429)  # same key twice
         self.assertNotIn(secret, json.dumps(self.app.store.t.items))
         poll = lambda: self.api("POST", "/api/connect/status", {"key": secret}, key=None)[1]["status"]

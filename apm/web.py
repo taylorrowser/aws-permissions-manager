@@ -23,17 +23,26 @@ from urllib.parse import parse_qs, urlencode
 
 from . import pages, policy
 from .broker import Broker, BrokerError
-from .store import PENDING_LIMIT, Conflict, Store
+from .store import CONNECT_SECONDS, PENDING_LIMIT, Conflict, Store, subscription_id
 
 STATIC = Path(__file__).parent / "static"
 STATIC_FILES = {
     "/sw.js": ("sw.js", "text/javascript"),
     "/app.js": ("app.js", "text/javascript"),
+    "/app.css": ("app.css", "text/css"),
+    "/offline.html": ("offline.html", "text/html; charset=utf-8"),
     "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
     "/icon-192.png": ("icon-192.png", "image/png"),
     "/icon-512.png": ("icon-512.png", "image/png"),
     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
 }
+# Changes whenever any static file changes. Pages load /app.js?v=VERSION, so those URLs can be
+# cached forever, and the service worker uses it to name (and replace) its cache.
+ASSET_VERSION = hashlib.sha256(b"".join((STATIC / n).read_bytes() for n, _ in STATIC_FILES.values())).hexdigest()[:12]
+# Checked by the browser on every start, so app updates arrive the next time the app opens.
+REVALIDATE = {"/sw.js", "/manifest.webmanifest", "/offline.html"}
+# Owner screens. Signed-out visits show the sign-in page and come back here after signing in.
+SCREENS = re.compile(r"/(projects|devices|keys|requests/\d+|connect/[A-Z0-9]{4}-[A-Z0-9]{4})?")
 SESSION_COOKIE = "__Host-apm_session"
 OAUTH_COOKIE = "__Host-apm_oauth"
 SESSION_SECONDS = 30 * 24 * 3600
@@ -44,8 +53,9 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
 
 class Settings:
     def __init__(self, domain, workos_client_id, owner_emails, vapid_public, session_secret,
-                 vapid_private="", workos_api_key=""):
+                 vapid_private="", workos_api_key="", stage="prod"):
         self.domain, self.origin = domain, f"https://{domain}"
+        self.stage = stage or "prod"
         self.workos_client_id, self.workos_api_key = workos_client_id, workos_api_key
         self.owner_emails = {e.strip().lower() for e in owner_emails.split(",") if e.strip()}
         self.vapid_public, self.vapid_private = vapid_public, vapid_private
@@ -67,7 +77,8 @@ class Settings:
         prefix = os.environ.get("PARAM_PREFIX", "/apm")
         return cls(os.environ["DOMAIN"], os.environ["WORKOS_CLIENT_ID"], os.environ["OWNER_EMAILS"],
                    os.environ["VAPID_PUBLIC_KEY"], param(f"{prefix}/session-secret"),
-                   param(f"{prefix}/vapid-private-key", ""), param(f"{prefix}/workos-api-key", ""))
+                   param(f"{prefix}/vapid-private-key", ""), param(f"{prefix}/workos-api-key", ""),
+                   os.environ.get("APM_STAGE", "prod"))
 
 
 class Response:
@@ -174,44 +185,69 @@ class App:
             traceback.print_exc()
             if req.path.startswith("/api/"):
                 return json_response({"error": "internal error"}, 500)
-            return Response(500, pages.error_page("Something went wrong. Check the Lambda logs."))
+            return Response(500, pages.error_page(self, "Something went wrong, and nothing may have been saved. "
+                                                        "Reload to check, or see the Lambda logs.", "/"))
 
     def route(self, req):
         p, m = req.path, req.method
         if p in STATIC_FILES and m == "GET":
-            name, ctype = STATIC_FILES[p]
-            data = (STATIC / name).read_bytes()
-            return Response(200, data if ctype == "image/png" else data.decode(), ctype,
-                            headers={"Cache-Control": "public, max-age=300"})
+            return self.static(req)
         if p == "/healthz":
             return json_response({"ok": True})
         if p.startswith("/api/"):
             return self.api(req)
         if p == "/login" and m == "GET":
-            return self.login()
+            return self.login(req.query.get("next", "/"))
         if p == "/auth/callback" and m == "GET":
             return self.callback(req)
 
         owner = self.owner(req)
-        if p == "/" and m == "GET":
+        if m == "GET" and SCREENS.fullmatch(p):
             if not owner:
-                return Response(200, pages.login_page(req.query.get("error", "")))
-            return Response(200, pages.dashboard(self, owner, req.query.get("msg", "")))
+                return Response(200, pages.login_page(self, req.query.get("error", ""), p))
+            return self.screen(req, owner)
         if m == "POST":
-            if not owner or req.headers.get("origin") != self.s.origin:
-                return Response(403, pages.error_page("Forbidden. Sign in again."))
+            json_call = p.startswith("/push/")
+            if req.headers.get("origin") != self.s.origin:
+                return Response(403, pages.error_page(self, "Forbidden: that form came from another site."))
+            if not owner:
+                if json_call:
+                    raise ApiError(401, "signed out; reload the page and sign in again")
+                return Response(403, pages.error_page(self, "You've been signed out, so nothing was changed. "
+                                                            "Sign in and try again.", "/"))
             if p == "/logout":
                 return redirect("/", [cookie(SESSION_COOKIE, "", 0)])
             if p == "/action":
                 return self.action(req.form(), owner)
-            if p == "/push/subscribe":
-                body = req.json()
-                sub = body.get("subscription") or {}
-                if not str(sub.get("endpoint", "")).startswith("https://") or not sub.get("keys"):
-                    raise ApiError(400, "invalid subscription")
-                self.store.add_subscription(sub, str(body.get("label", "device")))
-                return json_response({"ok": True})
-        return Response(404, pages.error_page("Not found."))
+            if json_call:
+                return self.push_api(p, req.json())
+        return Response(404, pages.error_page(self, "Not found."))
+
+    def static(self, req):
+        name, ctype = STATIC_FILES[req.path]
+        data = (STATIC / name).read_bytes()
+        if req.path == "/sw.js":
+            data = data.replace(b"__VERSION__", ASSET_VERSION.encode())
+        if req.path in REVALIDATE:
+            cache = "no-cache"
+        elif req.query.get("v") == ASSET_VERSION:
+            cache = "public, max-age=31536000, immutable"
+        else:
+            cache = "public, max-age=300"
+        return Response(200, data if ctype == "image/png" else data.decode(), ctype, headers={"Cache-Control": cache})
+
+    def screen(self, req, owner):
+        p, msg = req.path, req.query.get("msg", "")
+        if p.startswith("/requests/"):
+            r = self.store.get(int(p.rsplit("/", 1)[1]))
+            if not r:
+                return Response(404, pages.error_page(self, f"There is no request #{p.rsplit('/', 1)[1]}.", "/"))
+            return Response(200, pages.request_page(self, owner, r, msg))
+        if p.startswith("/connect/"):
+            return Response(200, pages.connect_page(self, owner, p.rsplit("/", 1)[1], msg))
+        view = {"/": pages.requests_page, "/projects": pages.projects_page,
+                "/devices": pages.devices_page, "/keys": pages.keys_page}[p]
+        return Response(200, view(self, owner, msg))
 
     # ----- owner auth (WorkOS AuthKit, PKCE) -----
 
@@ -219,14 +255,14 @@ class App:
         data = unsign(self.s, req.cookies.get(SESSION_COOKIE))
         return data["e"] if data and data.get("e") in self.s.owner_emails else None
 
-    def login(self):
+    def login(self, next_path="/"):
         state, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(48)
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         url = f"{WORKOS_API}/authorize?" + urlencode({
             "client_id": self.s.workos_client_id, "redirect_uri": f"{self.s.origin}/auth/callback",
             "response_type": "code", "provider": "authkit", "state": state,
             "code_challenge": challenge, "code_challenge_method": "S256"})
-        oauth = sign(self.s, {"s": state, "v": verifier, "x": int(time.time()) + 600})
+        oauth = sign(self.s, {"s": state, "v": verifier, "n": _safe_next(next_path), "x": int(time.time()) + 600})
         return redirect(url, [cookie(OAUTH_COOKIE, oauth, 600)])
 
     def callback(self, req):
@@ -249,12 +285,12 @@ class App:
             print(f"Rejected sign-in for {email!r}")
             return redirect("/?error=" + _q("That account is not allowed to use this dashboard."), [clear])
         session = sign(self.s, {"e": email, "x": int(time.time()) + SESSION_SECONDS})
-        return redirect("/", [clear, cookie(SESSION_COOKIE, session, SESSION_SECONDS)])
+        return redirect(_safe_next(oauth.get("n", "/")), [clear, cookie(SESSION_COOKIE, session, SESSION_SECONDS)])
 
     # ----- owner actions -----
 
     def action(self, form, owner):
-        op = form.get("op")
+        op, back = form.get("op"), _safe_next(form.get("back", "/"))
         try:
             if op in ("approve_connect", "reject_connect"):
                 c = self.store.decide_connect(form.get("code", ""), op == "approve_connect")
@@ -263,10 +299,14 @@ class App:
             if op == "create_key":
                 name = re.sub(r"[^A-Za-z0-9 ._@-]", "", form.get("name", "")).strip()[:40] or "agent"
                 secret = self.store.create_key(name)
-                return Response(200, pages.dashboard(self, owner, f"Created API key {name!r}.", new_key=secret))
-            return redirect("/?msg=" + _q(self.decide(form)))
+                return Response(200, pages.keys_page(self, owner, f"Created API key {name!r}.", new_key=secret))
+            msg = self.decide(form)
+            # A decided request has nothing left to do on its own page; go back to the list.
+            if op in ("approve", "reject") and back.startswith("/requests/"):
+                back = "/"
+            return redirect(back + "?msg=" + _q(msg))
         except (BrokerError, Conflict, ValueError) as e:
-            return redirect("/?msg=" + _q(f"Error: {e}"))
+            return redirect(back + "?msg=" + _q(f"Error: {e}"))
 
     def decide(self, form):
         """Grant changes run entirely under the project's lease. The decision is recorded in
@@ -335,31 +375,58 @@ class App:
         if op == "delete_device":
             self.store.delete_subscription(form.get("pk", ""))
             return "Removed the device from notifications."
-        if op == "test_push":
-            sent = self.notify({"title": "AWS Permissions", "body": "Test notification. Notifications work.", "url": "/"})
-            return f"Sent a test notification to {sent} device(s)."
         return "Unknown action."
 
     # ----- notifications -----
 
-    def notify(self, message):
+    def notify(self, message, only=None, ttl=86400):
+        """Push to all devices (or the device ids in `only`). Payloads land on lock screens, so
+        callers keep them to a title and a short line with no policy details or reasons. Returns
+        {device id: (outcome, status)}; devices the push service says are gone are removed."""
         if not self.s.vapid_private:
-            return 0
+            print(json.dumps({"event": "push_skipped", "reason": "no VAPID private key"}))
+            return {}
         from . import push
-        sent = 0
-        for s in self.store.subscriptions():
-            try:
-                status = push.send(s["sub"], message, self.s.vapid_private, self.s.origin)
-            except Exception as e:
-                print(f"push failed: {e}")
-                continue
-            if status in (404, 410):
-                self.store.delete_subscription(s["pk"])
-            elif status < 300:
-                sent += 1
+        subs = [s for s in self.store.subscriptions() if only is None or s["pk"] in only]
+        message = {**message, "pending": len(self.store.list(status="pending"))}
+        results = push.deliver(subs, message, self.s.vapid_private, self.s.origin, ttl=ttl)
+        for pk, (outcome, status) in results.items():
+            if outcome == "gone":
+                self.store.delete_subscription(pk)
             else:
-                print(f"push endpoint returned {status}")
-        return sent
+                self.store.record_delivery(pk, outcome == "delivered", status)
+            print(json.dumps({"event": "push", "tag": message.get("tag", ""), "device": pk[4:16],
+                              "outcome": outcome, "status": status}))
+        return results
+
+    def push_api(self, path, body):
+        """JSON calls from the dashboard's script: register, unregister and test this device."""
+        sub = body.get("subscription") or {}
+        if path == "/push/subscribe":
+            if not str(sub.get("endpoint", "")).startswith("https://") or not isinstance(sub.get("keys"), dict) \
+                    or not sub["keys"].get("p256dh") or not sub["keys"].get("auth"):
+                raise ApiError(400, "invalid subscription")
+            replaces = str(body.get("replaces", ""))
+            if replaces and replaces != sub["endpoint"]:
+                self.store.delete_subscription(subscription_id(replaces))
+            device = self.store.add_subscription(sub, str(body.get("label", "device")))
+            return json_response({"ok": True, "device": device})
+        if path == "/push/unsubscribe":
+            self.store.delete_subscription(subscription_id(str(body.get("endpoint", ""))))
+            return json_response({"ok": True})
+        if path == "/push/test":
+            only = None
+            if body.get("endpoint"):
+                only = {subscription_id(str(body["endpoint"]))}
+                if not any(s["pk"] in only for s in self.store.subscriptions()):
+                    raise ApiError(404, "this device isn't registered; turn notifications on again")
+            if not self.s.vapid_private:
+                raise ApiError(503, "push isn't configured on the server (no VAPID private key)")
+            results = self.notify({"title": "AWS Permissions", "body": "Test notification: this device will be "
+                                   "notified of new requests.", "url": "/devices", "tag": "test"}, only=only, ttl=300)
+            return json_response({"results": [{"device": pk, "outcome": o, "status": st}
+                                              for pk, (o, st) in results.items()]})
+        raise ApiError(404, "unknown endpoint")
 
     # ----- agent API -----
 
@@ -415,9 +482,9 @@ class App:
                 code = self.store.add_connect(name, key_hash, prefix, info.strip())
             except Conflict as e:
                 raise ApiError(429, str(e))
-            self.notify({"title": f"Connect agent {name}?", "body": f"Code {code}. Approve only if you started this.",
-                         "url": f"/#connect-{code}", "tag": f"connect-{code}"})
-            return json_response({"code": code, "url": f"{self.s.origin}/#connect-{code}"}, 201)
+            self.notify({"title": "An agent wants to connect", "body": f"{name} is waiting for you to approve it.",
+                         "url": f"/connect/{code}", "tag": f"connect-{code}"}, ttl=CONNECT_SECONDS)
+            return json_response({"code": code, "url": f"{self.s.origin}/connect/{code}"}, 201)
         if req.path == "/api/connect/status":
             key = str(body.get("key", ""))
             if not key.startswith("apm_"):
@@ -437,9 +504,10 @@ class App:
         if self.store.pending_count(key["name"]) >= PENDING_LIMIT:
             raise ApiError(429, f"this API key already has {PENDING_LIMIT} pending requests; wait for the owner")
         rid = self.store.add(project, actions, resources, reason, key["name"])
-        self.notify({"title": f"{project}: permission request #{rid}",
-                     "body": f"{', '.join(actions)[:120]}\n{reason[:140]}",
-                     "url": f"/#req-{rid}", "tag": f"req-{rid}"})
+        n = len(actions)
+        self.notify({"title": f"Permission request #{rid}",
+                     "body": f"{project}: {n} action{'s' if n != 1 else ''} to review",
+                     "url": f"/requests/{rid}", "tag": f"req-{rid}"})
         return _public(self.store.get(rid))
 
     def projects(self, search=""):
@@ -495,6 +563,12 @@ def _list(v):
 
 def _q(s):
     return urlencode({"x": s})[2:]
+
+
+def _safe_next(path):
+    """Only ever redirect to one of our own screens, never to another site."""
+    path = str(path or "/")
+    return path if SCREENS.fullmatch(path) else "/"
 
 
 def _http_json(url, body):

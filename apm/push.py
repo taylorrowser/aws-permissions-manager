@@ -5,6 +5,7 @@ import json
 import os
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -64,7 +65,7 @@ def vapid_header(endpoint, private_pem, subject):
     return f"vapid t={jwt}, k={b64url(_raw_public(key))}"
 
 
-def send(subscription, message, private_pem, subject, ttl=86400):
+def send(subscription, message, private_pem, subject, ttl=86400, timeout=10):
     """POST one notification. Returns the HTTP status; 404/410 mean the subscription is gone."""
     endpoint = subscription["endpoint"]
     body = encrypt(json.dumps(message).encode(), subscription["keys"]["p256dh"], subscription["keys"]["auth"])
@@ -72,7 +73,40 @@ def send(subscription, message, private_pem, subject, ttl=86400):
         "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream", "TTL": str(ttl),
         "Urgency": "high", "Authorization": vapid_header(endpoint, private_pem, subject)})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status
     except urllib.error.HTTPError as e:
         return e.code
+
+
+GONE = (404, 410)
+RETRYABLE = (429, 500, 502, 503, 504)
+
+
+def deliver(subscriptions, message, private_pem, subject, ttl=86400):
+    """Send to every subscription in parallel, retrying a transient failure once. The Lambda is
+    frozen once it responds, so this runs inline with short timeouts (worst case about 9 seconds)
+    instead of queueing. Returns {pk: (outcome, status)}, outcome being delivered, gone or failed;
+    status is the HTTP status or None for a network error."""
+    def one(s):
+        status = None
+        for attempt in (1, 2):
+            try:
+                status = send(s["sub"], message, private_pem, subject, ttl=ttl, timeout=4)
+            except Exception as e:  # DNS, TLS, timeout, bad stored subscription
+                print(json.dumps({"event": "push_error", "device": s["pk"][4:16], "error": str(e)[:200]}))
+                status = None
+            if status is not None and status < 300:
+                return "delivered", status
+            if status in GONE:
+                return "gone", status
+            if attempt == 1 and (status is None or status in RETRYABLE):
+                time.sleep(0.5)
+                continue
+            return "failed", status
+        return "failed", status
+
+    if not subscriptions:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(8, len(subscriptions))) as pool:
+        return dict(zip([s["pk"] for s in subscriptions], pool.map(one, subscriptions)))
