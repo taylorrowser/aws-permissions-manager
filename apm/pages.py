@@ -110,6 +110,10 @@ def dashboard(app, owner, msg="", new_key=None):
     if not projects:
         out.append("<p class=muted>No projects yet. Approving a request for a new project creates it.</p>")
     for project in projects:
+        if not broker.in_sync(project, store.approved(project)):
+            out.append(f"<div class='card pending'><b><code>{e(project)}</code>: IAM doesn't match your decisions.</b> "
+                       "An IAM update may have failed or been interrupted. "
+                       + _form({"op": "sync_project", "project": project}, "Re-apply decisions", "ok") + "</div>")
         grants = broker.grants(project)
         out.append(f"<div class=card><b><code>{e(project)}</code></b> · role <code>{e(policy.role_name(project))}</code>")
         if not grants or not grants["Statement"]:

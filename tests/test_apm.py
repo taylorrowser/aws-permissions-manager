@@ -308,15 +308,15 @@ class GrantConsistencyTests(unittest.TestCase):
         self.assertEqual(self.approve(r), "That request is no longer pending.")
         self.assertEqual(self.sids(), [])
 
-    def test_failed_iam_write_leaves_the_request_pending_and_nothing_granted(self):
+    def test_failed_iam_write_is_reported_and_reapply_completes_it(self):
         r = self.add()
         self.iam.put_role_policy = mock.Mock(side_effect=RuntimeError("throttled"))
-        with self.assertRaises(RuntimeError):
-            self.approve(r)
-        self.assertEqual(self.app.store.get(r["id"])["status"], "pending")
-        # Rejecting it afterwards leaves nothing behind in IAM.
-        self.app.decide({"op": "reject", "id": str(r["id"]), "digest": r["digest"]})
+        self.assertIn("updating IAM failed", self.approve(r))
         self.assertEqual(self.sids(), [])
+        self.assertFalse(self.app.broker.in_sync("myapp", self.app.store.approved("myapp")))
+        del self.iam.put_role_policy
+        self.app.decide({"op": "sync_project", "project": "myapp"})
+        self.assertEqual(self.sids(), ["Req1"])
 
     def test_failed_status_write_after_iam_cannot_hide_a_grant(self):
         r = self.add()
@@ -342,6 +342,47 @@ class GrantConsistencyTests(unittest.TestCase):
         self.assertEqual(self.app.store.get(1)["status"], "revoked")
         self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req2"})
         self.assertNotIn(("apm-myapp", "apm-grants"), self.iam.policies)
+
+    def test_uncertain_iam_write_keeps_the_approval_and_offers_reapply(self):
+        r = self.add()
+        real_put = self.iam.put_role_policy
+
+        def applied_then_timed_out(**kw):
+            real_put(**kw)
+            raise TimeoutError("read timed out")
+        self.iam.put_role_policy = applied_then_timed_out
+        msg = self.approve(r)
+        self.assertIn("updating IAM failed", msg)
+        self.assertEqual(self.app.store.get(r["id"])["status"], "approved")  # can't be rejected into a hidden grant
+        self.assertEqual(self.app.decide({"op": "reject", "id": str(r["id"]), "digest": r["digest"]}),
+                         "That request is no longer pending.")
+        self.iam.put_role_policy = real_put
+        self.assertTrue(self.app.broker.in_sync("myapp", self.app.store.approved("myapp")))
+
+    def test_drift_is_shown_and_reapply_fixes_it(self):
+        r1, r2 = self.add(), self.add()
+        self.approve(r1)
+        self.approve(r2)
+        self.iam.put_role_policy = mock.Mock(side_effect=TimeoutError("read timed out"))
+        msg = self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
+        self.assertTrue(msg.startswith("Error: recorded the revoke"))
+        self.assertEqual(self.sids(), ["Req1", "Req2"])  # IAM still grants it...
+        page = self.app(web.Request("GET", "/", cookies=session_cookie(self.app))).body
+        self.assertIn("match your decisions", page)  # ...and the dashboard says so
+        del self.iam.put_role_policy
+        self.app.decide({"op": "sync_project", "project": "myapp"})
+        self.assertEqual(self.sids(), ["Req2"])
+        page = self.app(web.Request("GET", "/", cookies=session_cookie(self.app))).body
+        self.assertNotIn("match your decisions", page)
+
+    def test_remove_project_continues_past_a_stale_listing(self):
+        r = self.add()
+        self.approve(r)
+        real = self.iam.list_role_policies
+        self.iam.list_role_policies = lambda RoleName, **kw: {"PolicyNames": ["already-gone"] + real(RoleName)["PolicyNames"]}
+        self.app.decide({"op": "remove_project", "project": "myapp"})
+        self.assertNotIn("apm-myapp", self.iam.roles)
+        self.assertEqual(self.iam.policies, {})
 
     def test_too_large_approval_is_refused_and_stays_pending(self):
         from apm.broker import BrokerError

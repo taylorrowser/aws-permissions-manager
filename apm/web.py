@@ -291,9 +291,16 @@ class App:
                 self.store.set_status(r["id"], "approved", expect="pending")
                 try:
                     self.broker.sync(project, self.store.approved(project))
-                except Exception:
-                    self.store.set_status(r["id"], "pending", expect="approved")  # IAM wasn't changed for it
+                except BrokerError:
+                    # Refused before writing anything (e.g. the size limit): safe to undo.
+                    self.store.set_status(r["id"], "pending", expect="approved")
                     raise
+                except Exception as e:
+                    # The write may or may not have reached IAM (e.g. a timeout after IAM applied
+                    # it). Keep the approval recorded; Projects shows the mismatch and re-applies.
+                    print(f"IAM sync for {project} failed after approving #{r['id']}: {e!r}")
+                    return (f"Approved request #{r['id']}, but updating IAM failed ({type(e).__name__}). "
+                            f"Open Projects and tap Re-apply decisions for {project}.")
                 return f"Approved request #{r['id']} for {project}."
         if op == "revoke":
             project, sid = form["project"], form["sid"]
@@ -303,8 +310,18 @@ class App:
                     if r and r["project"] == project and r["status"] == "approved":
                         self.store.set_status(r["id"], "revoked", expect="approved")
                 # Rewriting from the approved requests drops this grant (and anything else not approved).
-                self.broker.sync(project, self.store.approved(project))
+                try:
+                    self.broker.sync(project, self.store.approved(project))
+                except Exception as e:
+                    print(f"IAM sync for {project} failed while revoking {sid}: {e!r}")
+                    return (f"Error: recorded the revoke of {sid}, but updating IAM failed ({type(e).__name__}). "
+                            f"It may still be active: open Projects and tap Re-apply decisions for {project}.")
             return f"Revoked {sid} from {project}."
+        if op == "sync_project":
+            project = form["project"]
+            with self.store.lease(project):
+                self.broker.sync(project, self.store.approved(project))
+            return f"Re-applied your decisions to {project}."
         if op == "remove_project":
             project = form["project"]
             with self.store.lease(project):

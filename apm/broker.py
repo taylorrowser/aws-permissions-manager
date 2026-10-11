@@ -57,15 +57,32 @@ class Broker:
             self.iam.put_role_policy(RoleName=name, PolicyName=policy.GRANTS_POLICY, PolicyDocument=body)
 
     def remove_project(self, project):
+        """Delete every inline policy, then the role. Succeeds only once the role is gone."""
         name = policy.role_name(project)
         with _lock:
             try:
-                for p in self._all_policy_names(name):
+                names = self._all_policy_names(name)
+            except Exception as e:
+                if _is_missing(e):
+                    return  # no role
+                raise
+            for p in names:
+                try:
                     self.iam.delete_role_policy(RoleName=name, PolicyName=p)
+                except Exception as e:
+                    if not _is_missing(e):  # listed but already gone (stale listing): keep going
+                        raise
+            try:
                 self.iam.delete_role(RoleName=name)
             except Exception as e:
                 if not _is_missing(e):
                     raise
+
+    def in_sync(self, project, approved):
+        """Whether IAM currently grants exactly the approved requests (for the dashboard)."""
+        current = self.grants(project) or policy.doc()
+        return sorted(s.get("Sid", "") for s in current["Statement"]) == \
+            sorted(policy.sid(r["id"]) for r in approved)
 
     def _all_policy_names(self, role):
         names, kw = [], {}
