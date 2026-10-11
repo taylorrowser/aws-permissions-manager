@@ -112,17 +112,17 @@ done
 # Remove every grant from every agent role, including roles the restored table doesn't know.
 roles=$(aws iam list-roles --path-prefix /agents/ --query 'Roles[].RoleName' --output text)
 for role in $roles; do
-  has=$(aws iam list-role-policies --role-name "$role" --query "contains(PolicyNames, 'apm-grants')" --output text)
-  if [ "$has" = True ]; then aws iam delete-role-policy --role-name "$role" --policy-name apm-grants; fi
+  has=$(aws iam list-role-policies --role-name "$role" --query "contains(PolicyNames, 'apm-grants')" --output json)
+  if [ "$has" = true ]; then aws iam delete-role-policy --role-name "$role" --policy-name apm-grants; fi
 done
 # Verify before reopening.
 left=$(aws dynamodb scan --table-name apm --consistent-read --select COUNT \
   --filter-expression "(kind = :r AND #s = :a) OR kind IN (:k, :c, :d)" --expression-attribute-names "$status" \
   --expression-attribute-values '{":r":{"S":"req"},":a":{"S":"approved"},":k":{"S":"key"},":c":{"S":"connect"},":d":{"S":"sub"}}' \
-  --query Count --output text)
+  --query Count --output json)   # json sums Count across pages
 [ "$left" = 0 ] || { echo "table still grants access ($left items); apm stays paused"; exit 1; }
 for role in $roles; do
-  [ "$(aws iam list-role-policies --role-name "$role" --query "contains(PolicyNames, 'apm-grants')" --output text)" = False ] \
+  [ "$(aws iam list-role-policies --role-name "$role" --query "contains(PolicyNames, 'apm-grants')" --output json)" = false ] \
     || { echo "$role still has apm-grants; apm stays paused"; exit 1; }
 done
 echo "Access reset and verified."
