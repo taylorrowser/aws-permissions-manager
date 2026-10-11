@@ -14,7 +14,7 @@ agent ── aws --profile apm-<project> ── credential_process ────�
 ```
 
 - **One IAM role per project**: `apm-<project>` under path `/agents/`. Its inline policy `apm-grants` holds one statement per approved request.
-- **`apm-agent-boundary`**: a permissions boundary on every agent role. Even an approved grant can never give IAM writes, `sts:AssumeRole`, Organizations, account, SSO/identity or billing access. `iam:PassRole` is allowed only for other agent roles.
+- **`apm-agent-boundary`**: a permissions boundary on every agent role. Even an approved grant can never give IAM writes, `sts:AssumeRole`, Organizations, account, SSO/identity, billing or domain registration access, or stop or change CloudTrail logging. `iam:PassRole` is allowed only for other agent roles.
 - **`apm-broker` role (the Lambda)**: its permissions are limited to these:
   - create roles under `/agents/`, and only with the boundary attached;
   - edit those roles' inline policies, and delete those roles;
@@ -110,9 +110,11 @@ Tell an agent which project to use in the prompt or in the repo's `CLAUDE.md`/`A
 
 The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `apm wait`, `apm use`. Claude Code puts the plugin's `bin/apm` on the agent's PATH.
 
+**When something goes wrong** (bad deploy, damaged data, a leaked key, session or device), see [docs/operations.md](docs/operations.md): deploy, rollback, table restore and secret rotation. [docs/v1-acceptance.md](docs/v1-acceptance.md) is the end-to-end check run before a release.
+
 ## Security notes
 
-- Agents can never touch apm itself, whatever you approve. The boundary denies its SSM parameters (`/apm*`, including the session secret and push key), its Lambda, table, stack, `apm-*` buckets and logs, anything tagged `managed-by=apm`, and its DNS record. Without this, approving `ssm:GetParameter` or `lambda:UpdateFunctionCode` on `*` would let an agent forge your sign-in or replace the approval code. A boundary change takes effect only after a redeploy.
+- Agents can never touch apm itself, whatever you approve. The boundary denies its SSM parameters (`/apm*`, including the session secret and push key), its Lambda, table, stack, `apm-*` buckets and logs, its HTTP API (routes and integrations), anything tagged `managed-by=apm`, its DNS record and domain registration (`route53domains:*`). Without this, approving `ssm:GetParameter` or `lambda:UpdateFunctionCode` on `*` would let an agent forge your sign-in or replace the approval code. A boundary change takes effect only after a redeploy.
 - Each approve, reject, revoke or project deletion runs entirely under a per-project lease in DynamoDB and re-reads the request strongly consistent inside it, so concurrent Lambda instances can't interleave. The policy is never rebuilt from an IAM read, which can be stale, so a revoked grant can't come back. If IAM refuses a change before writing (the size limit), the approval goes back to pending. If an IAM write fails or its result is unknown (e.g. a timeout), the decision stays recorded. The dashboard flags any project whose IAM policy doesn't match its decisions, with a **Re-apply decisions** button.
 - `ssm:GetParametersByPath` on the root path `/` is denied too, since a recursive read of `/` would otherwise return `/apm/*`.
 - Approving `iam:PassRole` lets a project hand *another* agent role to a service. Approving `s3:*` on `*` means every bucket. Read the resources line; the dashboard flags wildcards.

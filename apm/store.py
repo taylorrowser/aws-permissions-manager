@@ -1,5 +1,7 @@
-"""DynamoDB state: the request queue, agent API keys and push subscriptions. AWS IAM is the
-source of truth for what is granted, so editing this table cannot grant anything."""
+"""DynamoDB state: the request queue and its decisions, agent API keys and push subscriptions.
+Decisions here are the source of truth: each project's IAM policy is rebuilt from its approved
+requests. Only the broker Lambda and account admins can write the table, and whatever it says, the
+agent boundary caps what an agent role can do."""
 import contextlib
 import hashlib
 import json

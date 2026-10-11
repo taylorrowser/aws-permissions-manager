@@ -187,7 +187,8 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(role["Path"], "/apm/")
         sids = [s.get("Sid") for s in role["Policies"][0]["PolicyDocument"]["Statement"]]
         self.assertIn("VendAgentCredentials", sids)
-        self.assertEqual(t["Resources"]["Boundary"]["Properties"]["PolicyDocument"], policy.boundary(ACCOUNT))
+        self.assertEqual(t["Resources"]["Boundary"]["Properties"]["PolicyDocument"],
+                         policy.doc(*policy.boundary(ACCOUNT)["Statement"], policy.api_deny()))
 
 
 class ProtectApmTests(unittest.TestCase):
@@ -239,7 +240,40 @@ class ProtectApmTests(unittest.TestCase):
                              for p in stmt["Resource"]))
 
     def test_boundary_fits_a_managed_policy(self):
-        self.assertLess(len(json.dumps(policy.boundary(ACCOUNT), separators=(",", ":"))), 6144)
+        from apm import deploy
+        deployed = deploy.boundary_document(ACCOUNT, policy.Names("prod"))
+        self.assertLess(len(json.dumps(deployed, separators=(",", ":"))), 6144)
+
+    def test_domain_registration_is_never_grantable(self):
+        for action in ["route53domains:UpdateDomainNameservers", "route53domains:TransferDomain",
+                       "route53domains:RegisterDomain", "route53domains:*", "route53domains:Get*"]:
+            with self.subTest(action=action):
+                self.assertTrue(policy.is_blocked(action))
+                with self.assertRaises(ValueError):
+                    policy.validate_request("myapp", [action], ["*"], "x")
+        allow = next(s for s in policy.boundary(ACCOUNT)["Statement"] if s["Sid"] == "AllowNonAdminServices")
+        self.assertIn("route53domains:*", allow["NotAction"])
+        # Ordinary DNS work in other names stays grantable.
+        self.assertFalse(policy.is_blocked("route53:ChangeResourceRecordSets"))
+
+    def test_audit_trail_tampering_is_denied_but_reading_is_not(self):
+        stmt = next(s for s in policy.boundary(ACCOUNT)["Statement"] if s["Sid"] == "DenyAuditTampering")
+        self.assertEqual((stmt["Effect"], stmt["Resource"]), ("Deny", "*"))
+        for action in ["cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "cloudtrail:UpdateTrail",
+                       "cloudtrail:PutEventSelectors"]:
+            self.assertIn(action, stmt["Action"])
+        for action in ["cloudtrail:LookupEvents", "cloudtrail:DescribeTrails", "cloudtrail:GetTrailStatus"]:
+            self.assertFalse(any(fnmatch.fnmatchcase(action, a) for a in stmt["Action"]))
+
+    def test_the_stacks_own_api_is_denied(self):
+        from apm import deploy
+        t = deploy.template(ACCOUNT, "us-east-1", "apm.test", "Z1", OWNER, "client_x", "PUB", "b", "k.zip")
+        stmts = t["Resources"]["Boundary"]["Properties"]["PolicyDocument"]["Statement"]
+        api = next(s for s in stmts if s["Sid"] == "DenyApmApi")
+        self.assertEqual((api["Effect"], api["Action"]), ("Deny", "apigateway:*"))
+        self.assertEqual(api["Resource"], [{"Fn::Sub": "arn:aws:apigateway:*::/apis/${Api}"},
+                                           {"Fn::Sub": "arn:aws:apigateway:*::/apis/${Api}/*"}])
+        self.assertIn("Api", t["Resources"])  # the reference resolves to this stack's HTTP API
 
 
 class LeaseTests(unittest.TestCase):
