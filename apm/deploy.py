@@ -45,6 +45,13 @@ EXPIRES_TAG = "apm:expires-at"
 STAGE_TAG = "apm:stage"
 
 
+def boundary_document(account, names):
+    """The agent boundary as deployed: policy.boundary() plus a deny on this stack's own API."""
+    doc = policy.boundary(account, names)
+    doc["Statement"].append(policy.api_deny())
+    return doc
+
+
 def template(account, region, domain, zone_id, owner_emails, workos_client_id, vapid_public, code_bucket, code_key,
              stage=policy.PROD, certificate_arn=None):
     """CloudFormation template for one stage. For stage "prod" every name is identical to the
@@ -64,7 +71,7 @@ def template(account, region, domain, zone_id, owner_emails, workos_client_id, v
     resources = {
         "Boundary": {"Type": "AWS::IAM::ManagedPolicy", "Properties": {
             "ManagedPolicyName": n.boundary_name, "Description": "apm: maximum permissions for any agent role",
-            "PolicyDocument": policy.boundary(account, n)}},
+            "PolicyDocument": boundary_document(account, n)}},
         "Table": {"Type": "AWS::DynamoDB::Table", "DeletionPolicy": keep, "UpdateReplacePolicy": keep,
                   "Properties": {
             "TableName": n.table, "BillingMode": "PAY_PER_REQUEST",

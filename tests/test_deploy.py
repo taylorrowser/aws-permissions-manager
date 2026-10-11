@@ -40,6 +40,15 @@ PROD_BOUNDARY_DENIES = [
      "Condition": {"ForAnyValue:StringLike": {
          "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["apm.*", "*.apm.*"]}}},
 ]
+# V1 hardening: domain registration never grantable, audit-trail tampering and the stack's own API denied.
+PROD_V1_BOUNDARY_DENIES = [
+    {"Sid": "DenyAuditTampering", "Effect": "Deny", "Resource": "*", "Action": [
+        "cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "cloudtrail:UpdateTrail", "cloudtrail:PutEventSelectors",
+        "cloudtrail:PutInsightSelectors", "cloudtrail:DeleteEventDataStore", "cloudtrail:UpdateEventDataStore",
+        "cloudtrail:StopEventDataStoreIngestion"]},
+    {"Sid": "DenyApmApi", "Effect": "Deny", "Action": "apigateway:*", "Resource": [
+        {"Fn::Sub": "arn:aws:apigateway:*::/apis/${Api}"}, {"Fn::Sub": "arn:aws:apigateway:*::/apis/${Api}/*"}]},
+]
 NONPROD = ["dev", "pr-1", "pr-12", "pr-123"]
 # Prod project names chosen to collide with naive nonprod naming.
 TRICKY_PROJECTS = ["myapp", "dev", "dev-broker", "broker", "pr-1", "pr-12-app", "agents", "dev-agent-boundary"]
@@ -64,6 +73,12 @@ class ProdCompatibility(unittest.TestCase):
         # Intended change 2: the baseline security fixes (290bf35, 759d908) appended four Deny statements
         # to the agent boundary. Spelled out literally so any other boundary drift fails this test.
         expected["Resources"]["Boundary"]["Properties"]["PolicyDocument"]["Statement"] += PROD_BOUNDARY_DENIES
+        # Intended change 3 (V1 hardening): route53domains:* joins the never-grantable actions, and two
+        # more Deny statements follow.
+        statements = expected["Resources"]["Boundary"]["Properties"]["PolicyDocument"]["Statement"]
+        allow = next(st for st in statements if st["Sid"] == "AllowNonAdminServices")
+        allow["NotAction"] = allow["NotAction"][:11] + ["route53domains:*"] + allow["NotAction"][11:]
+        statements += PROD_V1_BOUNDARY_DENIES
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS))), expected)
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS, stage="prod"))), expected)
 
@@ -257,7 +272,8 @@ class PreviewCannotReachReleaseArtifacts(unittest.TestCase):
     def test_every_stage_boundary_has_the_apm_denies(self):
         for stage in ["prod"] + NONPROD:
             sids = {s["Sid"]: s for s in policy.boundary(ACCOUNT, policy.Names(stage))["Statement"]}
-            for sid in ("DenyApmInfrastructure", "DenyApmTaggedResources", "DenyRecursiveReadOfRoot", "DenyApmDnsRecords"):
+            for sid in ("DenyApmInfrastructure", "DenyApmTaggedResources", "DenyRecursiveReadOfRoot", "DenyApmDnsRecords",
+                        "DenyAuditTampering"):
                 self.assertEqual(sids[sid]["Effect"], "Deny", (stage, sid))
             self.assertEqual(sids["DenyApmInfrastructure"]["Resource"], policy.apm_resources(ACCOUNT))
             self.assertEqual(sids["DenyApmInfrastructure"]["Action"], "*")

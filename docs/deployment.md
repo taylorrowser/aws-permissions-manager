@@ -13,9 +13,6 @@ records how apm implements it:
 - [`docs/deployment-policy.md`](https://github.com/taylorrowser-home-automation/home-automation-starter/blob/main/docs/deployment-policy.md)
   and [`docs/adoption.md`](https://github.com/taylorrowser-home-automation/home-automation-starter/blob/main/docs/adoption.md)
   on `main` of `taylorrowser-home-automation/home-automation-starter` (private).
-- Pending follow-up, not yet the reference: the starter's unmerged
-  [PR #5](https://github.com/taylorrowser-home-automation/home-automation-starter/pull/5) updates its
-  template docs and evidence.
 
 The starter's workflows are rehearsals; apm adapts the policy to its own constraints and doesn't
 copy them.
@@ -187,8 +184,9 @@ account wrote a well-formed record and bundle claiming a real `main` commit and 
 - it deploys through the same reusable workflow and concurrency group;
 - it records `kind=rollback`.
 
-When there's no recorded release to roll back to (before the first CI promotion), the owner path
-remains: check out the known-good commit and run `apm-admin deploy`.
+When there's no recorded release to roll back to (before the first CI promotion), use the owner
+path in [operations.md](operations.md#roll-back-prod): redeploy the previous bundle from the prod
+artifact bucket with `apm-admin deploy-artifact`.
 
 **Serialization.** Dev uses group `deploy-dev`. Prod promote and rollback share `deploy-production`.
 Each preview uses `preview-pr-N`. All of them run with `cancel-in-progress: false`, so a running

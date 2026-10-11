@@ -134,7 +134,17 @@ ACTION_RE = re.compile(r"^[a-z0-9-]+:[A-Za-z0-9*?]+$")
 BLOCKED_ACTIONS = [
     "iam:*", "organizations:*", "account:*", "sso:*", "sso-directory:*", "identitystore:*",
     "aws-portal:*", "billing:*", "payments:*", "tax:*", "cur:*",
+    # Domain registration: transferring a domain or changing its name servers would hand over
+    # apm's domain (and its sign-in callback), and registering domains costs money.
+    "route53domains:*",
     "sts:AssumeRole", "sts:AssumeRoleWithSAML", "sts:AssumeRoleWithWebIdentity",
+]
+# Audit-trail tampering, denied by the boundary even when e.g. cloudtrail:* is approved, so an agent
+# can't hide what it did. Reading trails and events stays possible.
+AUDIT_TAMPERING = [
+    "cloudtrail:StopLogging", "cloudtrail:DeleteTrail", "cloudtrail:UpdateTrail", "cloudtrail:PutEventSelectors",
+    "cloudtrail:PutInsightSelectors", "cloudtrail:DeleteEventDataStore", "cloudtrail:UpdateEventDataStore",
+    "cloudtrail:StopEventDataStoreIngestion",
 ]
 # Exceptions the boundary allows back in.
 IAM_ALLOWED = ["iam:Get*", "iam:List*", "iam:PassRole"]
@@ -201,7 +211,19 @@ def boundary(account, names=None):
         {"Sid": "DenyApmDnsRecords", "Effect": "Deny", "Action": "route53:ChangeResourceRecordSets", "Resource": "*",
          "Condition": {"ForAnyValue:StringLike": {
              "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["apm.*", "*.apm.*"]}}},
+        {"Sid": "DenyAuditTampering", "Effect": "Deny", "Action": AUDIT_TAMPERING, "Resource": "*"},
     )
+
+
+def api_deny(api_ref="Api"):
+    """Boundary statement for the stack's own HTTP API (routes, integrations, stages, authorizers).
+    Its id is only known inside the template, so this is CloudFormation: deploy.template() appends it.
+    Without it, an approved apigateway:* could re-point apm's API at another Lambda and capture the
+    owner's sign-in and approvals; the managed-by tag deny covers it too, but only as far as each
+    API Gateway action supports aws:ResourceTag."""
+    return {"Sid": "DenyApmApi", "Effect": "Deny", "Action": "apigateway:*", "Resource": [
+        {"Fn::Sub": f"arn:aws:apigateway:*::/apis/${{{api_ref}}}"},
+        {"Fn::Sub": f"arn:aws:apigateway:*::/apis/${{{api_ref}}}/*"}]}
 
 
 def broker_policy(account, names=None):
@@ -257,7 +279,7 @@ def validate_request(project, actions, resources, reason):
         if not ACTION_RE.match(a):
             raise ValueError(f"invalid action {a!r}; use service:Action, e.g. s3:GetObject")
         if is_blocked(a):
-            raise ValueError(f"{a} is never grantable to agent roles (IAM, STS assume, billing, org and identity are blocked)")
+            raise ValueError(f"{a} is never grantable to agent roles (IAM, STS assume, billing, org, identity and domain registration are blocked)")
     resources = sorted({r.strip() for r in resources if r.strip()}) or ["*"]
     for r in resources:
         if r != "*" and not r.startswith("arn:"):
