@@ -102,6 +102,8 @@ class ScreenTests(Base):
 
     def test_missing_request_and_expired_connect(self):
         self.assertEqual(self.get("/requests/999").status, 404)
+        self.assertEqual(self.get("/requests/" + "9" * 40).status, 404)  # too long for DynamoDB
+        self.assertEqual(self.get("/requests/\u0661\u0662").status, 404)  # non-ASCII digits
         self.assertIn("no longer waiting", self.get("/connect/ABCD-EFGH").body)
         self.assertEqual(self.get("/connect/not-a-code").status, 404)
 
@@ -119,6 +121,16 @@ class ScreenTests(Base):
         body = self.get(f"/requests/{rid}").body
         self.assertNotIn("<script>alert", body)
         self.assertIn("&lt;script&gt;", body)
+
+    def test_sign_out_works_with_an_expired_session(self):
+        resp = self.app(web.Request("POST", "/logout", headers={"Origin": ORIGIN}))
+        self.assertEqual(resp.status, 303)
+        self.assertTrue(resp.cookies[0].startswith(web.SESSION_COOKIE + "=;"))
+        self.assertEqual(self.app(web.Request("POST", "/logout", headers={"Origin": "https://evil.test"})).status, 403)
+
+    def test_every_screen_carries_the_push_key(self):
+        for path in ["/", "/projects", "/keys"]:
+            self.assertIn('data-vapid="VAPIDPUB"', self.get(path).body)
 
     def test_stage_badge_only_outside_prod(self):
         self.assertNotIn("class=stage", self.get("/").body)
@@ -285,11 +297,49 @@ class DeliveryTests(Base):
         self.app.store.record_delivery(self.device, False, 500)
         self.assertNotIn(self.device, self.app.store.t.items)
 
+    def test_storage_errors_while_notifying_do_not_fail_the_agent(self):
+        with mock.patch("apm.push.send", return_value=201), \
+                mock.patch.object(self.app.store, "record_delivery", side_effect=RuntimeError("throttled")):
+            rid = self.agent_request()
+        self.assertEqual(self.app.store.get(rid)["status"], "pending")
+        with mock.patch("apm.push.deliver", side_effect=RuntimeError("boom")):
+            self.agent_request()
+
+    def test_badge_count_includes_connect_requests(self):
+        self.app.store.add_connect("ci", "ab" * 32, "apm_abcdef")
+        with mock.patch("apm.push.send", return_value=201) as send:
+            self.agent_request()
+        self.assertEqual(send.call_args.args[1]["pending"], 2)
+
     def test_no_vapid_key_skips_quietly(self):
         self.app.s.vapid_private = ""
         with mock.patch("apm.push.send") as send:
             self.agent_request()
         send.assert_not_called()
+
+
+class DeadlineTests(unittest.TestCase):
+    def test_slow_push_service_cannot_hold_the_request(self):
+        import threading
+        import time
+        release = threading.Event()
+        subs = [{"pk": "sub#fast", "sub": SUB}, {"pk": "sub#slow", "sub": {**SUB, "endpoint": "https://slow"}}]
+
+        def fake_send(sub, *a, **k):
+            if sub["endpoint"] == "https://slow":
+                release.wait(5)
+            return 201
+        start = time.monotonic()
+        with mock.patch("apm.push.send", side_effect=fake_send):
+            out = push.deliver(subs, {"title": "t"}, "pem", ORIGIN, budget=0.3)
+        release.set()
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertEqual(out, {"sub#fast": ("delivered", 201), "sub#slow": ("failed", None)})
+
+    def test_no_retry_once_the_budget_is_nearly_spent(self):
+        with mock.patch("apm.push.send", return_value=503) as send:
+            out = push.deliver([{"pk": "sub#a", "sub": SUB}], {}, "pem", ORIGIN, budget=1)
+        self.assertEqual((out["sub#a"], send.call_count), (("failed", 503), 1))
 
 
 @unittest.skipUnless(shutil.which("node"), "node is not installed")

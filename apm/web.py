@@ -42,7 +42,7 @@ ASSET_VERSION = hashlib.sha256(b"".join((STATIC / n).read_bytes() for n, _ in ST
 # Checked by the browser on every start, so app updates arrive the next time the app opens.
 REVALIDATE = {"/sw.js", "/manifest.webmanifest", "/offline.html"}
 # Owner screens. Signed-out visits show the sign-in page and come back here after signing in.
-SCREENS = re.compile(r"/(projects|devices|keys|requests/\d+|connect/[A-Z0-9]{4}-[A-Z0-9]{4})?")
+SCREENS = re.compile(r"/(projects|devices|keys|requests/[0-9]{1,12}|connect/[A-Z0-9]{4}-[A-Z0-9]{4})?")
 SESSION_COOKIE = "__Host-apm_session"
 OAUTH_COOKIE = "__Host-apm_oauth"
 SESSION_SECONDS = 30 * 24 * 3600
@@ -210,13 +210,13 @@ class App:
             json_call = p.startswith("/push/")
             if req.headers.get("origin") != self.s.origin:
                 return Response(403, pages.error_page(self, "Forbidden: that form came from another site."))
+            if p == "/logout":  # works even when the session already expired
+                return redirect("/", [cookie(SESSION_COOKIE, "", 0)])
             if not owner:
                 if json_call:
                     raise ApiError(401, "signed out; reload the page and sign in again")
                 return Response(403, pages.error_page(self, "You've been signed out, so nothing was changed. "
                                                             "Sign in and try again.", "/"))
-            if p == "/logout":
-                return redirect("/", [cookie(SESSION_COOKIE, "", 0)])
             if p == "/action":
                 return self.action(req.form(), owner)
             if json_call:
@@ -379,6 +379,14 @@ class App:
 
     # ----- notifications -----
 
+    def notify_safely(self, message, **kw):
+        """For the agent API: the request is already saved, so a push problem must not fail the call."""
+        try:
+            return self.notify(message, **kw)
+        except Exception as e:
+            print(json.dumps({"event": "push_failed", "error": str(e)[:300]}))
+            return {}
+
     def notify(self, message, only=None, ttl=86400):
         """Push to all devices (or the device ids in `only`). Payloads land on lock screens, so
         callers keep them to a title and a short line with no policy details or reasons. Returns
@@ -388,15 +396,18 @@ class App:
             return {}
         from . import push
         subs = [s for s in self.store.subscriptions() if only is None or s["pk"] in only]
-        message = {**message, "pending": len(self.store.list(status="pending"))}
+        message = {**message, "pending": len(self.store.list(status="pending")) + len(self.store.connects())}
         results = push.deliver(subs, message, self.s.vapid_private, self.s.origin, ttl=ttl)
         for pk, (outcome, status) in results.items():
-            if outcome == "gone":
-                self.store.delete_subscription(pk)
-            else:
-                self.store.record_delivery(pk, outcome == "delivered", status)
             print(json.dumps({"event": "push", "tag": message.get("tag", ""), "device": pk[4:16],
                               "outcome": outcome, "status": status}))
+            try:
+                if outcome == "gone":
+                    self.store.delete_subscription(pk)
+                else:
+                    self.store.record_delivery(pk, outcome == "delivered", status)
+            except Exception as e:  # the request is already saved; don't fail the agent's call
+                print(json.dumps({"event": "push_bookkeeping_error", "device": pk[4:16], "error": str(e)[:200]}))
         return results
 
     def push_api(self, path, body):
@@ -482,7 +493,7 @@ class App:
                 code = self.store.add_connect(name, key_hash, prefix, info.strip())
             except Conflict as e:
                 raise ApiError(429, str(e))
-            self.notify({"title": "An agent wants to connect", "body": f"{name} is waiting for you to approve it.",
+            self.notify_safely({"title": "An agent wants to connect", "body": f"{name} is waiting for you to approve it.",
                          "url": f"/connect/{code}", "tag": f"connect-{code}"}, ttl=CONNECT_SECONDS)
             return json_response({"code": code, "url": f"{self.s.origin}/connect/{code}"}, 201)
         if req.path == "/api/connect/status":
@@ -505,7 +516,7 @@ class App:
             raise ApiError(429, f"this API key already has {PENDING_LIMIT} pending requests; wait for the owner")
         rid = self.store.add(project, actions, resources, reason, key["name"])
         n = len(actions)
-        self.notify({"title": f"Permission request #{rid}",
+        self.notify_safely({"title": f"Permission request #{rid}",
                      "body": f"{project}: {n} action{'s' if n != 1 else ''} to review",
                      "url": f"/requests/{rid}", "tag": f"req-{rid}"})
         return _public(self.store.get(rid))

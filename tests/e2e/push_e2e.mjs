@@ -20,8 +20,9 @@ const origin = `http://localhost:${port}`;
 const python = process.env.PYTHON || path.join(root, ".venv/bin/python");
 const log = (...a) => console.log("•", ...a);
 
-const server = spawn(python, ["scripts/dev_server.py", "--port", String(port), "--empty"], { cwd: root, stdio: ["ignore", "pipe", "inherit"] });
+const server = spawn(python, ["scripts/dev_server.py", "--port", String(port), "--empty"], { cwd: root, stdio: ["ignore", "pipe", "inherit"], env: { ...process.env, PYTHONUNBUFFERED: "1" } });
 await new Promise((resolve) => server.stdout.once("data", resolve));
+server.stdout.on("data", (d) => { if (process.env.E2E_VERBOSE) process.stderr.write(d); });
 const browser = await chromium.launchPersistentContext("", {
   channel: "chrome", headless: !process.argv.includes("--headed"), viewport: { width: 390, height: 844 },
 });
@@ -32,15 +33,24 @@ try {
 
   await page.goto(`${origin}/dev/login?next=/devices`);
   await page.getByRole("button", { name: "Turn on notifications" }).click();
-  await page.waitForFunction(() => /Test sent|didn't accept|Couldn't/.test(document.getElementById("push-status").textContent), null, { timeout: 30000 });
+  await page.waitForFunction(() => /Test sent|didn't accept|Couldn't|rejected|expired/.test(document.getElementById("push-status").textContent), null, { timeout: 30000 });
   const status = await page.textContent("#push-status");
   log("after enabling:", status);
   assert.match(status, /Test sent/);
 
-  const shown = async () => page.evaluate(async () =>
-    (await (await navigator.serviceWorker.ready).getNotifications()).map((n) => ({ title: n.title, body: n.body, tag: n.tag, url: n.data?.url })));
-  await page.waitForFunction(async () => (await (await navigator.serviceWorker.ready).getNotifications()).length > 0, null, { timeout: 20000 });
-  log("test notification displayed:", JSON.stringify(await shown()));
+  // Headless Chrome may dismiss notifications quickly, so read one in the same poll that finds it.
+  // (waitForFunction can't be used: it treats an async predicate's promise as already true.)
+  async function notification(tag, timeout = 20000) {
+    for (const end = Date.now() + timeout; Date.now() < end; await page.waitForTimeout(100)) {
+      const n = await page.evaluate(async (tag) => {
+        const [n] = await (await navigator.serviceWorker.ready).getNotifications({ tag });
+        return n ? { title: n.title, body: n.body, tag: n.tag, url: n.data?.url } : null;
+      }, tag);
+      if (n) return n;
+    }
+    throw new Error(`no notification with tag ${tag} within ${timeout} ms`);
+  }
+  log("test notification displayed:", JSON.stringify(await notification("test").catch((e) => e.message)));
 
   await page.reload();
   await page.waitForSelector(".chip.this:not([hidden])");
@@ -57,9 +67,7 @@ try {
   });
   assert.equal(resp.status, 201);
   const { id } = await resp.json();
-  await page.waitForFunction(async (tag) => (await (await navigator.serviceWorker.ready).getNotifications({ tag })).length > 0,
-    `req-${id}`, { timeout: 20000 });
-  const note = (await shown()).find((n) => n.tag === `req-${id}`);
+  const note = await notification(`req-${id}`);
   log("request notification:", JSON.stringify(note));
   assert.equal(note.url, `/requests/${id}`);
   assert.ok(!JSON.stringify(note).includes("SECRET-REASON") && !JSON.stringify(note).includes("ListAllMyBuckets"));
@@ -86,6 +94,10 @@ try {
   assert.match(await page.textContent("main"), /All devices \(0\)/i);
   log("turned off; device removed from server");
   console.log("PASS");
+} catch (err) {
+  console.error("FAIL", err.message.split("\n")[0]);
+  for (const p of browser.pages()) console.error("  page", p.url(), "status:", await p.textContent("#push-status").catch(() => "-"));
+  process.exitCode = 1;
 } finally {
   await browser.close();
   server.kill();

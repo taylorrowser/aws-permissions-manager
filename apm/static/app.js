@@ -171,7 +171,7 @@ if (typeof document !== "undefined") {
   });
 
   const status = $("push-status");
-  const vapid = status?.dataset.vapid || null;
+  const vapid = document.body.dataset.vapid || null;
   const env = () => ({
     ios: isIOS(navigator), userAgent: navigator.userAgent,
     standalone: matchMedia("(display-mode: standalone)").matches || navigator.standalone === true,
@@ -225,7 +225,8 @@ if (typeof document !== "undefined") {
     }[state];
   }
 
-  async function testDevice(sub) {
+  // Sends a test to this device and reports what the push service said. Returns the outcome.
+  async function testDevice(sub, { justEnabled = false, retrying = false } = {}) {
     render("on", "Sending a test notification…");
     try {
       const { results } = await post("/push/test", { endpoint: sub.endpoint });
@@ -234,12 +235,17 @@ if (typeof document !== "undefined") {
         render("on", "Test sent. It should appear within a few seconds. If it doesn't, check Focus or Do Not Disturb and your system notification settings.");
       } else if (r.outcome === "gone") {
         await sub.unsubscribe().catch(() => {});
-        render("off", "This device's subscription had expired and was removed. Turn notifications on again.");
+        if (retrying) return r.outcome; // the caller subscribes again; say nothing yet
+        render("off", justEnabled
+          ? "The browser's push service rejected this device. Try Turn on notifications again in a minute, or use another browser."
+          : "This device's subscription had expired and was removed. Turn notifications on again.");
       } else {
         render("on", `The push service didn't accept the test${r.status ? ` (HTTP ${r.status})` : ""}. Try again in a minute.`);
       }
+      return r.outcome;
     } catch (err) {
       render("on", `Couldn't send a test: ${err.message}`);
+      return "failed";
     }
   }
 
@@ -279,9 +285,14 @@ if (typeof document !== "undefined") {
           }
         }
         if (!vapid) throw new Error("the server has no push key configured");
-        sub = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(vapid) });
-        await save(sub);
-        await testDevice(sub);
+        // A brand-new subscription is occasionally rejected as gone by the push service; one
+        // fresh subscription usually fixes it.
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          sub = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(vapid) });
+          await save(sub);
+          if (await testDevice(sub, { justEnabled: true, retrying: attempt === 1 }) !== "gone") break;
+          sub = null;
+        }
       } catch (err) {
         render("off", `Couldn't turn on notifications: ${err.message}`);
       } finally {
@@ -291,9 +302,9 @@ if (typeof document !== "undefined") {
     $("push-test").onclick = () => sub && testDevice(sub);
     $("push-disable").onclick = async () => {
       try {
-        const endpoint = sub?.endpoint;
+        // Server first: if that fails, this device stays subscribed and the screen stays truthful.
+        if (sub) await post("/push/unsubscribe", { endpoint: sub.endpoint });
         await sub?.unsubscribe();
-        if (endpoint) await post("/push/unsubscribe", { endpoint });
         sub = null;
         render("off", "Notifications are off for this device.");
         document.querySelector(".chip.this:not([hidden])")?.closest("li")?.remove();

@@ -8,7 +8,9 @@ const PRECACHE = ["/offline.html", "/app.css", `/app.css?v=${VERSION}`, `/app.js
 const CACHEABLE = /^\/(app\.css|app\.js|icon-192\.png|icon-512\.png|apple-touch-icon\.png|offline\.html)$/;
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(PRECACHE)).then(() => self.skipWaiting()));
+  // cache: "reload" skips the HTTP cache so a new version never precaches stale files.
+  event.waitUntil(caches.open(CACHE).then((c) => c.addAll(PRECACHE.map((u) => new Request(u, { cache: "reload" }))))
+    .then(() => self.skipWaiting()));
 });
 
 self.addEventListener("activate", (event) => {
@@ -24,8 +26,9 @@ self.addEventListener("fetch", (event) => {
   const req = event.request;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
-  if (req.mode === "navigate") {
-    // Always the network. If it's unreachable, say so; a form post was not sent and isn't retried.
+  if (req.mode === "navigate" && req.method === "GET") {
+    // Always the network; if it's unreachable, say so. Form posts are never touched here: they go
+    // straight to the network, and the page blocks them while offline.
     event.respondWith(fetch(req).catch(async () => {
       const page = await caches.match("/offline.html", { ignoreSearch: true });
       return page
@@ -78,13 +81,11 @@ self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const url = new URL(safeUrl(event.notification.data?.url), self.location.origin).href;
   event.waitUntil((async () => {
-    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    for (const w of windows) {
-      if (new URL(w.url).origin !== self.location.origin) continue;
+    // Reuse an open window of the app (only windows this worker controls can be navigated).
+    for (const w of await self.clients.matchAll({ type: "window" })) {
       try {
-        const focused = await w.focus();
-        // navigate() only works on pages this worker controls; otherwise open a new window.
-        if (await (focused || w).navigate(url)) return;
+        const moved = await w.navigate(url);
+        if (moved) { await moved.focus(); return; }
       } catch (_) {}
     }
     await self.clients.openWindow(url);

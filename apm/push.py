@@ -5,7 +5,7 @@ import json
 import os
 import struct
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -76,6 +76,8 @@ def send(subscription, message, private_pem, subject, ttl=86400, timeout=10):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status
     except urllib.error.HTTPError as e:
+        reason = e.read()[:200].decode(errors="replace")
+        print(json.dumps({"event": "push_rejected", "service": urlparse(endpoint).netloc, "status": e.code, "reason": reason}))
         return e.code
 
 
@@ -83,11 +85,14 @@ GONE = (404, 410)
 RETRYABLE = (429, 500, 502, 503, 504)
 
 
-def deliver(subscriptions, message, private_pem, subject, ttl=86400):
+def deliver(subscriptions, message, private_pem, subject, ttl=86400, budget=10):
     """Send to every subscription in parallel, retrying a transient failure once. The Lambda is
-    frozen once it responds, so this runs inline with short timeouts (worst case about 9 seconds)
-    instead of queueing. Returns {pk: (outcome, status)}, outcome being delivered, gone or failed;
-    status is the HTTP status or None for a network error."""
+    frozen once it responds, so this runs inline, and the whole send returns within about
+    `budget` seconds whatever the push services do; a send still running then counts as failed.
+    Returns {pk: (outcome, status)}, outcome being delivered, gone or failed; status is the HTTP
+    status, or None for a network error or timeout."""
+    deadline = time.monotonic() + budget
+
     def one(s):
         status = None
         for attempt in (1, 2):
@@ -100,7 +105,7 @@ def deliver(subscriptions, message, private_pem, subject, ttl=86400):
                 return "delivered", status
             if status in GONE:
                 return "gone", status
-            if attempt == 1 and (status is None or status in RETRYABLE):
+            if attempt == 1 and (status is None or status in RETRYABLE) and time.monotonic() + 5 < deadline:
                 time.sleep(0.5)
                 continue
             return "failed", status
@@ -108,5 +113,8 @@ def deliver(subscriptions, message, private_pem, subject, ttl=86400):
 
     if not subscriptions:
         return {}
-    with ThreadPoolExecutor(max_workers=min(8, len(subscriptions))) as pool:
-        return dict(zip([s["pk"] for s in subscriptions], pool.map(one, subscriptions)))
+    pool = ThreadPoolExecutor(max_workers=min(16, len(subscriptions)))
+    futures = {s["pk"]: pool.submit(one, s) for s in subscriptions}
+    wait(futures.values(), timeout=max(0, deadline - time.monotonic()))
+    pool.shutdown(wait=False, cancel_futures=True)  # don't hold the response for a hung send
+    return {pk: f.result() if f.done() else ("failed", None) for pk, f in futures.items()}

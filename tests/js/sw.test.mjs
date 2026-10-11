@@ -14,7 +14,11 @@ function load({ online = true, windows = [] } = {}) {
     async open(name) {
       if (!caches.has(name)) caches.set(name, new Map());
       const c = caches.get(name);
-      return { addAll: async (urls) => urls.forEach((u) => c.set(u, new Response(`cached ${u}`))) };
+      return { addAll: async (reqs) => reqs.forEach((r) => {
+        const u = typeof r === "string" ? r : (() => { const x = new URL(r.url); return x.pathname + x.search; })();
+        assert.equal(typeof r === "string" ? "default" : r.cache, "reload");
+        c.set(u, new Response(`cached ${u}`));
+      }) };
     },
     async keys() { return [...caches.keys()]; },
     async delete(name) { return caches.delete(name); },
@@ -50,7 +54,9 @@ function load({ online = true, windows = [] } = {}) {
     if (!online) throw new TypeError("Failed to fetch");
     return new Response("network");
   };
-  const ctx = vm.createContext({ self, caches: cacheApi, fetch: fetchFn, Response, URL, console });
+  // Like a worker, resolve relative URLs against its location.
+  class WorkerRequest extends Request { constructor(u, o) { super(new URL(u, ORIGIN), o); } }
+  const ctx = vm.createContext({ self, caches: cacheApi, fetch: fetchFn, Response, Request: WorkerRequest, URL, console });
   vm.runInContext(SOURCE, ctx);
   async function fire(type, event) {
     const waits = [];
@@ -92,15 +98,19 @@ test("pages always come from the network", async () => {
   assert.equal(await resp.text(), "network");
 });
 
-test("offline navigation shows the offline page with 503, for posts too", async () => {
+test("offline navigation shows the offline page with 503", async () => {
   const sw = load({ online: false });
   await sw.fire("install", {});
-  for (const event of [nav("/"), nav("/action", "POST")]) {
-    const resp = await sw.fire("fetch", event);
-    assert.equal(resp.status, 503);
-    assert.equal(await resp.text(), "cached /offline.html");
-    assert.equal(resp.headers.get("Cache-Control"), "no-store");
-  }
+  const resp = await sw.fire("fetch", nav("/requests/3"));
+  assert.equal(resp.status, 503);
+  assert.equal(await resp.text(), "cached /offline.html");
+  assert.equal(resp.headers.get("Cache-Control"), "no-store");
+});
+
+test("form posts are left to the browser, never replayed by the worker", async () => {
+  const sw = load();
+  await sw.fire("install", {});
+  for (const path of ["/action", "/logout"]) assert.equal(await sw.fire("fetch", nav(path, "POST")), undefined);
 });
 
 test("API, push and action requests are never intercepted or cached", async () => {
@@ -146,12 +156,12 @@ test("notification links can only point into this app", async () => {
   assert.equal(sw.shown[0].data.url, "/");
 });
 
-test("clicking focuses an open window and navigates it to the request", async () => {
+test("clicking navigates an open app window to the request and focuses it", async () => {
   const calls = [];
   const w = { url: ORIGIN + "/projects", focus: async () => { calls.push("focus"); return w; }, navigate: async (u) => { calls.push(u); return w; } };
   const sw = load({ windows: [w] });
   await sw.fire("notificationclick", { notification: { close: () => calls.push("close"), data: { url: "/requests/4" } } });
-  assert.deepEqual(calls, ["close", "focus", ORIGIN + "/requests/4"]);
+  assert.deepEqual(calls, ["close", ORIGIN + "/requests/4", "focus"]);
   assert.deepEqual(sw.opened, []);
 });
 

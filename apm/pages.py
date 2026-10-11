@@ -68,7 +68,8 @@ def layout(app, owner, active, title, body, msg="", heading=None):
         current = ' aria-current="page"' if key == active else ""
         count = f' <span class=count aria-label="{pending} waiting">{pending}</span>' if key == "requests" and pending else ""
         tabs.append(f'<a href="{href}"{current}>{_icon(key)}<span class=label>{label}</span>{count}</a>')
-    return (_head(app, title) + f'<body data-page="{e(active)}" data-pending="{pending}">'
+    return (_head(app, title) + f'<body data-page="{e(active)}" data-pending="{pending}" '
+            f'data-vapid="{e(app.s.vapid_public)}">'
             '<a class=skip href="#main">Skip to content</a>'
             '<div id=offline class=banner role=status hidden>You\'re offline. Approving and rejecting need a connection; '
             'nothing is saved for later.</div>'
@@ -308,7 +309,7 @@ def devices_page(app, owner, msg=""):
     subs = app.store.subscriptions()
     out = ['<section class=card id=this-device aria-labelledby=this-device-t>'
            '<h2 id=this-device-t>This device</h2>'
-           f'<p id=push-status data-vapid="{e(app.s.vapid_public)}" aria-live=polite>Checking notifications…</p>'
+           '<p id=push-status aria-live=polite>Checking notifications…</p>'
            '<div class=decide>'
            '<button id=push-enable class=primary hidden>Turn on notifications</button>'
            '<button id=push-test hidden>Send a test</button>'
