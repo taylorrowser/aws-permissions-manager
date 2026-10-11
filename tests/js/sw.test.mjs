@@ -7,8 +7,8 @@ import vm from "node:vm";
 const SOURCE = readFileSync(new URL("../../apm/static/sw.js", import.meta.url), "utf8").replace("__VERSION__", "v2");
 const ORIGIN = "https://apm.test";
 
-function load({ online = true, windows = [] } = {}) {
-  const listeners = {}, caches = new Map(), shown = [], opened = [], fetched = [], messages = [];
+function load({ online = true, windows = [], status = 200 } = {}) {
+  const listeners = {}, caches = new Map(), shown = [], opened = [], fetched = [], messages = [], unsubscribed = [];
   let skipped = false, claimed = false, badge = null;
   const cacheApi = {
     async open(name) {
@@ -45,14 +45,14 @@ function load({ online = true, windows = [] } = {}) {
     },
     registration: {
       showNotification: async (title, options) => { shown.push({ title, ...options }); },
-      pushManager: { subscribe: async () => ({ endpoint: "https://push.example/new", toJSON: () => ({ endpoint: "https://push.example/new", keys: { p256dh: "p", auth: "a" } }) }) },
+      pushManager: { subscribe: async () => ({ endpoint: "https://push.example/new", unsubscribe: async () => { unsubscribed.push("new"); }, toJSON: () => ({ endpoint: "https://push.example/new", keys: { p256dh: "p", auth: "a" } }) }) },
     },
   };
   for (const w of windows) w.postMessage ??= (m) => messages.push(m);
   const fetchFn = async (req, init) => {
     fetched.push({ url: typeof req === "string" ? req : req.url, init });
     if (!online) throw new TypeError("Failed to fetch");
-    return new Response("network");
+    return new Response("network", { status });
   };
   // Like a worker, resolve relative URLs against its location.
   class WorkerRequest extends Request { constructor(u, o) { super(new URL(u, ORIGIN), o); } }
@@ -66,7 +66,7 @@ function load({ online = true, windows = [] } = {}) {
     await Promise.all(waits);
     return response && await response;
   }
-  return { fire, caches, shown, opened, fetched, messages, state: () => ({ skipped, claimed, badge }) };
+  return { fire, caches, shown, opened, fetched, messages, unsubscribed, state: () => ({ skipped, claimed, badge }) };
 }
 
 const nav = (path, method = "GET") => ({ request: { url: ORIGIN + path, mode: "navigate", method } });
@@ -183,4 +183,13 @@ test("a rotated subscription is re-registered, replacing the old one", async () 
   assert.equal(body.auto, true);
   assert.equal(body.subscription.endpoint, "https://push.example/new");
   assert.equal(call.init.credentials, "same-origin");
+});
+
+test("a rotated subscription the owner removed is dropped, not kept", async () => {
+  const sw = load({ status: 410 });
+  await sw.fire("pushsubscriptionchange", { oldSubscription: { endpoint: "https://push.example/old", options: { applicationServerKey: new ArrayBuffer(65) } } });
+  assert.deepEqual(sw.unsubscribed, ["new"]);
+  const ok = load();
+  await ok.fire("pushsubscriptionchange", { oldSubscription: { endpoint: "https://push.example/old", options: { applicationServerKey: new ArrayBuffer(65) } } });
+  assert.deepEqual(ok.unsubscribed, []);
 });

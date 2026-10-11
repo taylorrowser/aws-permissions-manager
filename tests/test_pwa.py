@@ -212,6 +212,9 @@ class PushApiTests(Base):
         self.assertEqual(self.post_json("/push/subscribe", {"subscription": rotated, "replaces": SUB["endpoint"],
                                                             "auto": True})[0], 410)
         self.assertEqual(self.app.store.subscriptions(), [])
+        # The rotated endpoint is marked too, so the next page sync can't register it either.
+        self.assertEqual(self.post_json("/push/subscribe", {"subscription": rotated, "auto": True})[0], 410)
+        self.assertEqual(self.app.store.subscriptions(), [])
         # ...until the owner taps Turn on there, which clears the removal.
         self.assertEqual(self.post_json("/push/subscribe", {"subscription": SUB})[0], 200)
         self.assertEqual(self.post_json("/push/subscribe", {"subscription": SUB, "auto": True})[0], 200)

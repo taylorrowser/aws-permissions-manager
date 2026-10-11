@@ -421,7 +421,9 @@ class App:
             removed = [d for d in (device, subscription_id(replaces) if replaces else None)
                        if d and self.store.device_removed(d)]
             if body.get("auto") and removed:
-                # Background re-syncs must not undo a removal; only tapping Turn on does.
+                # Background re-syncs must not undo a removal; only tapping Turn on does. Mark the
+                # new endpoint too, so a rotated subscription can't sneak back in later.
+                self.store.remove_device(device)
                 raise ApiError(410, "this device was removed from notifications")
             for d in removed:
                 self.store.clear_removed(d)

@@ -100,9 +100,11 @@ self.addEventListener("pushsubscriptionchange", (event) => {
     const key = old?.options?.applicationServerKey;
     const sub = event.newSubscription || (key && await self.registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }));
     if (!sub) return;
-    await fetch("/push/subscribe", {
+    const resp = await fetch("/push/subscribe", {
       method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ subscription: sub.toJSON(), label: self.navigator.userAgent, replaces: old?.endpoint || "", auto: true }),
-    }).catch(() => {});
+    }).catch(() => null);
+    // 410: the owner removed this device. Drop the new subscription instead of keeping it.
+    if (resp?.status === 410) await sub.unsubscribe().catch(() => {});
   })());
 });
