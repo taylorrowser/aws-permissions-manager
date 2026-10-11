@@ -1,6 +1,8 @@
 # Continuous deploy to dev (https://dev.apm.taylorrowser.com) after CI passes on main.
-# Deploys the exact artifact CI built for the commit (build once), smoke tests it, and records it
-# as eligible for promotion by uploading it as the `release-<sha>` artifact of this run.
+# Deploys the exact artifact CI built for the commit (build once), health checks it, and writes a
+# durable dev release record to S3 (releases/dev/<release_id>.json in the dev artifact bucket):
+# source sha, artifact digest, CI run, this deploy run, health result and timestamp. That record,
+# not the build, is the release candidate that "Promote to prod" accepts.
 #
 # Disabled until bootstrap: nothing runs unless the repository variable APM_DEV_ENABLED is 'true'.
 # See docs/deployment.md.
@@ -35,17 +37,21 @@ jobs:
     permissions:
       contents: read
       actions: read # download the artifact from the CI run
-      id-token: write # GitHub OIDC -> AWS dev deploy role
+      id-token: write # GitHub OIDC -> AWS dev deploy role (nonprod account)
     env:
       SHA: ${{ github.event.workflow_run.head_sha }}
       CI_RUN_ID: ${{ github.event.workflow_run.id }}
+      CI_RUN_URL: ${{ github.event.workflow_run.html_url }}
+      DEPLOY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       STAGE: dev
       DOMAIN: dev.${{ vars.APM_BASE_DOMAIN || 'apm.taylorrowser.com' }}
       AWS_REGION: ${{ vars.APM_NONPROD_REGION || 'us-east-1' }}
       ACCOUNT: ${{ vars.APM_NONPROD_ACCOUNT_ID }}
+      PROD_ACCOUNT: ${{ vars.APM_PROD_ACCOUNT_ID }}
       ROLE_ARN: ${{ vars.APM_DEV_ROLE_ARN }}
       OWNER_EMAILS: ${{ vars.APM_OWNER_EMAILS }}
       WORKOS_CLIENT_ID: ${{ vars.APM_STAGING_WORKOS_CLIENT_ID }}
+      PROD_WORKOS_CLIENT_ID: ${{ vars.APM_PROD_WORKOS_CLIENT_ID }}
       ZONE_ID: ${{ vars.APM_DEV_ZONE_ID }}
       CERT_ARN: ${{ vars.APM_DEV_CERT_ARN }}
     steps:
@@ -58,10 +64,19 @@ jobs:
             exit 1
           fi
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad head sha"; exit 1; }
+          [[ "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]] || { echo "::error::bad CI run id"; exit 1; }
+          # Dev uses the WorkOS staging app, never the prod one.
+          if [ "$WORKOS_CLIENT_ID" = "$PROD_WORKOS_CLIENT_ID" ]; then
+            echo "::error::APM_STAGING_WORKOS_CLIENT_ID must not be the prod WorkOS client"; exit 1
+          fi
+          if [ -n "$PROD_ACCOUNT" ] && [ "$ACCOUNT" = "$PROD_ACCOUNT" ]; then
+            echo "::warning::dev shares the prod AWS account; a separate nonprod account is recommended"
+          fi
 
+      # Deploy tooling from this main commit (reviewed), which is also the commit being deployed.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.SHA }}
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -79,9 +94,9 @@ jobs:
       - name: Download the artifact CI built for this commit
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: lambda-${{ env.SHA }}
+          name: lambda-${{ github.event.workflow_run.head_sha }}
           path: dist/lambda
-          run-id: ${{ env.CI_RUN_ID }}
+          run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
       - name: Verify artifact
         run: apm-admin verify --artifact dist/lambda --git-sha "$SHA"
@@ -96,15 +111,15 @@ jobs:
       - name: Skip if dev already runs a newer commit
         id: order
         run: |
-          bucket="apm-artifacts-${ACCOUNT}-${AWS_REGION}"
-          current=$(aws s3 cp "s3://${bucket}/deployments/dev/current.json" - 2>/dev/null \
-            | python -c 'import json,sys; print(json.load(sys.stdin)["git_sha"])' || true)
+          apm-admin release current --stage dev --account "$ACCOUNT" --region "$AWS_REGION" > current.json
+          current=$(python -c 'import json; print(json.load(open("current.json")).get("git_sha", ""))')
           if [ -n "$current" ] && [ "$current" != "$SHA" ] && git merge-base --is-ancestor "$SHA" "$current" 2>/dev/null; then
             echo "::notice::dev already runs ${current}, which contains ${SHA}; not deploying an older commit"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Deploy to dev
+        id: deploy
         if: steps.order.outputs.skip != 'true'
         run: |
           args=()
@@ -114,27 +129,41 @@ jobs:
             --account "$ACCOUNT" --region "$AWS_REGION" --domain "$DOMAIN" \
             --owner-email "$OWNER_EMAILS" --workos-client-id "$WORKOS_CLIENT_ID" "${args[@]}"
 
-      - name: Smoke test
-        if: steps.order.outputs.skip != 'true'
+      - name: Health check
+        id: smoke
+        if: steps.deploy.outcome == 'success'
+        continue-on-error: true # recorded either way; the job fails below if it failed
         run: apm-admin smoke --url "https://${DOMAIN}"
 
-      - name: Record release candidate
-        if: steps.order.outputs.skip != 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          # promote-prod.yml only accepts `release-<sha>` artifacts from successful runs of this workflow.
-          name: release-${{ env.SHA }}
-          path: dist/lambda/
-          if-no-files-found: error
-          retention-days: 90
+      - name: Record dev release
+        id: record
+        if: always() && steps.deploy.outcome == 'success'
+        env:
+          HEALTH: ${{ steps.smoke.outcome == 'success' && 'passed' || 'failed' }}
+        run: |
+          apm-admin release record --stage dev --kind deploy --artifact dist/lambda --git-sha "$SHA" \
+            --health "$HEALTH" --health-url "https://${DOMAIN}/healthz" \
+            --ci-run-id "$CI_RUN_ID" --ci-run-url "$CI_RUN_URL" \
+            --deploy-run-id "$GITHUB_RUN_ID" --deploy-run-url "$DEPLOY_RUN_URL" \
+            --account "$ACCOUNT" --region "$AWS_REGION" --domain "$DOMAIN"
 
       - name: Summary
-        if: steps.order.outputs.skip != 'true'
+        if: always() && steps.record.outcome == 'success'
+        env:
+          RELEASE_ID: ${{ steps.record.outputs.release_id }}
+          HEALTH: ${{ steps.smoke.outcome == 'success' && 'passed' || 'failed' }}
         run: |
           {
-            echo "### Deployed to dev"
+            echo "### Deployed to dev: health ${HEALTH}"
             echo "- URL: https://${DOMAIN}"
             echo "- Commit: \`${SHA}\`"
             echo "- Artifact sha256: \`$(python -c 'import json; print(json.load(open("dist/lambda/manifest.json"))["sha256"])')\`"
-            echo "- Promote: run **Promote to prod** on main with sha \`${SHA}\`"
+            echo "- Dev release: \`${RELEASE_ID}\`"
+            [ "$HEALTH" = passed ] && echo "- Promote: run **Promote to prod** on main with release_id \`${RELEASE_ID}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if the health check failed
+        if: steps.smoke.outcome == 'failure'
+        run: |
+          echo "::error::dev health check failed; the release was recorded as failed and can't be promoted"
+          exit 1

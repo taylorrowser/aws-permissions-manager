@@ -1,14 +1,26 @@
 # One-time bootstrap for GitHub Actions deploys. NOT applied by CI or by this repo's code: the owner
 # reviews it and deploys it by hand, once per account, with an admin login. See docs/deployment.md.
 #
-#   Nonprod account: AccountKind=nonprod -> roles apm-github-dev and apm-github-preview
-#   Prod account:    AccountKind=prod    -> role apm-github-prod
+#   Nonprod account: AccountKind=nonprod -> apm-github-dev, apm-github-preview, apm-github-release-reader
+#   Prod account:    AccountKind=prod    -> apm-github-prod
 #
 # Trust: each role trusts only GitHub's OIDC provider, audience sts.amazonaws.com, and ONE exact
 # `sub` value. Copy the subjects from the "OIDC claims" workflow output (.github/workflows/
 # oidc-claims.yml); do not guess the format. This repo was created after 2026-07-15, so its `sub`
-# is expected to use immutable IDs (repo:OWNER@OWNER_ID/REPO@REPO_ID:environment:NAME), but only
-# the printed claim is authoritative.
+# is expected to use immutable IDs (repo:OWNER@OWNER_ID/REPO@REPO_ID:...), but only the printed
+# claim is authoritative.
+#
+# Prod identity: only the reusable .github/workflows/prod-release.yml (called by promote-prod.yml and
+# rollback-prod.yml from main) runs in the `production` environment with the prod role. Recommended:
+# customize the repo's OIDC subject template to include job_workflow_ref (docs/deployment.md), so
+# ProdSubject pins org/repo, environment, workflow file and refs/heads/main in one exact string.
+# Optionally also set ProdJobWorkflowRef to require the job_workflow_ref claim directly (fails
+# closed if AWS doesn't evaluate that claim: verify with a first run).
+#
+# Isolation: the preview role can't touch dev or prod names, and the dev role can't touch prod names
+# (explicit Deny statements below, on top of name-scoped Allows; tests/test_pipeline.py checks
+# them). The release-reader role (nonprod) is read-only on dev release records and bundles and is
+# trusted only by the prod identity, so promotion can read the dev release without dev writing to prod.
 #
 # Caveat: a role that can create the broker role and its inline policy through CloudFormation is
 # effectively able to grant itself anything in that account. The scoping below limits accidents and
@@ -41,12 +53,21 @@ Parameters:
   ProdSubject:
     Type: String
     Default: ""
-    Description: Exact sub claim of a job in environment production (prod only)
+    Description: >-
+      Exact sub claim of prod-release.yml in environment production (both accounts: prod role, and the
+      nonprod release-reader role). Read it with the OIDC claims workflow, environment production.
+  ProdJobWorkflowRef:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional. Exact job_workflow_ref, e.g. OWNER/REPO/.github/workflows/prod-release.yml@refs/heads/main.
+      Adds a job_workflow_ref condition to the prod and release-reader trust (unverified against AWS; fails closed).
 
 Conditions:
   IsNonprod: !Equals [!Ref AccountKind, nonprod]
   IsProd: !Equals [!Ref AccountKind, prod]
   MakeProvider: !Equals [!Ref CreateOidcProvider, "true"]
+  PinWorkflow: !Not [!Equals [!Ref ProdJobWorkflowRef, ""]]
 
 Rules:
   NonprodSubjects:
@@ -56,6 +77,8 @@ Rules:
         AssertDescription: DevSubject is required for a nonprod account
       - Assert: !Not [!Equals [!Ref PreviewSubject, ""]]
         AssertDescription: PreviewSubject is required for a nonprod account
+      - Assert: !Not [!Equals [!Ref ProdSubject, ""]]
+        AssertDescription: ProdSubject is required for the nonprod release-reader role
   ProdSubjects:
     RuleCondition: !Equals [!Ref AccountKind, prod]
     Assertions:
@@ -148,12 +171,27 @@ Resources:
                 Effect: Allow
                 Action: [ssm:GetParameter, ssm:PutParameter]
                 Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/apm-dev/*
-              - Sid: Artifacts
+              - Sid: Artifacts # bundles, manifests and dev release records (write-once)
                 Effect: Allow
                 Action: [s3:CreateBucket, s3:PutBucketPublicAccessBlock, s3:ListBucket, s3:GetObject, s3:PutObject]
                 Resource:
-                  - !Sub arn:${AWS::Partition}:s3:::apm-artifacts-${AWS::AccountId}-${AWS::Region}
-                  - !Sub arn:${AWS::Partition}:s3:::apm-artifacts-${AWS::AccountId}-${AWS::Region}/*
+                  - !Sub arn:${AWS::Partition}:s3:::apm-dev-artifacts-${AWS::AccountId}-${AWS::Region}
+                  - !Sub arn:${AWS::Partition}:s3:::apm-dev-artifacts-${AWS::AccountId}-${AWS::Region}/*
+              - Sid: NeverProd
+                Effect: Deny
+                Action: "*"
+                Resource:
+                  - !Sub arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/apm/*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/apm/*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/github/*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agents/*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/apm-agent-boundary
+                  - !Sub arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:apm
+                  - !Sub arn:${AWS::Partition}:dynamodb:*:${AWS::AccountId}:table/apm
+                  - !Sub arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:parameter/apm/*
+                  - !Sub arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/apm:*
+                  - !Sub arn:${AWS::Partition}:s3:::apm-artifacts-*
+                  - !Sub arn:${AWS::Partition}:s3:::apm-preview-artifacts-*
               - Sid: Edge
                 Effect: Allow
                 Action: [apigateway:GET, apigateway:POST, apigateway:PUT, apigateway:PATCH, apigateway:DELETE,
@@ -255,12 +293,36 @@ Resources:
                 Effect: Allow
                 Action: ssm:GetParameter
                 Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/apm-nonprod/workos-api-key
-              - Sid: Artifacts
+              - Sid: Artifacts # shared preview bucket only; objects expire (lifecycle set on creation)
                 Effect: Allow
-                Action: [s3:CreateBucket, s3:PutBucketPublicAccessBlock, s3:ListBucket, s3:GetObject, s3:PutObject]
+                Action: [s3:CreateBucket, s3:PutBucketPublicAccessBlock, s3:PutLifecycleConfiguration,
+                         s3:ListBucket, s3:GetObject, s3:PutObject, s3:DeleteObject]
                 Resource:
-                  - !Sub arn:${AWS::Partition}:s3:::apm-artifacts-${AWS::AccountId}-${AWS::Region}
-                  - !Sub arn:${AWS::Partition}:s3:::apm-artifacts-${AWS::AccountId}-${AWS::Region}/*
+                  - !Sub arn:${AWS::Partition}:s3:::apm-preview-artifacts-${AWS::AccountId}-${AWS::Region}
+                  - !Sub arn:${AWS::Partition}:s3:::apm-preview-artifacts-${AWS::AccountId}-${AWS::Region}/*
+              - Sid: NeverDevOrProd
+                Effect: Deny
+                Action: "*"
+                Resource:
+                  - !Sub arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/apm/*
+                  - !Sub arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/apm-dev/*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/apm/*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/apm-dev/*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agents/*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agents-dev/*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/github/*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/apm-agent-boundary
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/apm-dev_agent-boundary
+                  - !Sub arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:apm
+                  - !Sub arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:apm-dev
+                  - !Sub arn:${AWS::Partition}:dynamodb:*:${AWS::AccountId}:table/apm
+                  - !Sub arn:${AWS::Partition}:dynamodb:*:${AWS::AccountId}:table/apm-dev
+                  - !Sub arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:parameter/apm/*
+                  - !Sub arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:parameter/apm-dev/*
+                  - !Sub arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/apm:*
+                  - !Sub arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/apm-dev:*
+                  - !Sub arn:${AWS::Partition}:s3:::apm-artifacts-*
+                  - !Sub arn:${AWS::Partition}:s3:::apm-dev-artifacts-*
               - Sid: Edge
                 Effect: Allow
                 Action: [apigateway:GET, apigateway:POST, apigateway:PUT, apigateway:PATCH, apigateway:DELETE,
@@ -268,6 +330,43 @@ Resources:
                          route53:ListHostedZonesByName, route53:GetHostedZone, route53:ChangeResourceRecordSets,
                          route53:ListResourceRecordSets, route53:GetChange]
                 Resource: "*"
+
+  # ---------- nonprod: read-only access to dev releases, for the prod promotion workflow ----------
+  ReleaseReaderRole:
+    Type: AWS::IAM::Role
+    Condition: IsNonprod
+    Properties:
+      RoleName: apm-github-release-reader
+      Path: /github/
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !If [MakeProvider, !Ref GitHubOidc, !Ref ExistingOidcProviderArn]
+            Condition: !If
+              - PinWorkflow
+              - StringEquals:
+                  token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                  token.actions.githubusercontent.com:sub: !Ref ProdSubject
+                  token.actions.githubusercontent.com:job_workflow_ref: !Ref ProdJobWorkflowRef
+              - StringEquals:
+                  token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                  token.actions.githubusercontent.com:sub: !Ref ProdSubject
+      Policies:
+        - PolicyName: read-apm-dev-releases
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadDevReleases
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::apm-dev-artifacts-${AWS::AccountId}-${AWS::Region}/releases/dev/*
+                  - !Sub arn:${AWS::Partition}:s3:::apm-dev-artifacts-${AWS::AccountId}-${AWS::Region}/lambda/*
+                  - !Sub arn:${AWS::Partition}:s3:::apm-dev-artifacts-${AWS::AccountId}-${AWS::Region}/manifests/*
 
   # ---------- prod ----------
   ProdDeployRole:
@@ -284,10 +383,15 @@ Resources:
             Action: sts:AssumeRoleWithWebIdentity
             Principal:
               Federated: !If [MakeProvider, !Ref GitHubOidc, !Ref ExistingOidcProviderArn]
-            Condition:
-              StringEquals:
-                token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Ref ProdSubject
+            Condition: !If
+              - PinWorkflow
+              - StringEquals:
+                  token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                  token.actions.githubusercontent.com:sub: !Ref ProdSubject
+                  token.actions.githubusercontent.com:job_workflow_ref: !Ref ProdJobWorkflowRef
+              - StringEquals:
+                  token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                  token.actions.githubusercontent.com:sub: !Ref ProdSubject
       Policies:
         - PolicyName: deploy-apm-prod
           PolicyDocument:
@@ -364,6 +468,10 @@ Outputs:
     Condition: IsNonprod
     Value: !GetAtt PreviewDeployRole.Arn
     Description: repository variable APM_PREVIEW_ROLE_ARN
+  ReleaseReaderRoleArn:
+    Condition: IsNonprod
+    Value: !GetAtt ReleaseReaderRole.Arn
+    Description: repository variable APM_RELEASE_READER_ROLE_ARN
   ProdRoleArn:
     Condition: IsProd
     Value: !GetAtt ProdDeployRole.Arn

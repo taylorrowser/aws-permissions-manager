@@ -80,8 +80,38 @@ class Names:
         return "/apm/" if self.is_prod else f"/apm-{self.stage}/"
 
     def artifact_bucket(self, account, region):
-        # Content-addressed keys, so all stages in one account can share it; prod's name is unchanged.
-        return f"apm-artifacts-{account}-{region}"
+        """Content-addressed bundles, manifests and release records. prod's name is unchanged. dev and
+        previews get their own buckets, so a preview role (which runs any same-repo branch) can never
+        write a bundle or release record that dev or prod would later deploy."""
+        if self.is_prod:
+            return f"apm-artifacts-{account}-{region}"
+        return f"apm-{'preview' if self.is_preview else 'dev'}-artifacts-{account}-{region}"
+
+
+# Only previews may ever be deleted. Deliberately stricter than STAGE_RE and independent of it.
+CLEANUP_RE = re.compile(r"pr-[0-9]+", re.ASCII)
+
+
+def cleanup_stage(value):
+    """Return value if it names a preview stage that automation may delete, else raise ValueError.
+    Used by every delete path (destroy, the preview workflow, the sweeper) on any input, including
+    workflow inputs and AWS tags: dev, prod and anything that isn't exactly pr-<digits> are refused."""
+    if not isinstance(value, str) or not CLEANUP_RE.fullmatch(value) or value in (PROD, "dev"):
+        raise ValueError(f"refusing to clean up {value!r}: only preview stages pr-<number> can be deleted")
+    n = Names(value)  # also enforces the stage format (no leading zeros, length)
+    if not n.is_preview or n.is_prod:
+        raise ValueError(f"refusing to clean up {value!r}")
+    return n.stage
+
+
+def stage_from_stack(stack_name):
+    """apm-pr-<N> -> pr-<N> for a preview stack name; ValueError for anything else (apm, apm-dev, ...)."""
+    if not isinstance(stack_name, str) or not stack_name.startswith("apm-"):
+        raise ValueError(f"{stack_name!r} is not an apm preview stack")
+    stage = cleanup_stage(stack_name[len("apm-"):])
+    if Names(stage).stack != stack_name:
+        raise ValueError(f"{stack_name!r} is not an apm preview stack")
+    return stage
 
 
 def current_stage():

@@ -1,59 +1,116 @@
-# Opt-in per-PR previews: add the `preview` label to a same-repo PR to deploy stage pr-<N> to the
-# NONPROD account at https://pr-<N>.preview.apm.taylorrowser.com. New pushes redeploy while the
-# label is on; closing the PR or removing the label destroys the stage; a daily sweep destroys
-# previews of closed/unlabeled PRs and ones idle longer than APM_PREVIEW_TTL_DAYS (default 7).
+# Opt-in per-PR previews in the NONPROD account at https://pr-<N>.preview.apm.taylorrowser.com.
 #
-# Fork PRs are skipped (they get no OIDC token anyway). This uses `pull_request`, never
-# `pull_request_target`, so PR code never runs with base-repo privileges.
+# Opt in: add the `preview` label to a same-repository PR, or a maintainer runs this workflow with
+# action=deploy (which adds the label). The preview deploys the PR's head sha only after CI
+# succeeded for that sha, using the artifact CI built (lambda-<sha>), and updates on every push
+# whose CI passes while the label stays on. Removing the label, closing the PR, or action=remove
+# deletes it; a daily sweep deletes closed, unlabeled and expired previews (apm:expires-at tag).
+#
+# Trust model: this workflow definition and all tooling come from reviewed main. It never checks out
+# PR code: it uses `workflow_run` (after CI) and `pull_request_target` (label/close events) only to
+# read validated references (PR number, 40-hex sha, CI run id) through `apm-admin preview plan`, and
+# then deploys the CI-built artifact for that sha. PR text is never interpolated into a shell.
+# Fork PRs are never deployed.
+#
 # Disabled until bootstrap: nothing runs unless the repository variable APM_PREVIEW_ENABLED is 'true'.
 name: Preview
 
 on:
-  pull_request:
-    types: [labeled, unlabeled, synchronize, reopened, closed]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  pull_request_target: # no PR checkout anywhere in this workflow; see the header
+    types: [labeled, unlabeled, closed]
   schedule:
     - cron: "23 7 * * *"
-  workflow_dispatch: # run the sweep now
+  workflow_dispatch:
+    inputs:
+      action:
+        description: deploy or remove one PR's preview, or sweep all
+        required: true
+        type: choice
+        options: [deploy, remove, sweep]
+      pr:
+        description: PR number (deploy/remove)
+        required: false
+        type: string
 
 permissions: {}
 
 jobs:
-  deploy:
+  plan:
     if: >-
       vars.APM_PREVIEW_ENABLED == 'true' &&
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.action != 'closed' && github.event.action != 'unlabeled' &&
-      contains(github.event.pull_request.labels.*.name, 'preview') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'preview')
+      ((github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.conclusion == 'success') ||
+       (github.event_name == 'pull_request_target' && github.event.pull_request.base.ref == 'main') ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.action != 'sweep'))
+    runs-on: ${{ vars.APM_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read # find the successful CI run for the head sha
+      pull-requests: read
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      pr: ${{ steps.plan.outputs.pr }}
+      stage: ${{ steps.plan.outputs.stage }}
+      head_sha: ${{ steps.plan.outputs.head_sha }}
+      ci_run_id: ${{ steps.plan.outputs.ci_run_id }}
+    steps:
+      # main's tooling (the default branch / the PR's base, which is main by the condition above).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --disable-pip-version-check -e .
+      - name: Plan (validated PR number, head sha and CI run; no AWS)
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_PR: ${{ inputs.pr }}
+          DISPATCH_ACTION: ${{ inputs.action }}
+        run: apm-admin preview plan --pr "$DISPATCH_PR" --action "$DISPATCH_ACTION"
+
+  deploy:
+    needs: plan
+    if: needs.plan.outputs.action == 'deploy'
     runs-on: ${{ vars.APM_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 40
     concurrency:
-      group: preview-pr-${{ github.event.pull_request.number }}
+      group: preview-${{ needs.plan.outputs.stage }}
       cancel-in-progress: false
     environment:
       name: preview
-      url: https://pr-${{ github.event.pull_request.number }}.preview.${{ vars.APM_BASE_DOMAIN || 'apm.taylorrowser.com' }}
+      url: https://${{ needs.plan.outputs.stage }}.preview.${{ vars.APM_BASE_DOMAIN || 'apm.taylorrowser.com' }}
     permissions:
       contents: read
-      pull-requests: write # the preview URL comment
+      actions: read # download the CI artifact
+      pull-requests: write # label (dispatch) and the preview URL comment
+      issues: write
       id-token: write # GitHub OIDC -> AWS preview deploy role (nonprod account)
     env:
-      PR: ${{ github.event.pull_request.number }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR: ${{ needs.plan.outputs.pr }}
+      STAGE: ${{ needs.plan.outputs.stage }}
+      HEAD_SHA: ${{ needs.plan.outputs.head_sha }}
+      CI_RUN_ID: ${{ needs.plan.outputs.ci_run_id }}
       REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
       AWS_REGION: ${{ vars.APM_NONPROD_REGION || 'us-east-1' }}
       ACCOUNT: ${{ vars.APM_NONPROD_ACCOUNT_ID }}
+      PROD_ACCOUNT: ${{ vars.APM_PROD_ACCOUNT_ID }}
       ROLE_ARN: ${{ vars.APM_PREVIEW_ROLE_ARN }}
       OWNER_EMAILS: ${{ vars.APM_OWNER_EMAILS }}
       WORKOS_CLIENT_ID: ${{ vars.APM_STAGING_WORKOS_CLIENT_ID }}
+      PROD_WORKOS_CLIENT_ID: ${{ vars.APM_PROD_WORKOS_CLIENT_ID }}
       CERT_ARN: ${{ vars.APM_PREVIEW_CERT_ARN }}
       ZONE_ID: ${{ vars.APM_PREVIEW_ZONE_ID }}
       BASE_DOMAIN: ${{ vars.APM_BASE_DOMAIN || 'apm.taylorrowser.com' }}
+      TTL_DAYS: ${{ vars.APM_PREVIEW_TTL_DAYS || '7' }}
     steps:
-      - name: Check configuration and head sha
-        id: head
+      - name: Check configuration and references
         run: |
           missing=()
           for v in ACCOUNT ROLE_ARN OWNER_EMAILS WORKOS_CLIENT_ID CERT_ARN; do [ -n "${!v}" ] || missing+=("$v"); done
@@ -61,97 +118,118 @@ jobs:
             echo "::error::APM_PREVIEW_ENABLED is true but these settings are empty: ${missing[*]} (see docs/deployment.md)"
             exit 1
           fi
-          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad head sha"; exit 1; }
-          # Deploy only the PR's current head; a newer push has its own run queued behind this one.
-          IFS=$'\t' read -r live state <<< "$(gh api "repos/${REPO}/pulls/${PR}" --jq '[.head.sha, .state] | @tsv')"
-          if [ "$live" != "$HEAD_SHA" ] || [ "$state" != "open" ]; then
-            echo "::notice::PR head is now ${live} (${state}); skipping stale ${HEAD_SHA}"
+          [[ "$PR" =~ ^[1-9][0-9]*$ && "$STAGE" == "pr-$PR" && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ && "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::invalid plan outputs"; exit 1; }
+          [[ "$TTL_DAYS" =~ ^[1-9][0-9]?$ ]] || { echo "::error::APM_PREVIEW_TTL_DAYS must be 1-99"; exit 1; }
+          if [ "$WORKOS_CLIENT_ID" = "$PROD_WORKOS_CLIENT_ID" ]; then
+            echo "::error::previews must use the WorkOS staging client, not prod"; exit 1
+          fi
+          if [ -n "$PROD_ACCOUNT" ] && [ "$ACCOUNT" = "$PROD_ACCOUNT" ]; then
+            echo "::error::previews must not deploy to the prod AWS account"; exit 1
+          fi
+
+      - name: Opt in (maintainer dispatch adds the label)
+        if: github.event_name == 'workflow_dispatch'
+        run: gh pr edit "$PR" --repo "$REPO" --add-label preview
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # main's tooling, not the PR
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --disable-pip-version-check -e .
+
+      - name: Download the artifact CI built for the PR head
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lambda-${{ needs.plan.outputs.head_sha }}
+          path: dist/lambda
+          run-id: ${{ needs.plan.outputs.ci_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify artifact is for the head sha
+        run: apm-admin verify --artifact dist/lambda --git-sha "$HEAD_SHA"
+
+      - name: Still the current head of an open, opted-in PR?
+        id: fresh
+        run: |
+          IFS=$'\t' read -r live state labeled <<< "$(gh api "repos/${REPO}/pulls/${PR}" \
+            --jq '[.head.sha, .state, ([.labels[].name] | index("preview") != null)] | @tsv')"
+          if [ "$live" != "$HEAD_SHA" ] || [ "$state" != "open" ] || [ "$labeled" != "true" ]; then
+            echo "::notice::PR is now ${live} (${state}, labeled=${labeled}); skipping ${HEAD_SHA}"
             echo "stale=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.head.outputs.stale != 'true'
-        with:
-          ref: ${{ github.event.pull_request.head.sha }} # the head commit itself, not the merge ref
-          persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        if: steps.head.outputs.stale != 'true'
-        with:
-          python-version: "3.13"
-      - name: Build
-        if: steps.head.outputs.stale != 'true'
-        run: |
-          [ "$(git rev-parse HEAD)" = "$HEAD_SHA" ]
-          python -m pip install --disable-pip-version-check -e .
-          apm-admin build --out dist/lambda --git-sha "$HEAD_SHA"
-
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        if: steps.head.outputs.stale != 'true'
+        if: steps.fresh.outputs.stale != 'true'
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
-          role-session-name: apm-preview-pr-${{ github.event.pull_request.number }}
+          role-session-name: apm-preview-${{ needs.plan.outputs.stage }}
           aws-region: ${{ env.AWS_REGION }}
           allowed-account-ids: ${{ env.ACCOUNT }}
 
-      - name: Deploy pr-${{ github.event.pull_request.number }}
-        if: steps.head.outputs.stale != 'true'
+      - name: Deploy
+        if: steps.fresh.outputs.stale != 'true'
         run: |
           args=(--certificate-arn "$CERT_ARN")
           [ -n "$ZONE_ID" ] && args+=(--zone-id "$ZONE_ID")
-          apm-admin deploy-artifact --stage "pr-${PR}" --artifact dist/lambda --git-sha "$HEAD_SHA" \
-            --account "$ACCOUNT" --region "$AWS_REGION" --domain "pr-${PR}.preview.${BASE_DOMAIN}" \
+          apm-admin deploy-artifact --stage "$STAGE" --artifact dist/lambda --git-sha "$HEAD_SHA" \
+            --account "$ACCOUNT" --region "$AWS_REGION" --domain "${STAGE}.preview.${BASE_DOMAIN}" \
             --owner-email "$OWNER_EMAILS" --workos-client-id "$WORKOS_CLIENT_ID" \
-            --copy-workos-key-from /apm-nonprod "${args[@]}"
+            --copy-workos-key-from /apm-nonprod --preview-ttl-days "$TTL_DAYS" "${args[@]}"
 
-      - name: Smoke test
-        if: steps.head.outputs.stale != 'true'
-        run: apm-admin smoke --url "https://pr-${PR}.preview.${BASE_DOMAIN}"
+      - name: Health check
+        if: steps.fresh.outputs.stale != 'true'
+        run: apm-admin smoke --url "https://${STAGE}.preview.${BASE_DOMAIN}"
 
-      - name: Comment preview URL
-        if: steps.head.outputs.stale != 'true'
+      - name: Upsert the preview comment
+        if: steps.fresh.outputs.stale != 'true'
         run: |
           body="<!-- apm-preview -->
-          **Preview:** https://pr-${PR}.preview.${BASE_DOMAIN} (stage \`pr-${PR}\`, nonprod account)
+          **Preview:** https://${STAGE}.preview.${BASE_DOMAIN} (stage \`${STAGE}\`, nonprod account, WorkOS staging)
 
-          Deployed \`${HEAD_SHA}\`. Redeploys on each push while the \`preview\` label is on; removing the label or closing the PR deletes it."
+          Deployed \`${HEAD_SHA}\` (CI run ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${CI_RUN_ID}). Redeploys after each push whose CI passes while the \`preview\` label is on. Removing the label or closing the PR deletes it; otherwise it expires ${TTL_DAYS} days after the last deploy."
           id=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
-            --jq '.[] | select(.body | startswith("<!-- apm-preview -->")) | .id' | head -n 1)
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- apm-preview -->"))) | .id' | head -n 1)
           if [ -n "$id" ]; then
             gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -f body="$body" > /dev/null
           else
             gh api -X POST "repos/${REPO}/issues/${PR}/comments" -f body="$body" > /dev/null
           fi
 
-  cleanup:
-    if: >-
-      vars.APM_PREVIEW_ENABLED == 'true' &&
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      ((github.event.action == 'closed' && contains(github.event.pull_request.labels.*.name, 'preview')) ||
-       (github.event.action == 'unlabeled' && github.event.label.name == 'preview'))
+  remove:
+    needs: plan
+    if: needs.plan.outputs.action == 'remove'
     runs-on: ${{ vars.APM_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 40
     concurrency:
-      group: preview-pr-${{ github.event.pull_request.number }}
+      group: preview-${{ needs.plan.outputs.stage }}
       cancel-in-progress: false
     environment:
       name: preview
     permissions:
       contents: read
       pull-requests: write
+      issues: write
       id-token: write
     env:
-      PR: ${{ github.event.pull_request.number }}
+      PR: ${{ needs.plan.outputs.pr }}
+      STAGE: ${{ needs.plan.outputs.stage }}
       REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
       AWS_REGION: ${{ vars.APM_NONPROD_REGION || 'us-east-1' }}
       ACCOUNT: ${{ vars.APM_NONPROD_ACCOUNT_ID }}
       ROLE_ARN: ${{ vars.APM_PREVIEW_ROLE_ARN }}
     steps:
-      # Teardown tooling from the base branch, not the PR.
+      - name: Check references
+        run: |
+          [[ "$PR" =~ ^[1-9][0-9]*$ && "$STAGE" == "pr-$PR" ]] || { echo "::error::invalid plan outputs"; exit 1; }
+          [ -n "$ACCOUNT" ] && [ -n "$ROLE_ARN" ] || { echo "::error::preview account/role variables are empty"; exit 1; }
+      - name: Opt out (maintainer dispatch removes the label)
+        if: github.event_name == 'workflow_dispatch'
+        run: gh pr edit "$PR" --repo "$REPO" --remove-label preview || true
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -160,23 +238,24 @@ jobs:
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
-          role-session-name: apm-preview-cleanup-pr-${{ github.event.pull_request.number }}
+          role-session-name: apm-preview-remove-${{ needs.plan.outputs.stage }}
           aws-region: ${{ env.AWS_REGION }}
           allowed-account-ids: ${{ env.ACCOUNT }}
-      - name: Destroy pr-${{ github.event.pull_request.number }}
-        run: apm-admin destroy --stage "pr-${PR}" --yes --account "$ACCOUNT" --region "$AWS_REGION"
+      - name: Destroy (refuses anything but pr-<number>)
+        run: apm-admin destroy --stage "$STAGE" --yes --account "$ACCOUNT" --region "$AWS_REGION"
       - name: Update comment
         run: |
           id=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate \
-            --jq '.[] | select(.body | startswith("<!-- apm-preview -->")) | .id' | head -n 1)
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- apm-preview -->"))) | .id' | head -n 1)
           [ -z "$id" ] || gh api -X PATCH "repos/${REPO}/issues/comments/${id}" \
             -f body="<!-- apm-preview -->
-          Preview \`pr-${PR}\` was deleted. Add the \`preview\` label to deploy it again." > /dev/null
+          Preview \`${STAGE}\` was deleted (stack, table, log group, SSM parameters, agent roles and deploy records). Add the \`preview\` label to deploy it again." > /dev/null
 
   sweep:
     if: >-
       vars.APM_PREVIEW_ENABLED == 'true' &&
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.action == 'sweep'))
     runs-on: ${{ vars.APM_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 120
     concurrency:
@@ -195,7 +274,6 @@ jobs:
       AWS_REGION: ${{ vars.APM_NONPROD_REGION || 'us-east-1' }}
       ACCOUNT: ${{ vars.APM_NONPROD_ACCOUNT_ID }}
       ROLE_ARN: ${{ vars.APM_PREVIEW_ROLE_ARN }}
-      TTL_DAYS: ${{ vars.APM_PREVIEW_TTL_DAYS || '7' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -210,41 +288,5 @@ jobs:
           role-session-name: apm-preview-sweep-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
           allowed-account-ids: ${{ env.ACCOUNT }}
-      - name: Destroy stale previews
-        run: |
-          bucket="apm-artifacts-${ACCOUNT}-${AWS_REGION}"
-          now=$(date -u +%s)
-          stacks=$(aws cloudformation describe-stacks \
-            --query "Stacks[?starts_with(StackName, 'apm-pr-')].[StackName, LastUpdatedTime || CreationTime]" \
-            --output text)
-          failed=0
-          while read -r name updated; do
-            [ -n "$name" ] || continue
-            pr="${name#apm-pr-}"
-            [[ "$pr" =~ ^[0-9]+$ ]] || continue
-            # Last deploy time (written by every deploy, even no-op ones); fall back to the stack's.
-            deployed=$(aws s3api head-object --bucket "$bucket" --key "deployments/pr-${pr}/current.json" \
-              --query LastModified --output text 2>/dev/null || echo "$updated")
-            age_days=$(( (now - $(date -u -d "$deployed" +%s)) / 86400 ))
-            info=$(gh pr view "$pr" --repo "$REPO" --json state,labels \
-              --jq '[.state, ([.labels[].name] | index("preview") != null)] | @tsv' || printf 'UNKNOWN\tfalse')
-            IFS=$'\t' read -r state labeled <<< "$info"
-            reason=""
-            if [ "$state" != "OPEN" ]; then reason="PR is ${state}"
-            elif [ "$labeled" != "true" ]; then reason="no preview label"
-            elif [ "$age_days" -ge "$TTL_DAYS" ]; then reason="idle ${age_days}d (TTL ${TTL_DAYS}d)"
-            fi
-            [ -n "$reason" ] || { echo "keep pr-${pr} (idle ${age_days}d)"; continue; }
-            echo "::notice::destroying pr-${pr}: ${reason}"
-            if apm-admin destroy --stage "pr-${pr}" --yes --account "$ACCOUNT" --region "$AWS_REGION"; then
-              if [ "$state" = "OPEN" ] && [ "$labeled" = "true" ]; then
-                # Removing the label with GITHUB_TOKEN doesn't trigger another workflow run.
-                gh pr edit "$pr" --repo "$REPO" --remove-label preview || true
-                gh pr comment "$pr" --repo "$REPO" \
-                  --body "Preview \`pr-${pr}\` expired after ${TTL_DAYS} idle days and was deleted. Add the \`preview\` label to deploy it again." || true
-              fi
-            else
-              failed=1
-            fi
-          done <<< "$stacks"
-          exit "$failed"
+      - name: Delete closed, unlabeled and expired previews (allowlist pr-<number> only)
+        run: apm-admin preview sweep --repo "$REPO" --account "$ACCOUNT" --region "$AWS_REGION"

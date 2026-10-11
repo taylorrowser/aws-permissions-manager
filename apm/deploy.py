@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import datetime as dt
 import urllib.error
 import urllib.request
 import zipfile
@@ -36,6 +37,12 @@ LOCK_FILE = PACKAGE / "lambda-requirements.txt"
 SETTINGS_FILE = Path.home() / ".apm" / "deploy.json"
 ZIP_NAME, MANIFEST_NAME = "lambda.zip", "manifest.json"
 MANIFEST_SCHEMA = 1
+PREVIEW_TTL_DAYS = 7
+# Preview bundles share one bucket per account; they are disposable, so they expire. Dev and prod
+# buckets have no expiry: their bundles and release records are kept for rollback.
+PREVIEW_BUCKET_EXPIRY_DAYS = 30
+EXPIRES_TAG = "apm:expires-at"
+STAGE_TAG = "apm:stage"
 
 
 def template(account, region, domain, zone_id, owner_emails, workos_client_id, vapid_public, code_bucket, code_key,
@@ -259,6 +266,7 @@ def _ensure_secrets(ssm, prefix, copy_workos_key_from=None, log=print):
         ssm.put_parameter(Name=f"{prefix}/vapid-public-key", Value=vapid_public, Type="String")
         log("Created push notification keys in Parameter Store (private key not shown)")
     if copy_workos_key_from:
+        check_workos_copy(prefix, copy_workos_key_from)
         # Nonprod only: one WorkOS staging client secret, copied inside AWS to each preview stage.
         # The value stays in memory here and is never printed.
         try:
@@ -275,7 +283,16 @@ def _ensure_secrets(ssm, prefix, copy_workos_key_from=None, log=print):
     return vapid_public
 
 
-def _ensure_bucket(s3, bucket, region, log=print):
+def check_workos_copy(prefix, source):
+    """The shared WorkOS secret copy is for nonprod stages from a nonprod prefix only: never into
+    prod, and never from a prod or stage prefix (prod's /apm, /apm-dev, /apm-pr-N)."""
+    if prefix == "/apm" or not prefix.startswith("/apm-"):
+        raise SystemExit(f"refusing to copy a WorkOS secret into {prefix}: prod secrets are owner-managed")
+    if not re.fullmatch(r"/apm-nonprod(-[a-z0-9]+)?", source or ""):
+        raise SystemExit(f"refusing to copy a WorkOS secret from {source!r}: only /apm-nonprod is allowed")
+
+
+def _ensure_bucket(s3, bucket, region, expire_days=None, log=print):
     try:
         s3.head_bucket(Bucket=bucket)
     except Exception:
@@ -283,16 +300,26 @@ def _ensure_bucket(s3, bucket, region, log=print):
         s3.create_bucket(Bucket=bucket, **kw)
         s3.put_public_access_block(Bucket=bucket, PublicAccessBlockConfiguration={
             "BlockPublicAcls": True, "IgnorePublicAcls": True, "BlockPublicPolicy": True, "RestrictPublicBuckets": True})
-        log(f"Created artifact bucket {bucket}")
+        if expire_days:
+            s3.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration={"Rules": [{
+                "ID": "expire-preview-bundles", "Status": "Enabled", "Filter": {"Prefix": ""},
+                "Expiration": {"Days": expire_days}}]})
+        log(f"Created artifact bucket {bucket}" + (f" (objects expire after {expire_days} days)" if expire_days else ""))
 
 
 def _upload_code(s3, bucket, manifest, code, log=print):
     """Content-addressed: an existing key is reused, never overwritten."""
     key = manifest["s3_key"]
     try:
-        s3.head_object(Bucket=bucket, Key=key)
-        log(f"Lambda bundle already at s3://{bucket}/{key}")
+        existing = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
     except Exception:
+        existing = None
+    if existing is not None:
+        # The key is only a digest prefix: never trust an existing object without re-hashing it.
+        if hashlib.sha256(existing).hexdigest() != manifest["sha256"]:
+            raise SystemExit(f"s3://{bucket}/{key} exists with different content; refusing to deploy it")
+        log(f"Lambda bundle already at s3://{bucket}/{key}")
+    else:
         s3.put_object(Bucket=bucket, Key=key, Body=code,
                       Metadata={"sha256": manifest["sha256"], "git-sha": manifest["git_sha"]})
         log(f"Uploaded Lambda bundle ({len(code) // 1024} KiB) to s3://{bucket}/{key}")
@@ -301,20 +328,31 @@ def _upload_code(s3, bucket, manifest, code, log=print):
     return key
 
 
-def _apply_stack(cfn, stack, body, stage, log=print):
+def stack_tags(stage, now=None, ttl_days=PREVIEW_TTL_DAYS):
+    """Tags for a new stack. Previews also carry an expiry (refreshed on every deploy) for the sweeper."""
+    tags = [{"Key": "managed-by", "Value": "apm"}]
+    if stage != policy.PROD:
+        tags.append({"Key": STAGE_TAG, "Value": stage})
+    if policy.Names(stage).is_preview:
+        expires = (now or dt.datetime.now(dt.timezone.utc)) + dt.timedelta(days=ttl_days)
+        tags.append({"Key": EXPIRES_TAG, "Value": expires.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    return tags
+
+
+def _apply_stack(cfn, stack, body, stage, log=print, ttl_days=PREVIEW_TTL_DAYS):
     try:
         cfn.describe_stacks(StackName=stack)
         exists = True
     except cfn.exceptions.ClientError:
         exists = False
+    tags = stack_tags(stage, ttl_days=ttl_days)
     try:
         if exists:
-            cfn.update_stack(StackName=stack, TemplateBody=body, Capabilities=["CAPABILITY_NAMED_IAM"])
+            # prod and dev keep their existing tags untouched; previews refresh their expiry.
+            extra = {"Tags": tags} if policy.Names(stage).is_preview else {}
+            cfn.update_stack(StackName=stack, TemplateBody=body, Capabilities=["CAPABILITY_NAMED_IAM"], **extra)
             waiter = "stack_update_complete"
         else:
-            tags = [{"Key": "managed-by", "Value": "apm"}]
-            if stage != policy.PROD:
-                tags.append({"Key": "apm:stage", "Value": stage})
             cfn.create_stack(StackName=stack, TemplateBody=body, Capabilities=["CAPABILITY_NAMED_IAM"], Tags=tags)
             waiter = "stack_create_complete"
     except cfn.exceptions.ClientError as e:
@@ -339,13 +377,16 @@ def _log_failures(cfn, stack, log):
 
 def deploy_artifact(artifact_dir, domain, owner_emails, workos_client_id, stage=policy.PROD, profile=None,
                     region="us-east-1", zone_id=None, certificate_arn=None, expected_sha256=None,
-                    expected_git_sha=None, expected_account=None, copy_workos_key_from=None, log=print):
+                    expected_git_sha=None, expected_account=None, copy_workos_key_from=None,
+                    preview_ttl_days=PREVIEW_TTL_DAYS, log=print):
     """Deploy an already-built artifact to a stage. Returns the verified manifest."""
     import boto3
 
     n = policy.Names(stage)
     manifest = verify_artifact(artifact_dir, expected_sha256, expected_git_sha)
     code = (Path(artifact_dir) / ZIP_NAME).read_bytes()
+    if copy_workos_key_from:
+        check_workos_copy(n.param_prefix, copy_workos_key_from)
 
     s = boto3.Session(profile_name=profile, region_name=region)
     account = s.client("sts").get_caller_identity()["Account"]
@@ -358,12 +399,12 @@ def deploy_artifact(artifact_dir, domain, owner_emails, workos_client_id, stage=
     vapid_public = _ensure_secrets(s.client("ssm"), n.param_prefix, copy_workos_key_from, log=log)
     bucket = n.artifact_bucket(account, region)
     s3 = s.client("s3")
-    _ensure_bucket(s3, bucket, region, log=log)
+    _ensure_bucket(s3, bucket, region, expire_days=PREVIEW_BUCKET_EXPIRY_DAYS if n.is_preview else None, log=log)
     key = _upload_code(s3, bucket, manifest, code, log=log)
 
     body = json.dumps(template(account, region, domain, zone_id, owner_emails, workos_client_id,
                                vapid_public, bucket, key, stage=n.stage, certificate_arn=certificate_arn))
-    _apply_stack(s.client("cloudformation"), n.stack, body, n.stage, log=log)
+    _apply_stack(s.client("cloudformation"), n.stack, body, n.stage, log=log, ttl_days=preview_ttl_days)
     record = {**manifest, "stage": n.stage, "domain": domain, "account": account, "region": region,
               "deployed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     s3.put_object(Bucket=bucket, Key=f"deployments/{n.stage}/{manifest['git_sha']}.json",
@@ -383,13 +424,16 @@ def deploy(domain, owner_emails, workos_client_id, profile=None, region="us-east
 
 
 def destroy(stage, profile=None, region="us-east-1", expected_account=None, log=print):
-    """Tear down a preview stage: its agent roles, stack (table included) and SSM parameters.
-    Refuses prod and dev."""
+    """Tear down a preview stage and everything it retained: agent roles, the stack, then explicitly
+    its table and log group if they outlived the stack, its SSM parameters and its deploy records.
+    Refuses prod, dev and anything that isn't exactly pr-<number>, before touching AWS."""
+    try:
+        stage = policy.cleanup_stage(stage)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
     import boto3
 
     n = policy.Names(stage)
-    if not n.is_preview:
-        raise SystemExit(f"refusing to destroy stage {n.stage}: only pr-<number> stages can be destroyed")
     s = boto3.Session(profile_name=profile, region_name=region)
     account = s.client("sts").get_caller_identity()["Account"]
     if expected_account and account != str(expected_account):
@@ -424,6 +468,31 @@ def destroy(stage, profile=None, region="us-east-1", expected_account=None, log=
         except Exception:
             _log_failures(cfn, n.stack, log)
             raise SystemExit("Stack delete failed; see the errors above.")
+
+    # Retained data, handled explicitly: a table or log group left behind (an older template with
+    # DeletionPolicy Retain, or Lambda recreating its log group) would otherwise outlive the preview.
+    ddb = s.client("dynamodb")
+    try:
+        ddb.delete_table(TableName=n.table)
+        log(f"Deleted leftover table {n.table}")
+    except ddb.exceptions.ResourceNotFoundException:
+        pass
+    logs = s.client("logs")
+    try:
+        logs.delete_log_group(logGroupName=f"/aws/lambda/{n.function}")
+        log(f"Deleted leftover log group /aws/lambda/{n.function}")
+    except logs.exceptions.ResourceNotFoundException:
+        pass
+    # Deploy records of this stage in the shared preview bucket (bundles there expire by lifecycle).
+    s3 = s.client("s3")
+    bucket = n.artifact_bucket(account, region)
+    try:
+        for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=f"deployments/{n.stage}/"):
+            keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+            if keys:
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+    except s3.exceptions.NoSuchBucket:
+        pass
 
     ssm = s.client("ssm")
     names = [p["Name"] for page in ssm.get_paginator("get_parameters_by_path").paginate(

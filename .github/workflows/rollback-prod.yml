@@ -1,0 +1,38 @@
+# Manual prod rollback: redeploys the artifact of a previous prod release whose prod health check
+# passed. Input is a prod release id (from an earlier "Promote to prod" or "Rollback prod" summary,
+# or `releases/prod/` in the prod artifact bucket). Same reusable workflow, validations and
+# serialization as promotion; the artifact comes from the prod bucket and is re-verified by digest.
+# DynamoDB data is not rolled back: see "Schema compatibility" in docs/deployment.md.
+#
+# Disabled until bootstrap: needs the repository variable APM_PROD_DEPLOY_ENABLED == 'true'.
+name: Rollback prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Prod release id to return to, e.g. prod-20261011T120000Z-0123456789ab
+        required: true
+        type: string
+      sha256:
+        description: Optional expected artifact sha256
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/prod-release.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      mode: rollback
+      release_id: ${{ inputs.release_id }}
+      sha256: ${{ inputs.sha256 }}

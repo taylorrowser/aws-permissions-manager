@@ -1,8 +1,9 @@
-# Bootstrap helper: prints the GitHub OIDC claims (sub, aud, ...) a job in the chosen environment
-# receives, so AWS trust policies are written from the real `sub` instead of an assumed format.
-# Repositories created after 2026-07-15 (like this one) or opted in use immutable owner/repo IDs in
-# `sub`. The token itself is never printed: only its decoded claims, which are not secret.
-# Makes no AWS calls.
+# Bootstrap helper: prints the GitHub OIDC claims (sub, aud, job_workflow_ref, ...) a job receives,
+# so AWS trust policies are written from the real `sub` instead of an assumed format. Repositories
+# created after 2026-07-15 (like this one) or opted in use immutable owner/repo IDs in `sub`.
+# For `production` it calls the reusable prod-release.yml in claims mode, so the printed
+# job_workflow_ref is exactly the one promote and rollback present. The token itself is never
+# printed, only its decoded claims, which are not secret. Makes no AWS calls.
 name: OIDC claims
 
 on:
@@ -18,7 +19,7 @@ permissions: {}
 
 jobs:
   claims:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && inputs.environment != 'production'
     runs-on: ${{ vars.APM_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 5
     environment: ${{ inputs.environment }}
@@ -33,4 +34,13 @@ jobs:
           payload=$(cut -d. -f2 <<< "$token" | tr '_-' '/+')
           while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
           base64 -d <<< "$payload" | jq '{sub, aud, iss, repository, repository_id, repository_owner,
-            repository_owner_id, environment, ref, job_workflow_ref, event_name}' | tee -a "$GITHUB_STEP_SUMMARY"
+            repository_owner_id, environment, ref, job_workflow_ref, workflow_ref, event_name}' | tee -a "$GITHUB_STEP_SUMMARY"
+
+  production:
+    if: github.ref == 'refs/heads/main' && inputs.environment == 'production'
+    uses: ./.github/workflows/prod-release.yml
+    permissions:
+      contents: read # the reusable workflow's other jobs declare it; they are skipped in claims mode
+      id-token: write
+    with:
+      mode: claims

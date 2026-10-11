@@ -28,4 +28,3 @@ credentials
 # Build output
 dist/
 rendered/
-*.egg-info/
