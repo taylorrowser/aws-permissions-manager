@@ -21,7 +21,8 @@ ACCOUNT = "654654478411"
 # single-stage deploy.py (commit bf98c18 on baseline/hosted-apm) before stages were added.
 PROD_ARGS = (ACCOUNT, "us-east-1", "apm.taylorrowser.com", "Z0EXAMPLE", "owner@example.com", "client_EXAMPLE",
              "VAPIDPUB", "apm-artifacts-654654478411-us-east-1", "lambda/0123456789abcdef.zip")
-# The only boundary statements prod gained since the fixture was captured (baseline commit 290bf35).
+# The only boundary statements prod gained since the fixture was captured (baseline commits 290bf35
+# and 759d908), in boundary order.
 PROD_BOUNDARY_DENIES = [
     {"Sid": "DenyApmInfrastructure", "Effect": "Deny", "Action": "*", "Resource": [
         f"arn:aws:ssm:*:{ACCOUNT}:parameter/apm*",
@@ -33,6 +34,8 @@ PROD_BOUNDARY_DENIES = [
         "arn:aws:apigateway:*::/domainnames/*apm*"]},
     {"Sid": "DenyApmTaggedResources", "Effect": "Deny", "NotAction": "iam:*", "Resource": "*",
      "Condition": {"StringEquals": {"aws:ResourceTag/managed-by": "apm"}}},
+    {"Sid": "DenyRecursiveReadOfRoot", "Effect": "Deny", "Action": "ssm:GetParametersByPath",
+     "Resource": [f"arn:aws:ssm:*:{ACCOUNT}:parameter/", f"arn:aws:ssm:*:{ACCOUNT}:parameter"]},
     {"Sid": "DenyApmDnsRecords", "Effect": "Deny", "Action": "route53:ChangeResourceRecordSets", "Resource": "*",
      "Condition": {"ForAnyValue:StringLike": {
          "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["apm.*", "*.apm.*"]}}},
@@ -58,8 +61,8 @@ class ProdCompatibility(unittest.TestCase):
         expected = copy.deepcopy(before)
         # Intended change 1: the Lambda learns its stage (the PWA badge and policy.py read it).
         expected["Resources"]["Function"]["Properties"]["Environment"]["Variables"]["APM_STAGE"] = "prod"
-        # Intended change 2: the baseline security fix (290bf35) appended three Deny statements to the
-        # agent boundary. Spelled out literally so any other boundary drift fails this test.
+        # Intended change 2: the baseline security fixes (290bf35, 759d908) appended four Deny statements
+        # to the agent boundary. Spelled out literally so any other boundary drift fails this test.
         expected["Resources"]["Boundary"]["Properties"]["PolicyDocument"]["Statement"] += PROD_BOUNDARY_DENIES
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS))), expected)
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS, stage="prod"))), expected)
@@ -254,10 +257,40 @@ class PreviewCannotReachReleaseArtifacts(unittest.TestCase):
     def test_every_stage_boundary_has_the_apm_denies(self):
         for stage in ["prod"] + NONPROD:
             sids = {s["Sid"]: s for s in policy.boundary(ACCOUNT, policy.Names(stage))["Statement"]}
-            for sid in ("DenyApmInfrastructure", "DenyApmTaggedResources", "DenyApmDnsRecords"):
+            for sid in ("DenyApmInfrastructure", "DenyApmTaggedResources", "DenyRecursiveReadOfRoot", "DenyApmDnsRecords"):
                 self.assertEqual(sids[sid]["Effect"], "Deny", (stage, sid))
             self.assertEqual(sids["DenyApmInfrastructure"]["Resource"], policy.apm_resources(ACCOUNT))
             self.assertEqual(sids["DenyApmInfrastructure"]["Action"], "*")
+
+    def test_every_stage_boundary_denies_recursive_read_of_root(self):
+        # The SSM root is shared by every stage in an account, so the same root deny applies to all of them.
+        b_prod = policy.boundary(ACCOUNT, policy.Names("prod"))
+        for stage in ["prod"] + NONPROD:
+            b = policy.boundary(ACCOUNT, policy.Names(stage))
+            root = next(s for s in b["Statement"] if s["Sid"] == "DenyRecursiveReadOfRoot")
+            self.assertEqual(root, next(s for s in b_prod["Statement"] if s["Sid"] == "DenyRecursiveReadOfRoot"))
+            for arn in (f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/", f"arn:aws:ssm:eu-west-1:{ACCOUNT}:parameter"):
+                self.assertEqual(boundary_decision(b, "ssm:GetParametersByPath", arn), "deny", (stage, arn))
+            # Other paths stay usable; /apm* paths were already denied for every stage.
+            self.assertEqual(boundary_decision(b, "ssm:GetParametersByPath",
+                                               f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/myapp"), "allow")
+            for prefix in ("apm", "apm-dev", "apm-pr-1"):
+                self.assertEqual(boundary_decision(b, "ssm:GetParametersByPath",
+                                                   f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/{prefix}"), "deny")
+
+    def test_broker_can_manage_per_grant_policies_on_its_own_stage_roles(self):
+        # Each grant is its own inline policy (apm-grants-Req<id>): the broker lists, reads, puts and
+        # deletes them, and creates, tags and deletes the role, all on its own stage's agent roles.
+        needed = ["iam:ListRolePolicies", "iam:GetRolePolicy", "iam:PutRolePolicy", "iam:DeleteRolePolicy",
+                  "iam:GetRole", "iam:CreateRole", "iam:DeleteRole", "iam:TagRole"]
+        for stage in ["prod"] + NONPROD:
+            n = policy.Names(stage)
+            allows = [s for s in policy.broker_policy(ACCOUNT, n)["Statement"] if s["Effect"] == "Allow"]
+            arn = policy.role_arn(ACCOUNT, "myapp", n)
+            for action in needed:
+                self.assertTrue(any(any(iam_match(a.lower(), action.lower()) for a in _actions(s, "Action"))
+                                    and any(iam_match(r, arn) for r in resources(s)) for s in allows),
+                                (stage, action, arn))
 
     def test_preview_broker_creates_roles_only_in_its_stage_with_its_boundary(self):
         for stage in ("pr-1", "pr-12"):

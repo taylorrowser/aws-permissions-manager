@@ -99,8 +99,10 @@ read on the dev and prod buckets and objects, in any region or account.
 
 **Prod compatibility.** `tests/fixtures/prod_template_before_stages.json` was rendered by the
 single-stage `deploy.py`. The test asserts the prod template equals it plus exactly
-`APM_STAGE=prod` and the three agent-boundary Deny statements from the baseline security fix
-(`DenyApmInfrastructure`, `DenyApmTaggedResources`, `DenyApmDnsRecords`). A second test checks that
+`APM_STAGE=prod` and the four agent-boundary Deny statements from the baseline security fixes
+(`DenyApmInfrastructure`, `DenyApmTaggedResources`, `DenyRecursiveReadOfRoot`, `DenyApmDnsRecords`).
+Every stage's boundary carries the same four; the SSM root is shared by all stages in an account, so
+`DenyRecursiveReadOfRoot` is identical everywhere. A second test checks that
 every resource name is byte-identical. Prod names, bucket, tags and SSM paths are unchanged.
 
 ## Releases: build once, record, promote the same bytes
