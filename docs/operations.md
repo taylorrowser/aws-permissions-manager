@@ -29,7 +29,7 @@ aws s3 cp s3://$BUCKET/deployments/prod/current.json - | python3 -m json.tool   
 
 `deploy-artifact` refuses to run if the digest, commit or account doesn't match. It records the deploy at `deployments/prod/<git_sha>.json` and overwrites `deployments/prod/current.json`, so note the previous `current.json` **before** deploying.
 
-A boundary change (`apm/policy.py`) takes effect only through a deploy. After one, check it with the IAM policy simulator against an agent role, e.g. `aws iam simulate-principal-policy --policy-source-arn arn:aws:iam::$ACCOUNT:role/agents/apm-<project> --action-names route53domains:UpdateDomainNameservers`. It should come back `explicitDeny` or `implicitDeny`, never `allowed`.
+A boundary change (`apm/policy.py`) takes effect only through a deploy. After one, check it with the IAM policy simulator against an agent role, e.g. `aws iam simulate-principal-policy --policy-source-arn "arn:aws:iam::${ACCOUNT}:role/agents/apm-<project>" --action-names route53domains:UpdateDomainNameservers`. It should come back `explicitDeny` or `implicitDeny`, never `allowed`.
 
 ## Roll back prod
 
@@ -57,7 +57,9 @@ The `apm` table holds every decision, key and device, and each project's IAM pol
 
 **Never let apm run on an empty or re-created `apm` table.** Request numbers would restart at 1, and the next approval for a project would rewrite its role policy from the new table alone, removing grants that are still in IAM.
 
-To restore, AWS can't restore in place, so restore to a new table and check it. Then, with apm paused, swap it in under the same name and reconcile IAM before reopening:
+A restored table only knows what happened before the restore time. Keys deleted, grants revoked and projects approved after that would come back wrong. So **a restore resets access**: it keeps the history, but every grant is revoked, every key and device is removed, and agents connect and ask again. All of it happens while apm is paused.
+
+AWS can't restore a table in place, so restore to a new table, check it, then swap it in under the same name:
 
 ```sh
 T=apm-restore-$(date -u +%Y%m%d%H%M)
@@ -65,36 +67,52 @@ aws dynamodb restore-table-to-point-in-time --source-table-name apm --target-tab
   --restore-date-time <UTC time before the damage, e.g. 2026-10-12T09:00:00Z>
 aws dynamodb wait table-exists --table-name $T
 aws dynamodb scan --table-name $T --select COUNT                    # sanity check; inspect items as needed
+
+# 1. Pause apm: from here on no request reaches the Lambda.
+aws lambda put-function-concurrency --function-name apm --reserved-concurrent-executions 0
+
+# 2. Reset access in the restored copy: approved -> revoked; drop keys, connect requests and devices.
+for pk in $(aws dynamodb scan --table-name $T --filter-expression "kind = :r AND #s = :a" \
+    --expression-attribute-names '{"#s":"status"}' \
+    --expression-attribute-values '{":r":{"S":"req"},":a":{"S":"approved"}}' \
+    --projection-expression pk --query 'Items[].pk.S' --output text); do
+  aws dynamodb update-item --table-name $T --key "{\"pk\":{\"S\":\"$pk\"}}" \
+    --update-expression "SET #s = :v, note = :n" --expression-attribute-names '{"#s":"status"}' \
+    --expression-attribute-values '{":v":{"S":"revoked"},":n":{"S":"revoked by table restore"}}'
+done
+for pk in $(aws dynamodb scan --table-name $T --filter-expression "kind IN (:k, :c, :d)" \
+    --expression-attribute-values '{":k":{"S":"key"},":c":{"S":"connect"},":d":{"S":"sub"}}' \
+    --projection-expression pk --query 'Items[].pk.S' --output text); do
+  aws dynamodb delete-item --table-name $T --key "{\"pk\":{\"S\":\"$pk\"}}"
+done
+
+# 3. Remove every grant from every agent role, including roles the restored table doesn't know.
+for role in $(aws iam list-roles --path-prefix /agents/ --query 'Roles[].RoleName' --output text); do
+  aws iam delete-role-policy --role-name "$role" --policy-name apm-grants 2>/dev/null || true
+done
+
+# 4. Swap the restored copy in as `apm`, once its backup is usable.
 BACKUP=$(aws dynamodb create-backup --table-name $T --backup-name $T --query BackupDetails.BackupArn --output text)
 until [ "$(aws dynamodb describe-backup --backup-arn "$BACKUP" \
            --query BackupDescription.BackupDetails.BackupStatus --output text)" = AVAILABLE ]; do sleep 10; done
-
-# Pause apm: no request reaches the Lambda until the end. IAM grants already in place keep working.
-aws lambda put-function-concurrency --function-name apm --reserved-concurrent-executions 0
 aws dynamodb delete-table --table-name apm
 aws dynamodb wait table-not-exists --table-name apm
 aws dynamodb restore-table-from-backup --target-table-name apm --backup-arn "$BACKUP"
 aws dynamodb wait table-exists --table-name apm
 aws dynamodb update-continuous-backups --table-name apm \
   --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true   # restores don't keep PITR
-aws dynamodb tag-resource --resource-arn arn:aws:dynamodb:$AWS_REGION:$ACCOUNT:table/apm \
-  --tags Key=managed-by,Value=apm                                           # restores don't keep tags either
+aws dynamodb tag-resource --resource-arn "arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT}:table/apm" \
+  --tags Key=managed-by,Value=apm                                           # or tags
+
+# 5. Reopen.
+aws lambda delete-function-concurrency --function-name apm
 ```
 
-The restored table only knows what happened before the restore time, so reconcile IAM before reopening:
-
-1. **Roles the table doesn't know.** List the agent roles with `aws iam list-roles --path-prefix /agents/ --query 'Roles[].RoleName'`. Then compare them with the restored projects: `aws dynamodb scan --table-name apm --filter-expression "kind = :r" --expression-attribute-values '{":r":{"S":"req"}}' --projection-expression project`. A role with no restored project would keep its grants, but the dashboard would never show it. Remove it by hand:
-
-   ```sh
-   aws iam delete-role-policy --role-name apm-<project> --policy-name apm-grants
-   aws iam delete-role --role-name apm-<project>
-   ```
-
-2. **Reopen apm** with `aws lambda delete-function-concurrency --function-name apm`, then right away check two things:
-   - **Projects:** press **Re-apply decisions** on any project flagged "IAM doesn't match your decisions". Revoke again anything you revoked after the restore time, because the restore brought it back.
-   - **Keys** and **Notifications:** delete again any key or device you deleted after the restore time.
-
-Finally, delete `$T` and its backup.
+After reopening:
+- Projects show only revoked grants, with no mismatch warnings.
+- Turn notifications back on from your phone.
+- Agents reconnect and request what they need again.
+- Finally, delete `$T` and its backup.
 
 ## Something leaked
 
@@ -102,7 +120,7 @@ Finally, delete `$T` and its backup.
 |---|---|---|
 | An agent API key | **Keys** → Delete it. Then reconnect that machine (`connect` tool or `apm login`). | The key stops working on its next call. Credentials it already fetched last up to 1 hour, but only with each role's current permissions. To cut those off now, revoke the grants they could use. |
 | A grant was too broad | **Projects** → Revoke it. | The role's policy changes immediately, and that applies to sessions already issued too. |
-| Your phone or a browser session | **Notifications** → Remove the device. Rotate the session secret (below). In the WorkOS dashboard (production environment), revoke your user's sessions. Secure the email account too, since sign-in codes go there. | Signs every browser out of apm. A stolen device can't simply sign back in through a WorkOS session that's still open. |
+| Your phone or a browser session | In this order: 1) secure the email account, since sign-in codes go there; 2) in the WorkOS dashboard (production environment), revoke your user's sessions; 3) **Notifications** → Remove the device; 4) rotate the session secret (below). | Rotating last means the stolen device can't sign back in and get a new apm cookie in between. |
 | The session secret | Rotate it as below. | All dashboard sessions end. |
 
 Rotate the session secret (the value is generated locally and never printed):
