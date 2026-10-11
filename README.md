@@ -30,7 +30,7 @@ agent ── aws --profile apm-<project> ── credential_process ────�
 
 | Path | What |
 |---|---|
-| `apm/` | Hosted service (Lambda): `web.py` routes and auth, `pages.py` dashboard, `broker.py` IAM/STS, `store.py` DynamoDB, `push.py` Web Push, `policy.py` policies and validation, `deploy.py` + `cli.py` (`apm-admin`) owner deploy |
+| `apm/` | Hosted service (Lambda): `web.py` routes and auth, `pages.py` screens, `static/` web app (service worker, script, styles, manifest), `broker.py` IAM/STS, `store.py` DynamoDB, `push.py` Web Push, `policy.py` policies and validation, `deploy.py` + `cli.py` (`apm-admin`) owner deploy |
 | `apm/static/` | Web app: manifest, service worker, icons, `app.js` |
 | `plugins/aws-permissions/` | The plugin for Claude Code and Codex: MCP server + `apm` CLI in one stdlib-only script (`scripts/apm.py`), `skills/aws-access`, manifests for both tools |
 | `.claude-plugin/marketplace.json`, `.agents/plugins/marketplace.json` | Marketplaces so both tools can install the plugin from this repo |
@@ -65,9 +65,17 @@ aws ssm put-parameter --name /apm/workos-api-key --type SecureString --value "$(
 ## Use it
 
 **On your phone:**
-1. Open the site in Safari and sign in.
-2. Tap Share, then Add to Home Screen.
-3. Open the app from the home screen and tap **Enable notifications on this device**. iOS only allows web push for home-screen apps.
+1. Open the site and sign in.
+2. Install it. On iPhone or iPad, tap Share and then Add to Home Screen, then open it from the Home Screen. iOS only allows web push for Home Screen apps (iOS 16.4 or later). On Android or desktop Chrome or Edge, use **Install app** on the Notifications screen or the browser's install option.
+3. On the **Notifications** screen, tap **Turn on notifications**. A test notification is sent straight away. **Send a test** repeats it at any time.
+
+The app has four screens: **Requests** (the home screen, with pending requests and agents asking to connect), **Projects**, **Notifications** and **Keys**. Tapping a notification opens that request at `/requests/<id>` (or `/connect/<code>`). If you're signed out, you go back to it after signing in.
+
+**What notifications contain.** Only the project name, the request number and how many actions it asks for, so nothing sensitive shows on a lock screen. The reason, actions and resources appear only in the signed-in app. Nothing can be approved from a notification.
+
+**Delivery.** When an agent asks for something, the Lambda sends to every device in parallel. It retries a timeout, 429 or 5xx once, then gives up; the Lambda can't queue work after it responds. Devices the push service reports as gone (404/410) are removed. Other failures are recorded per device and shown on the Notifications screen. Every send logs a JSON line (`"event": "push"`) to CloudWatch with the outcome and HTTP status. A missed notification never loses a request: the Requests screen always lists everything pending. Browsers that rotate a subscription re-register it themselves, as does the app whenever it opens.
+
+**Offline and caching.** The service worker caches only static files (CSS, JS, icons and an offline page). Signed-in pages, approvals, keys and API responses are never cached (`Cache-Control: no-store`). Offline, buttons are disabled and opening a screen shows the offline page. Nothing is queued to send later.
 
 **For each machine:** install the plugin:
 
@@ -111,7 +119,15 @@ The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `ap
 .venv/bin/python -m unittest discover -s tests
 ```
 
-These use fake IAM, STS and DynamoDB. They also run the plugin's MCP server and CLI with the system `python3` against the app served locally.
+These use fake IAM, STS and DynamoDB. They also run the plugin's MCP server and CLI with the system `python3` against the app served locally. If `node` is installed, they also run the service worker and page-script tests in `tests/js` (`node --test tests/js`).
+
+To try the web app locally against the same fakes (no AWS or WorkOS), with seeded requests:
+
+```sh
+.venv/bin/python scripts/dev_server.py        # then open http://localhost:8765/dev/login
+```
+
+`tests/e2e/push_e2e.mjs` is an optional check in real Chrome. It turns on notifications, receives real Web Push through Chrome's push service, opens a request from the notification's link, and tests offline behaviour. It needs Playwright, Google Chrome and internet access; see the file's header.
 
 ## Legacy
 

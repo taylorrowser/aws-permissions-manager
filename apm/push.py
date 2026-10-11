@@ -5,6 +5,7 @@ import json
 import os
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -64,7 +65,7 @@ def vapid_header(endpoint, private_pem, subject):
     return f"vapid t={jwt}, k={b64url(_raw_public(key))}"
 
 
-def send(subscription, message, private_pem, subject, ttl=86400):
+def send(subscription, message, private_pem, subject, ttl=86400, timeout=10):
     """POST one notification. Returns the HTTP status; 404/410 mean the subscription is gone."""
     endpoint = subscription["endpoint"]
     body = encrypt(json.dumps(message).encode(), subscription["keys"]["p256dh"], subscription["keys"]["auth"])
@@ -72,7 +73,51 @@ def send(subscription, message, private_pem, subject, ttl=86400):
         "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream", "TTL": str(ttl),
         "Urgency": "high", "Authorization": vapid_header(endpoint, private_pem, subject)})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status
     except urllib.error.HTTPError as e:
+        reason = e.read()[:200].decode(errors="replace")
+        print(json.dumps({"event": "push_rejected", "service": urlparse(endpoint).netloc, "status": e.code, "reason": reason}))
         return e.code
+
+
+GONE = (404, 410)
+RETRYABLE = (429, 500, 502, 503, 504)
+
+
+def deliver(subscriptions, message, private_pem, subject, ttl=86400, budget=10):
+    """Send to every subscription in parallel, retrying a transient failure once. The Lambda is
+    frozen once it responds, so this runs inline, and the whole send returns within about
+    `budget` seconds whatever the push services do; a send still running then counts as failed.
+    Returns {pk: (outcome, status)}, outcome being delivered, gone or failed; status is the HTTP
+    status, or None for a network error or timeout."""
+    deadline = time.monotonic() + budget
+
+    def one(s):
+        status = None
+        if time.monotonic() >= deadline:  # queued behind slow sends past the budget
+            return "failed", None
+        for attempt in (1, 2):
+            try:
+                status = send(s["sub"], message, private_pem, subject, ttl=ttl, timeout=4)
+            except Exception as e:  # DNS, TLS, timeout, bad stored subscription
+                print(json.dumps({"event": "push_error", "device": s["pk"][4:16], "error": str(e)[:200]}))
+                status = None
+            if status is not None and status < 300:
+                return "delivered", status
+            if status in GONE:
+                return "gone", status
+            if attempt == 1 and (status is None or status in RETRYABLE) and time.monotonic() + 5 < deadline:
+                time.sleep(0.5)
+                continue
+            return "failed", status
+        return "failed", status
+
+    if not subscriptions:
+        return {}
+    pool = ThreadPoolExecutor(max_workers=min(16, len(subscriptions)))
+    futures = {s["pk"]: pool.submit(one, s) for s in subscriptions}
+    wait(futures.values(), timeout=max(0, deadline - time.monotonic()))
+    pool.shutdown(wait=False, cancel_futures=True)  # don't hold the response for a hung send
+    # Cancelled futures also count as done, but have no result.
+    return {pk: f.result() if f.done() and not f.cancelled() else ("failed", None) for pk, f in futures.items()}

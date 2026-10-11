@@ -1,5 +1,7 @@
-"""HTML for the owner dashboard. Server-rendered; JavaScript (static/app.js) only adds
-confirm prompts and push notification sign-up."""
+"""HTML for the owner web app. Server-rendered; static/app.js adds confirm prompts, local times,
+offline handling, install help and push notification sign-up.
+
+Screens: Requests (/, /requests/<id>, /connect/<code>), Projects, Notifications (/devices), Keys."""
 import html
 import json
 import time
@@ -8,172 +10,376 @@ from . import policy
 
 e = html.escape
 
-STYLE = """
-:root{color-scheme:light dark;--bg:#fff;--fg:#1d1d1f;--muted:#6e6e73;--line:#d2d2d7;--card:#fff;--pend:#fff8e1;--pendline:#e0b000;--code:#f5f5f7;--ok:#1f7a3a;--no:#b3261e;--msg:#e8f1ff}
-@media (prefers-color-scheme:dark){:root{--bg:#000;--fg:#f5f5f7;--muted:#98989d;--line:#3a3a3c;--card:#1c1c1e;--pend:#2b2410;--pendline:#8a6d00;--code:#2c2c2e;--msg:#10233f}}
-*{box-sizing:border-box}
-body{font:16px/1.45 -apple-system,system-ui,sans-serif;max-width:960px;margin:0 auto;padding:max(1rem,env(safe-area-inset-top)) 1rem 3rem;background:var(--bg);color:var(--fg)}
-header{display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap}
-h1{font-size:1.35rem;margin:.4rem 0}h2{font-size:1.1rem;margin-top:2rem;border-bottom:1px solid var(--line);padding-bottom:.3rem}
-.card{border:1px solid var(--line);background:var(--card);border-radius:12px;padding:1rem;margin:.8rem 0;overflow-wrap:anywhere}
-.pending{border-color:var(--pendline);background:var(--pend)}.muted{color:var(--muted)}.msg{background:var(--msg);padding:.7rem 1rem;border-radius:10px}
-code,pre{font:13px ui-monospace,Menlo,monospace}pre{background:var(--code);padding:.6rem;border-radius:8px;overflow:auto;white-space:pre-wrap}
-button,.button{font:inherit;padding:.55rem 1.1rem;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer;margin:.2rem .4rem .2rem 0;text-decoration:none;display:inline-block}
-.ok{background:var(--ok);color:#fff;border-color:var(--ok)}.no{color:var(--no)}
-table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.35rem .5rem;border-bottom:1px solid var(--line);vertical-align:top}
-form{display:inline}input[type=text]{font:inherit;padding:.5rem;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
-.secret{font:15px ui-monospace,Menlo,monospace;padding:.7rem;background:var(--code);border-radius:8px;user-select:all;word-break:break-all}
-@media (max-width:640px){table,tbody,tr,td,th{display:block}tr{border-bottom:1px solid var(--line);padding:.4rem 0}td,th{border:0;padding:.15rem 0}tr:first-child{display:none}}
-"""
+SERVICES = {
+    "s3": "S3", "ec2": "EC2", "lambda": "Lambda", "dynamodb": "DynamoDB", "cloudfront": "CloudFront",
+    "logs": "CloudWatch Logs", "cloudwatch": "CloudWatch", "sqs": "SQS", "sns": "SNS", "ecr": "ECR",
+    "ecs": "ECS", "rds": "RDS", "route53": "Route 53", "acm": "Certificate Manager", "ssm": "Systems Manager",
+    "secretsmanager": "Secrets Manager", "kms": "KMS", "cloudformation": "CloudFormation", "iam": "IAM",
+    "sts": "STS", "apigateway": "API Gateway", "events": "EventBridge", "states": "Step Functions",
+    "bedrock": "Bedrock", "athena": "Athena", "glue": "Glue", "kinesis": "Kinesis", "elasticloadbalancing": "ELB",
+}
 
-HEAD = ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
-        '<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">'
-        '<meta name="apple-mobile-web-app-title" content="AWS Permissions">'
-        '<meta name="theme-color" content="#232f3e">'
-        '<link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/apple-touch-icon.png">'
-        '<link rel="icon" href="/icon-192.png"><title>AWS Permissions</title>'
-        f'<style>{STYLE}</style><script src="/app.js" defer></script></head><body>')
+ICONS = {
+    "requests": '<path d="M4 13h4l2 3h4l2-3h4M4 13V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v7M4 13v5a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/>',
+    "projects": '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+    "devices": '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+    "keys": '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.8-9.8M16 7l3 3M19 4l2 2"/>',
+}
+TABS = [("/", "requests", "Requests"), ("/projects", "projects", "Projects"),
+        ("/devices", "devices", "Notifications"), ("/keys", "keys", "Keys")]
 
 
-def _form(fields, label, cls="", confirm=""):
+def _icon(name):
+    return (f'<svg class=icon viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" '
+            f'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{ICONS[name]}</svg>')
+
+
+def _head(app, title):
+    from .web import ASSET_VERSION
+    v = ASSET_VERSION
+    stage = "" if app.s.stage == "prod" else f"[{app.s.stage}] "
+    return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+            '<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">'
+            '<meta name="apple-mobile-web-app-title" content="AWS Permissions">'
+            '<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">'
+            '<meta name="theme-color" content="#111418" media="(prefers-color-scheme: dark)">'
+            '<meta name="color-scheme" content="light dark">'
+            '<link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/apple-touch-icon.png">'
+            f'<link rel="icon" href="/icon-192.png"><title>{e(stage + title)} · AWS Permissions</title>'
+            f'<link rel="stylesheet" href="/app.css?v={v}"><script src="/app.js?v={v}" defer></script></head>')
+
+
+def _stage(app):
+    return "" if app.s.stage == "prod" else f'<span class=stage title="Not production">{e(app.s.stage)}</span>'
+
+
+def _flash(msg):
+    if not msg:
+        return ""
+    cls = "flash error" if msg.startswith("Error") else "flash"
+    return f'<p class="{cls}" role="status" tabindex="-1" id="flash">{e(msg)}</p>'
+
+
+def layout(app, owner, active, title, body, msg="", heading=None):
+    pending = len(app.store.list(status="pending")) + len(app.store.connects())
+    tabs = []
+    for href, key, label in TABS:
+        current = ' aria-current="page"' if key == active else ""
+        count = f' <span class=count aria-label="{pending} waiting">{pending}</span>' if key == "requests" and pending else ""
+        tabs.append(f'<a href="{href}"{current}>{_icon(key)}<span class=label>{label}</span>{count}</a>')
+    return (_head(app, title) + f'<body data-page="{e(active)}" data-pending="{pending}" '
+            f'data-vapid="{e(app.s.vapid_public)}">'
+            '<a class=skip href="#main">Skip to content</a>'
+            '<div id=offline class=banner role=status hidden>You\'re offline. Approving and rejecting need a connection; '
+            'nothing is saved for later.</div>'
+            '<header class=top><a class=brand href="/"><img src="/icon-192.png" alt="" width=28 height=28>'
+            f'<span>AWS Permissions</span></a>{_stage(app)}'
+            '<form method=post action="/logout"><button class=link>Sign out</button></form></header>'
+            f'<nav class=tabs aria-label="Sections">{"".join(tabs)}</nav>'
+            f'<main id=main><h1>{e(heading or title)}</h1>{_flash(msg)}{body}</main>'
+            f'<footer>AWS account {e(app.broker.account)} · {e(app.broker.region)} · signed in as {e(owner)}</footer>'
+            '</body></html>')
+
+
+def _form(fields, label, cls="", confirm="", back="/"):
+    fields = {**fields, "back": back}
     hidden = "".join(f'<input type="hidden" name="{e(k)}" value="{e(str(v))}">' for k, v in fields.items())
     data = f' data-confirm="{e(confirm)}"' if confirm else ""
     return f'<form method="post" action="/action"{data}>{hidden}<button class="{cls}">{e(label)}</button></form>'
 
 
-def _when(ts):
-    return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts)) if ts else ""
+def _time(ts):
+    if not ts:
+        return ""
+    iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    return f'<time datetime="{iso}">{time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))}</time>'
 
 
-def _codes(items, sep=", "):
-    return sep.join(f"<code>{e(x)}</code>" for x in items)
+def _codes(items):
+    return "".join(f"<li><code>{e(x)}</code></li>" for x in items)
 
 
-def login_page(error=""):
-    msg = f"<p class=msg>{e(error)}</p>" if error else ""
-    return (HEAD + "<h1>AWS Permissions</h1>" + msg +
-            "<p>Approve AWS permissions for your agents.</p>"
-            '<p><a class="button ok" href="/login">Sign in</a></p></body></html>')
+def _service(action):
+    prefix = action.split(":", 1)[0]
+    return SERVICES.get(prefix, prefix)
 
 
-def error_page(text):
-    return HEAD + f"<h1>AWS Permissions</h1><p class=msg>{e(text)}</p><p><a href='/'>Back</a></p></body></html>"
+def _plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
 
-def dashboard(app, owner, msg="", new_key=None):
-    store, broker = app.store, app.broker
-    out = [HEAD, "<header><div><h1>AWS Permissions</h1>"
-           f"<div class=muted>Account {e(broker.account)} · {e(owner)}</div></div>"
-           '<div><a class=button href="/">Refresh</a>'
-           '<form method="post" action="/logout"><button>Sign out</button></form></div></header>']
-    if msg:
-        out.append(f"<p class=msg>{e(msg)}</p>")
-    if new_key:
-        out.append(
-            "<div class='card pending'><b>New API key. Copy it now; it won't be shown again.</b>"
-            f"<p class=secret>{e(new_key)}</p>"
-            "<p>On the agent's machine run <code>apm login --paste</code> and paste it, or set "
-            "<code>APM_API_KEY</code> in the agent's environment. Agents with the plugin can instead "
-            "connect themselves, which you approve here.</p></div>")
+def login_page(app, error="", next_path="/"):
+    from urllib.parse import urlencode
+    href = "/login" + ("?" + urlencode({"next": next_path}) if next_path != "/" else "")
+    msg = f'<p class="flash error" role="alert">{e(error)}</p>' if error else ""
+    deep = ("<p class=muted>Sign in to see the request you opened.</p>"
+            if next_path.startswith(("/requests/", "/connect/")) else "")
+    return (_head(app, "Sign in") + '<body data-page="login" class=center><main id=main class=signin>'
+            '<img src="/icon-192.png" alt="" width=72 height=72>'
+            f'<h1>AWS Permissions {_stage(app)}</h1>'
+            '<p>Approve the AWS access your agents ask for.</p>' + msg + deep +
+            f'<p><a class="button primary wide" href="{e(href)}">Sign in</a></p>'
+            '<p class=muted>Only the owner\'s verified email can sign in.</p></main></body></html>')
 
-    for c in store.connects():
-        out.append(
-            f"<div class='card pending' id='connect-{e(c['code'])}'><b>Connect agent <code>{e(c['name'])}</code>?</b>"
-            f"<div class=muted>{_when(c['created_at'])} · {e(c.get('info') or '')}</div>"
-            f"<p>Code <b><code>{e(c['code'])}</code></b>. Approve only if you just started this and the agent "
-            "shows the same code. It gets an API key that can request (never approve) permissions.</p><p>"
-            + _form({"op": "approve_connect", "code": c["code"]}, "Approve", "ok")
-            + _form({"op": "reject_connect", "code": c["code"]}, "Reject", "no") + "</p></div>")
 
-    pending = store.list(status="pending")
-    out.append(f"<h2>Pending requests ({len(pending)})</h2>")
-    if not pending:
-        out.append("<p class=muted>Nothing waiting.</p>")
-    projects = store.projects()
-    for r in pending:
-        stmt = policy.statement(r["id"], r["actions"], r["resources"])
-        new = "" if r["project"] in projects else f" <b>(new project: creates role {e(policy.role_name(r['project']))})</b>"
-        wild = any("*" in x for x in r["actions"] + r["resources"])
-        out.append(
-            f"<div class='card pending' id='req-{r['id']}'><b>#{r['id']} · <code>{e(r['project'])}</code></b>{new}"
-            f"<div class=muted>{_when(r['created_at'])} · from {e(r.get('requester') or 'unknown')}</div>"
-            f"<p><b>Reason:</b> {e(r['reason'])}</p>"
-            f"<p><b>Actions:</b> {_codes(r['actions'])}<br><b>Resources:</b> {_codes(r['resources'])}</p>"
-            + ("<p class=no><b>Includes wildcards.</b> Check the scope before approving.</p>" if wild else "")
-            + f"<details><summary>Policy statement</summary><pre>{e(json.dumps(stmt, indent=2))}</pre></details><p>"
-            + _form({"op": "approve", "id": r["id"], "digest": r["digest"]}, "Approve", "ok")
-            + _form({"op": "reject", "id": r["id"], "digest": r["digest"]}, "Reject", "no")
-            + "</p></div>")
+def error_page(app, text, back="/"):
+    return (_head(app, "Problem") + '<body data-page="error" class=center><main id=main class=signin>'
+            f'<h1>Something needs attention</h1><p class="flash error" role="alert">{e(text)}</p>'
+            f'<p><a class="button wide" href="{e(back)}">Back to AWS Permissions</a></p></main></body></html>')
 
-    out.append("<h2>Projects</h2><p class=muted>Grants are read live from IAM.</p>")
-    if not projects:
-        out.append("<p class=muted>No projects yet. Approving a request for a new project creates it.</p>")
-    for project in projects:
-        if not broker.in_sync(project, store.approved(project)):
-            out.append(f"<div class='card pending'><b><code>{e(project)}</code>: IAM doesn't match your decisions.</b> "
-                       "An IAM update may have failed or been interrupted. "
-                       + _form({"op": "sync_project", "project": project}, "Re-apply decisions", "ok") + "</div>")
-        grants = broker.grants(project)
-        out.append(f"<div class=card><b><code>{e(project)}</code></b> · role <code>{e(policy.role_name(project))}</code>")
-        if not grants or not grants["Statement"]:
-            out.append("<p class=muted>No permissions granted.</p>")
-        else:
-            out.append("<table><tr><th>Grant</th><th>Actions</th><th>Resources</th><th>Reason</th><th></th></tr>")
-            for s in grants["Statement"]:
-                sid = s.get("Sid", "")
-                req = store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
-                out.append(
-                    f"<tr><td><code>{e(sid)}</code></td><td>{_codes(_list(s.get('Action', [])), '<br>')}</td>"
-                    f"<td>{_codes(_list(s.get('Resource', [])), '<br>')}</td>"
-                    f"<td>{e(req['reason']) if req else '<span class=muted>unknown</span>'}</td>"
-                    f"<td>{_form({'op': 'revoke', 'project': project, 'sid': sid}, 'Revoke', 'no', f'Revoke {sid} from {project}?')}</td></tr>")
-            out.append("</table>")
-        out.append("<p>" + _form({"op": "remove_project", "project": project}, "Delete project", "no",
-                                 f"Delete role {policy.role_name(project)} and all its grants?") + "</p></div>")
 
-    out.append("<h2>Notifications</h2><div class=card>"
-               f'<p id="push-status" class=muted data-vapid="{e(app.s.vapid_public)}">Checking this device…</p>'
-               '<button id="enable-push" class="ok" hidden>Enable notifications on this device</button>')
-    subs = store.subscriptions()
-    if subs:
-        out.append("<table><tr><th>Device</th><th>Added</th><th></th></tr>")
-        for s in subs:
-            out.append(f"<tr><td>{e(_device(s['label']))}</td><td>{_when(s['created_at'])}</td>"
-                       f"<td>{_form({'op': 'delete_device', 'pk': s['pk']}, 'Remove', 'no')}</td></tr>")
-        out.append("</table><p>" + _form({"op": "test_push"}, "Send test notification") + "</p>")
-    out.append("</div>")
+# ---------- requests ----------
 
-    out.append("<h2>Agent API keys</h2><div class=card><p class=muted>Agents use a key to list projects, "
-               "request permissions and get short-lived credentials. They can never approve.</p>")
-    keys = store.keys()
-    if keys:
-        out.append("<table><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th></th></tr>")
-        for k in keys:
-            out.append(f"<tr><td>{e(k['name'])}</td><td><code>{e(k['prefix'])}…</code></td><td>{_when(k['created_at'])}</td>"
-                       f"<td>{_when(k['last_used']) or 'never'}</td>"
-                       f"<td>{_form({'op': 'delete_key', 'pk': k['pk']}, 'Delete', 'no', 'Delete key ' + k['name'] + '?')}</td></tr>")
-        out.append("</table>")
-    out.append('<form method="post" action="/action"><input type="hidden" name="op" value="create_key">'
-               '<input type="text" name="name" placeholder="name, e.g. macbook" maxlength="40" required> '
-               "<button>Create key</button></form></div>")
+def _scope_notes(r):
+    notes = []
+    for a in r["actions"]:
+        verb = a.split(":", 1)[1]
+        if verb == "*":
+            notes.append(f"<code>{e(a)}</code> allows <b>every {e(_service(a))} action</b>, including deleting things.")
+        elif "*" in verb or "?" in verb:
+            notes.append(f"<code>{e(a)}</code> matches several {e(_service(a))} actions.")
+    return notes
 
-    history = [r for r in store.list() if r["status"] != "pending"][:25]
-    if history:
-        out.append("<h2>Recent decisions</h2><table><tr><th>#</th><th>Project</th><th>Status</th><th>Actions</th><th>Reason</th><th>When</th></tr>")
-        for r in history:
-            out.append(f"<tr><td>{r['id']}</td><td><code>{e(r['project'])}</code></td><td>{e(r['status'])}</td>"
-                       f"<td>{e(', '.join(r['actions']))}</td><td>{e(r['reason'])}</td><td>{_when(r['decided_at'])}</td></tr>")
-        out.append("</table>")
-    out.append("</body></html>")
+
+def request_card(app, r, projects, back="/"):
+    rid, project = r["id"], r["project"]
+    new = r["project"] not in projects
+    notes = _scope_notes(r)
+    stmt = policy.statement(rid, r["actions"], r["resources"])
+    all_resources = r["resources"] == ["*"]
+    on = ("<p class=on><b>On:</b> all resources in the account</p>" if all_resources else
+          f'<p class=on><b>On:</b></p><ul class=codes>{_codes(r["resources"])}</ul>')
+    chips = f'<span class=chip>#{rid}</span>' + ('<span class="chip new">New project</span>' if new else "")
+    services = sorted({_service(a) for a in r["actions"]})
+    summary = f"{_plural(len(r['actions']), 'action')} in {', '.join(services)}"
+    out = [f'<article class="card request" id="req-{rid}" aria-labelledby="req-{rid}-t">'
+           f'<div class=card-head><h2 id="req-{rid}-t"><a href="/requests/{rid}">{e(project)}</a></h2>{chips}</div>'
+           f'<p class=meta>{e(summary)} · from {e(r.get("requester") or "unknown")} · {_time(r["created_at"])}</p>'
+           f'<blockquote class=reason>{e(r["reason"])}</blockquote>'
+           f'<p class=on><b>Allow:</b></p><ul class=codes>{_codes(r["actions"])}</ul>{on}']
+    if new:
+        out.append(f'<p class=note>Approving creates the project and its role <code>{e(policy.role_name(project))}</code>.</p>')
+    for n in notes:
+        out.append(f'<p class=warn>{n}</p>')
+    out.append(f'<details><summary>Exact policy statement</summary><pre>{e(json.dumps(stmt, indent=2))}</pre></details>')
+    if r["status"] == "pending":
+        confirm = (f"Approve broad access ({', '.join(a for a in r['actions'] if '*' in a)}) for {project}?"
+                   if notes else "")
+        out.append('<div class=decide>'
+                   + _form({"op": "approve", "id": rid, "digest": r["digest"]}, "Approve", "primary", confirm, back)
+                   + _form({"op": "reject", "id": rid, "digest": r["digest"]}, "Reject", "danger", "", back)
+                   + "</div>")
+    out.append("</article>")
     return "".join(out)
 
+
+def connect_card(c, back="/"):
+    code = c["code"]
+    return (f'<article class="card connect" id="connect-{e(code)}" aria-labelledby="connect-{e(code)}-t">'
+            f'<div class=card-head><h2 id="connect-{e(code)}-t">Connect agent “{e(c["name"])}”?</h2>'
+            '<span class="chip new">New agent</span></div>'
+            f'<p class=meta>{_time(c["created_at"])} · {e(c.get("info") or "")}</p>'
+            f'<p class=code-check>Code <b class=code>{e(code)}</b></p>'
+            '<p>Approve only if you just started this and the agent shows the same code. The agent gets an API key '
+            'that can ask for permissions but never approve them.</p><div class=decide>'
+            + _form({"op": "approve_connect", "code": code}, "Approve", "primary", "", back)
+            + _form({"op": "reject_connect", "code": code}, "Reject", "danger", "", back) + "</div></article>")
+
+
+def _status_chip(status):
+    return f'<span class="chip s-{e(status)}">{e(status.capitalize())}</span>'
+
+
+def requests_page(app, owner, msg=""):
+    store = app.store
+    pending, connects, projects = store.list(status="pending"), store.connects(), store.projects()
+    out = ['<p class="nudge" id="push-nudge" hidden><a href="/devices">Turn on notifications</a> on this device '
+           'to hear about new requests.</p>']
+    for c in connects:
+        out.append(connect_card(c))
+    for r in pending:
+        out.append(request_card(app, r, projects))
+    if not pending and not connects:
+        out.append('<div class=empty><p><b>Nothing to review.</b></p><p class=muted>When an agent asks for AWS access, '
+                   'it shows up here and you get a notification.</p></div>')
+    history = [r for r in store.list() if r["status"] != "pending"][:10]
+    if history:
+        out.append('<h2 class=section>Recent decisions</h2><ul class=list>')
+        for r in history:
+            out.append(f'<li class=link-row><a href="/requests/{r["id"]}"><span><b>{e(r["project"])}</b> <span class=muted>#{r["id"]}</span>'
+                       f'<br><span class=muted>{e(", ".join(r["actions"]))}</span></span>'
+                       f'<span class=right>{_status_chip(r["status"])}<br>{_time(r["decided_at"])}</span></a></li>')
+        out.append("</ul>")
+    n = len(pending) + len(connects)
+    heading = f"Requests ({n})" if n else "Requests"
+    return layout(app, owner, "requests", "Requests", "".join(out), msg, heading)
+
+
+def request_page(app, owner, r, msg=""):
+    rid = r["id"]
+    body = []
+    if r["status"] != "pending":
+        when = _time(r["decided_at"])
+        body.append(f'<p class="flash">This request was {_status_chip(r["status"])} {when}.'
+                    + (f' Note: {e(r["note"])}' if r.get("note") else "")
+                    + (' See it in <a href="/projects">Projects</a>.' if r["status"] == "approved" else "") + "</p>")
+    body.append(request_card(app, r, app.store.projects(), back=f"/requests/{rid}"))
+    body.append('<p><a href="/">← All requests</a></p>')
+    return layout(app, owner, "requests", f"Request #{rid}", "".join(body), msg)
+
+
+def connect_page(app, owner, code, msg=""):
+    match = [c for c in app.store.connects() if c["code"] == code]
+    if match:
+        body = connect_card(match[0], back=f"/connect/{code}")
+    else:
+        body = ('<div class=empty><p><b>This connect request is no longer waiting.</b></p><p class=muted>It was '
+                'approved, rejected or expired (they last 15 minutes). If the agent still needs access, start '
+                'connecting again from the agent.</p></div>')
+    return layout(app, owner, "requests", "Connect an agent", body + '<p><a href="/">← All requests</a></p>', msg)
+
+
+# ---------- projects ----------
+
+def projects_page(app, owner, msg=""):
+    store, broker = app.store, app.broker
+    projects = store.projects()
+    out = ['<p class=muted>Each project is an IAM role agents can use. Grants are read live from IAM.</p>']
+    if not projects:
+        out.append('<div class=empty><p><b>No projects yet.</b></p><p class=muted>A project is created the first '
+                   'time you approve a request for it.</p></div>')
+    for project in projects:
+        if not broker.in_sync(project, store.approved(project)):
+            out.append(f'<div class="warn" role="alert"><p><b>{e(project)}: IAM doesn\'t match your decisions.</b> An IAM '
+                       'update failed or was interrupted, so the grants below may differ from what you approved or '
+                       'revoked.</p>' + _form({"op": "sync_project", "project": project}, "Re-apply decisions",
+                                              "primary", "", "/projects") + "</div>")
+        grants = broker.grants(project)
+        statements = grants["Statement"] if grants else []
+        out.append(f'<article class=card id="project-{e(project)}"><div class=card-head><h2>{e(project)}</h2>'
+                   f'<span class=chip>{_plural(len(statements), "grant")}</span></div>'
+                   f'<p class=meta>Role <code>{e(policy.role_name(project))}</code> · agents use profile '
+                   f'<code>apm-{e(project)}</code></p>')
+        if not statements:
+            out.append("<p class=muted>No permissions granted. Agents can't use this project until you approve a request.</p>")
+        else:
+            out.append("<ul class=grants>")
+            for s in statements:
+                sid = s.get("Sid", "")
+                req = store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
+                resources = _list(s.get("Resource", []))
+                on = "all resources" if resources == ["*"] else ""
+                out.append(
+                    f'<li><div><ul class=codes>{_codes(_list(s.get("Action", [])))}</ul>'
+                    + (f'<p class=on>On {on}</p>' if on else f'<p class=on>On:</p><ul class=codes>{_codes(resources)}</ul>')
+                    + (f'<p class=muted>{e(req["reason"])} · <a href="/requests/{req["id"]}">#{req["id"]}</a></p>' if req
+                       else f'<p class=muted>Grant <code>{e(sid)}</code></p>')
+                    + "</div>"
+                    + _form({"op": "revoke", "project": project, "sid": sid}, "Revoke", "danger small",
+                            f"Revoke this grant from {project}? Agents lose it within minutes.", "/projects")
+                    + "</li>")
+            out.append("</ul>")
+        out.append('<details class=danger-zone><summary>Delete project…</summary>'
+                   f'<p>Deletes role <code>{e(policy.role_name(project))}</code> and all its grants. Agents using it '
+                   'lose access when their current credentials expire (within an hour).</p>'
+                   + _form({"op": "remove_project", "project": project}, f"Delete {project}", "danger",
+                           f"Delete project {project} and all its grants?", "/projects")
+                   + "</details></article>")
+    return layout(app, owner, "projects", "Projects", "".join(out), msg)
+
+
+# ---------- notifications ----------
 
 def _device(ua):
     for name in ("iPhone", "iPad", "Android", "Macintosh", "Windows", "Linux"):
         if name in ua:
-            return {"Macintosh": "Mac"}.get(name, name) + (" (Chrome)" if "Chrome/" in ua else " (Firefox)" if "Firefox/" in ua else "")
+            browser = (" · Edge" if "Edg/" in ua else " · Chrome" if "Chrome/" in ua or "CriOS/" in ua
+                       else " · Firefox" if "Firefox/" in ua or "FxiOS/" in ua else " · Safari" if "Safari/" in ua else "")
+            return {"Macintosh": "Mac"}.get(name, name) + browser
     return ua[:40] or "device"
+
+
+def _health(s):
+    ok, bad = s.get("last_ok_at", 0), s.get("last_error_at", 0)
+    if s.get("failures"):  # reset by the next success
+        status = s.get("last_status") or "no response"
+        return f'<span class=warn-text>Last notification failed (HTTP {e(str(status))}) {_time(bad)}</span>'
+    if ok:
+        return f"Last notified {_time(ok)}"
+    return "No notifications sent yet"
+
+
+def devices_page(app, owner, msg=""):
+    subs = app.store.subscriptions()
+    out = ['<section class=card id=this-device aria-labelledby=this-device-t>'
+           '<h2 id=this-device-t>This device</h2>'
+           '<p id=push-status aria-live=polite>Checking notifications…</p>'
+           '<div class=decide>'
+           '<button id=push-enable class=primary hidden>Turn on notifications</button>'
+           '<button id=push-test hidden>Send a test</button>'
+           '<button id=push-disable class=danger hidden>Turn off</button>'
+           '<button id=install-app hidden>Install app</button></div>'
+           '<div id=install-ios class=steps hidden><p><b>On iPhone and iPad, notifications only work from the '
+           'Home Screen app.</b></p><ol><li>Tap <b>Share</b> <span aria-hidden=true>(□↑)</span> in Safari.</li>'
+           '<li>Choose <b>Add to Home Screen</b>, then <b>Add</b>.</li>'
+           '<li>Open <b>AWS Permissions</b> from your Home Screen and come back to this page.</li></ol>'
+           '<p class=muted>Needs iOS or iPadOS 16.4 or later.</p></div>'
+           '<div id=push-denied class=steps hidden><p id=push-denied-help></p></div>'
+           '</section>']
+    out.append(f'<h2 class=section>All devices ({len(subs)})</h2>')
+    if not subs:
+        out.append('<p class=muted>No devices get notifications yet. Turn them on above on each phone or computer '
+                   'you want alerted.</p>')
+    else:
+        out.append('<ul class="list devices">')
+        for s in subs:
+            out.append(f'<li data-device="{e(s["pk"])}"><span><b>{e(_device(s["label"]))}</b>'
+                       '<span class="chip this" hidden>This device</span>'
+                       f'<br><span class=muted>Added {_time(s["created_at"])}</span><br><span class=muted>{_health(s)}</span></span>'
+                       + _form({"op": "delete_device", "pk": s["pk"]}, "Remove", "danger small",
+                               "Stop notifications to this device?", "/devices") + "</li>")
+        out.append("</ul>")
+    out.append('<details class=info><summary>What notifications show</summary><p>A notification says only which '
+               'project is asking and the request number, so nothing sensitive appears on a lock screen. Tapping it '
+               'opens the request; you may need to sign in first. Nothing is approved from a notification.</p>'
+               '<p>Devices that the browser has unsubscribed are removed automatically the next time a notification '
+               'is sent. A device that keeps failing shows the error above.</p></details>')
+    return layout(app, owner, "devices", "Notifications", "".join(out), msg)
+
+
+# ---------- keys ----------
+
+def keys_page(app, owner, msg="", new_key=None):
+    out = []
+    if new_key:
+        out.append('<section class="card new-key" aria-labelledby=new-key-t><h2 id=new-key-t>Copy your new key now</h2>'
+                   "<p>It won't be shown again.</p>"
+                   f'<p class=secret id=secret>{e(new_key)}</p><p><button id=copy-key data-target=secret>Copy key</button></p>'
+                   "<p>On the agent's machine run <code>apm login --paste</code> and paste it, or set "
+                   "<code>APM_API_KEY</code> in the agent's environment.</p></section>")
+    out.append('<p class=muted>Agents use a key to list projects, ask for permissions and get short-lived '
+               'credentials. A key can never approve anything. Agents with the plugin can also connect themselves; '
+               'you approve those on the Requests screen.</p>')
+    keys = app.store.keys()
+    if keys:
+        out.append('<ul class=list>')
+        for k in keys:
+            out.append(f'<li><span><b>{e(k["name"])}</b> <code>{e(k["prefix"])}…</code><br>'
+                       f'<span class=muted>Created {_time(k["created_at"])} · last used '
+                       f'{_time(k["last_used"]) or "never"}</span></span>'
+                       + _form({"op": "delete_key", "pk": k["pk"]}, "Delete", "danger small",
+                               f"Delete key {k['name']}? Agents using it stop working.", "/keys") + "</li>")
+        out.append("</ul>")
+    else:
+        out.append('<div class=empty><p><b>No keys yet.</b></p></div>')
+    out.append('<form method="post" action="/action" class=create><input type="hidden" name="op" value="create_key">'
+               '<input type="hidden" name="back" value="/keys">'
+               '<label for=key-name>New key name</label><div class=row>'
+               '<input type="text" id=key-name name="name" placeholder="e.g. macbook" maxlength="40" required '
+               'autocomplete=off autocapitalize=off>'
+               '<button class=primary>Create key</button></div></form>')
+    return layout(app, owner, "keys", "Agent API keys", "".join(out), msg)
 
 
 def _list(v):

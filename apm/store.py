@@ -207,16 +207,50 @@ class Store:
     # ---------- web push subscriptions ----------
 
     def add_subscription(self, sub, label):
-        endpoint = sub["endpoint"]
-        self.t.put_item(Item={"pk": f"sub#{_hash(endpoint)}", "kind": "sub", "sub": json.dumps(sub),
-                              "label": label[:120], "created_at": int(time.time())})
+        """Save a device's push subscription (idempotent). Returns its id. Re-saving keeps when it
+        was first added and its delivery history."""
+        pk = subscription_id(sub["endpoint"])
+        old = _plain(self.t.get_item(Key={"pk": pk}).get("Item") or {})
+        self.t.put_item(Item={**old, "pk": pk, "kind": "sub", "sub": json.dumps(sub), "label": label[:120],
+                              "created_at": old.get("created_at") or int(time.time())})
+        return pk
 
     def subscriptions(self):
-        return [{**s, "sub": json.loads(s["sub"])} for s in self._scan("sub")]
+        return sorted(({**s, "sub": json.loads(s["sub"])} for s in self._scan("sub")), key=lambda s: s["created_at"])
 
     def delete_subscription(self, pk):
         if pk.startswith("sub#"):
             self.t.delete_item(Key={"pk": pk})
+
+    def remove_device(self, pk):
+        """The owner removed a device: delete it and remember that, so the device's browser,
+        which still holds its subscription, can't quietly sign itself up again."""
+        if pk.startswith("sub#"):
+            self.delete_subscription(pk)
+            self.t.put_item(Item={"pk": "subgone#" + pk[4:], "kind": "subgone", "created_at": int(time.time())})
+
+    def device_removed(self, pk):
+        return bool(self.t.get_item(Key={"pk": "subgone#" + pk[4:]}).get("Item"))
+
+    def clear_removed(self, pk):
+        self.t.delete_item(Key={"pk": "subgone#" + pk[4:]})
+
+    def record_delivery(self, pk, ok, status):
+        """Remember the last push outcome per device so the dashboard can show broken devices."""
+        now = int(time.time())
+        expr = "SET last_ok_at = :t, last_status = :s, failures = :z" if ok else \
+            "SET last_error_at = :t, last_status = :s ADD failures :one"
+        values = {":t": now, ":s": status or 0, **({":z": 0} if ok else {":one": 1})}
+        try:
+            self.t.update_item(Key={"pk": pk}, UpdateExpression=expr, ExpressionAttributeValues=values,
+                               ConditionExpression="attribute_exists(pk)")
+        except Exception as e:
+            if getattr(e, "response", {}).get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise  # a missing device was removed meanwhile; nothing to record
+
+
+def subscription_id(endpoint):
+    return f"sub#{_hash(endpoint)}"
 
 
 def _view(r):
