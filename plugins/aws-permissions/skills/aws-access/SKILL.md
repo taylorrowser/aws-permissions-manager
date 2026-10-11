@@ -19,6 +19,6 @@ You never get admin AWS credentials. AWS access is organised into **projects**, 
    - Prefer narrow requests. Wildcards like `s3:*` or `Resource: *` are harder for the owner to approve.
    - Then wait with `check_request` (`wait_seconds: 120`, repeat while pending), and retry once it is approved.
    - If it's rejected, read the note and stop or adjust. Don't re-request the same thing.
-4. **Some actions can never be granted:** IAM changes, `sts:AssumeRole`, Organizations, account, SSO/identity and billing. Don't request them. Tell the user if a task needs them.
+4. **Some actions can never be granted:** IAM changes, `sts:AssumeRole`, Organizations, account, SSO/identity, billing and domain registration (`route53domains`). Stopping or changing CloudTrail logging, and anything belonging to AWS Permissions itself, is denied even if approved. Don't request them. Tell the user if a task needs them.
 
 If the tools say this machine isn't connected, call `connect`. It opens the owner's dashboard in the browser. Tell the user the code it returns so they can check it matches, then call `connect` with `wait_seconds: 120` until it reports connected. This only happens once per machine. Without the MCP tools, run `apm login`.

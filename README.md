@@ -88,6 +88,15 @@ codex plugin marketplace add taylorrowser/aws-permissions-manager
 codex plugin add aws-permissions@taylorrowser
 ```
 
+Install from GitHub, so agents run the reviewed `main`. A local-path marketplace installs whatever that checkout holds, including uncommitted changes. To update later:
+
+```sh
+claude plugin marketplace update taylorrowser && claude plugin update aws-permissions@taylorrowser
+codex plugin marketplace upgrade taylorrowser && codex plugin add aws-permissions@taylorrowser
+```
+
+Both tools cache plugins by version, so bump `version` in both `plugin.json` files (and `VERSION` in `scripts/apm.py`) with any plugin change.
+
 The first time an agent needs AWS on that machine, it calls the `connect` tool. The tool opens the dashboard and pings your phone, you check the code matches what the agent shows, and you tap Approve. The agent generates its own API key and sends only its hash, so no key is ever copied or pasted. Without an agent, `apm login` does the same from a terminal. `apm login --paste` or `APM_API_KEY` accept a key created in the dashboard instead.
 
 Agents then follow the bundled `aws-access` skill:

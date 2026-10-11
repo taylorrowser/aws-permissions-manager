@@ -741,6 +741,102 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(oct(key_file.stat().st_mode & 0o777), "0o600")
         self.assertFalse((self.tmp / "apm" / "pending-key").exists())
 
+    def test_mcp_server_survives_unexpected_errors(self):
+        (self.tmp / "aws-config").mkdir()  # unreadable as a file: an OSError inside the tool
+        proc = subprocess.Popen([self.python, str(CLIENT), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                env=self.env, text=True)
+        def stop():
+            proc.stdin.close()
+            proc.wait(5)
+            proc.stdout.close()
+        self.addCleanup(stop)
+
+        def rpc(i, method, params=None):
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i, "method": method, "params": params or {}}) + "\n")
+            proc.stdin.flush()
+            return json.loads(proc.stdout.readline())
+
+        def tool(i, name, **args):
+            return rpc(i, "tools/call", {"name": name, "arguments": args})["result"]
+
+        tool(1, "request_permissions", project="myapp", actions=["s3:ListAllMyBuckets"], reason="list buckets")
+        self.approve_all()
+        broken = tool(2, "get_aws_credentials", project="myapp")
+        self.assertTrue(broken["isError"])
+        self.assertIn("IsADirectoryError", broken["content"][0]["text"])
+        unknown = tool(3, "no_such_tool")
+        self.assertTrue(unknown["isError"])
+        self.assertIn("unknown tool", unknown["content"][0]["text"])
+        # Still serving after both.
+        self.assertIn("myapp", tool(4, "list_projects")["content"][0]["text"])
+        self.assertIsNone(proc.poll())
+
+    def test_profile_update_keeps_the_rest_of_aws_config(self):
+        config = self.tmp / "aws-config"
+        original = ("# keep this comment\n[default]\nregion = eu-west-1\n\n"
+                    "[profile apm-web]\ncredential_process = stale command\noutput = json\n\n"
+                    "[profile other]\nregion = ap-south-1\n")
+        config.write_text(original)
+        config.chmod(0o600)
+        run = lambda *a: subprocess.run([self.python, str(CLIENT), *a], env=self.env, capture_output=True, text=True)
+        run("request", "--project", "web", "-a", "s3:GetObject", "--reason", "read")
+        self.approve_all()
+        contents = []
+        for _ in range(2):  # a second `use` leaves the file unchanged
+            r = run("use", "web")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            contents.append(config.read_text())
+        self.assertEqual(contents[0], contents[1])
+        text = contents[1]
+        self.assertTrue(text.startswith("# keep this comment\n[default]\nregion = eu-west-1\n"))
+        self.assertIn("[profile other]\nregion = ap-south-1\n", text)
+        self.assertIn("output = json", text)
+        self.assertNotIn("stale command", text)
+        self.assertEqual(text.count("[profile apm-web]"), 1)
+        self.assertEqual(text.count("credential_process"), 1)
+        self.assertIn("credentials web", text)
+        self.assertEqual(oct(config.stat().st_mode & 0o777), "0o600")
+        self.assertEqual((self.tmp / "aws-config.apm-backup").read_text(), original)
+
+    def test_profile_update_writes_through_a_symlinked_config(self):
+        real = self.tmp / "shared-config"
+        real.write_text("[default]\nregion = eu-west-1\n")
+        real.chmod(0o640)
+        (self.tmp / "aws-config").symlink_to(real)
+        run = lambda *a: subprocess.run([self.python, str(CLIENT), *a], env=self.env, capture_output=True, text=True)
+        run("request", "--project", "web", "-a", "s3:GetObject", "--reason", "read")
+        self.approve_all()
+        r = run("use", "web")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.tmp / "aws-config").is_symlink())
+        self.assertIn("[profile apm-web]", real.read_text())
+        self.assertEqual(oct(real.stat().st_mode & 0o777), "0o640")
+
+    def test_mcp_rejects_malformed_requests_and_hides_keys(self):
+        env = {**self.env, "APM_API_KEY": "apm_SYNTHETICSECRET\nx"}  # breaks the HTTP header
+        proc = subprocess.Popen([self.python, str(CLIENT), "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                env=env, text=True)
+        def stop():
+            proc.stdin.close()
+            proc.wait(5)
+            proc.stdout.close()
+        self.addCleanup(stop)
+
+        def send(raw):
+            proc.stdin.write(raw + "\n")
+            proc.stdin.flush()
+            return json.loads(proc.stdout.readline())
+
+        self.assertEqual(send("null")["error"]["code"], -32600)
+        self.assertEqual(send("[1]")["error"]["code"], -32600)
+        self.assertEqual(send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "nope"}))["error"]["code"], -32601)
+        out = send(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                               "params": {"name": "list_projects", "arguments": {}}}))["result"]
+        self.assertTrue(out["isError"])
+        self.assertNotIn("SYNTHETICSECRET", out["content"][0]["text"])
+        self.assertEqual(send(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "ping"}))["result"], {})
+
+
     def test_cli(self):
         run = lambda *a: subprocess.run([self.python, str(CLIENT), *a], env=self.env, capture_output=True, text=True)
         r = run("request", "--project", "web", "-a", "s3:GetObject", "--reason", "read")
@@ -750,6 +846,73 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(run("wait", "1", "--timeout", "5").returncode, 0)
         self.assertIn("web", run("projects").stdout)
         self.assertEqual(run("projects", "--search", "nothing").stdout.strip(), "No matching projects.")
+
+
+class AwsConfigEditTests(unittest.TestCase):
+    """upsert_profile must leave a file the AWS CLI (botocore's RawConfigParser) still reads."""
+    SECTION = "profile apm-a"
+    VALUES = {"credential_process": '"python3" "/x/apm.py" credentials a', "region": "us-east-1"}
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("apm_client", CLIENT)
+        cls.client = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.client)
+
+    def parse(self, text):
+        import configparser
+        ini = configparser.RawConfigParser()
+        ini.read_string(text)
+        return ini
+
+    def test_edge_cases_parse_and_are_idempotent(self):
+        cases = {
+            "empty": "",
+            "no trailing newline": "[default]\nregion = eu-west-1",
+            "crlf": "[default]\r\nregion = eu-west-1\r\n",
+            "colon delimiter and comment after header": "[profile apm-a] # mine\nregion: eu-west-1\ncredential_process : old\n",
+            "indented keys": "[profile apm-a]\n  region = eu\n  output = json\n",
+            "nested values": "[profile apm-a]\ns3 =\n    region = nested\ncredential_process = old\n    more\n[default]\nregion=x\n",
+            "commented-out header": "# [profile apm-a]\n[default]\nregion=x\n",
+            "upper-case keys": "[profile apm-a]\nREGION = eu\n",
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                out = self.client.upsert_profile(text, self.SECTION, self.VALUES)
+                ini = self.parse(out)
+                for k, v in self.VALUES.items():
+                    self.assertEqual(ini.get(self.SECTION, k), v)
+                self.assertEqual(self.client.upsert_profile(out, self.SECTION, self.VALUES), out)
+                self.assertEqual(sum(l.startswith("[profile apm-a]") for l in out.splitlines()), 1)
+                if "\r\n" in text:
+                    self.assertNotIn("\n", out.replace("\r\n", ""))
+        nested = self.parse(self.client.upsert_profile(cases["nested values"], self.SECTION, self.VALUES))
+        self.assertIn("region = nested", nested.get(self.SECTION, "s3"))
+
+    def test_unparsable_file_is_refused_without_echoing_it(self):
+        # Broken elsewhere in the file (a duplicate option in another profile): don't touch it.
+        bad = "[default]\nregion = 1\nregion = 2\naws_secret_access_key = SECRETVALUE\n"
+        out = self.client.upsert_profile(bad, self.SECTION, self.VALUES)
+        with self.assertRaises(self.client.ApmError) as e:
+            self.client._check_config(out, self.SECTION, self.VALUES)
+        self.assertNotIn("SECRETVALUE", str(e.exception))
+        self.assertIn("left unchanged", str(e.exception))
+
+    def test_use_reports_a_broken_config_even_when_the_profile_is_already_right(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config"
+            good = self.client.upsert_profile("", self.SECTION, self.VALUES)
+            config.write_text(good + "[default]\nregion = 1\nregion = 2\n")
+            before = config.read_text()
+            with mock.patch.object(self.client, "AWS_CONFIG", config), \
+                 mock.patch.object(self.client, "fetch_credentials"), \
+                 mock.patch.object(self.client, "_stable_copy", return_value="/x/apm.py"), \
+                 mock.patch.object(self.client, "call", return_value={"region": "us-east-1"}), \
+                 mock.patch.object(self.client.sys, "executable", "python3"):
+                with self.assertRaises(self.client.ApmError):
+                    self.client.use("a")
+            self.assertEqual(config.read_text(), before)
 
 
 if __name__ == "__main__":
