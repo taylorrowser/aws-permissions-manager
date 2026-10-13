@@ -148,7 +148,9 @@ details.policy>summary,details.danger-zone>summary{cursor:pointer;min-height:40p
 .empty{text-align:center;padding:2.2rem 1rem;border:1px dashed var(--line);border-radius:14px;margin-bottom:1rem}
 .empty p{margin:.3rem 0}
 .nudge{background:var(--note-bg);padding:.6rem 1rem;border-radius:10px;margin:0 0 1rem;font-size:.92rem}
-.banner{flex:none;background:var(--warn-bg);color:var(--warn-fg);padding:.6rem 1rem;text-align:center;font-weight:600}
+/* The offline banner is the first thing on screen on phones, so it takes the top inset instead of main. */
+.banner{flex:none;background:var(--warn-bg);color:var(--warn-fg);padding:calc(var(--inset-top) + .4rem) 1rem .6rem;text-align:center;font-weight:600}
+.banner:not([hidden])+main{padding-top:.25rem}
 
 /* confirm dialog */
 .confirm{border:0;border-radius:14px;padding:1.25rem;width:min(92vw,420px);background:var(--card);color:var(--fg);box-shadow:0 12px 40px rgba(0,0,0,.3)}

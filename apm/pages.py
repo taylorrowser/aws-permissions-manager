@@ -429,7 +429,7 @@ def settings_page(app, owner, msg="", new_key=None):
                        + _form({"op": "delete_device", "pk": s["pk"]}, "Remove", "danger small",
                                "Stop notifications to this device?", "/settings") + "</li>")
         out.append("</ul>")
-    out.append('<p class=muted>Notifications show only the project and request number.</p>')
+    out.append('<p class=muted>Notifications show only the project, request number and action count.</p>')
 
     out.append('<h2 class=section>Agent keys</h2>')
     if keys:
