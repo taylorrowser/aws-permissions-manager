@@ -245,10 +245,11 @@ class App:
     def screen(self, req, owner):
         p, msg = req.path, req.query.get("msg", "")
         if p.startswith("/requests/"):
+            st = pages.state(self)  # before reading the request, so a decision made meanwhile isn't hidden
             r = self.store.get(int(p.rsplit("/", 1)[1]))
             if not r:
                 return Response(404, pages.error_page(self, f"There is no request #{p.rsplit('/', 1)[1]}.", "/"))
-            return Response(200, pages.request_page(self, owner, r, msg))
+            return Response(200, pages.request_page(self, owner, r, msg, st))
         if p.startswith("/connect/"):
             return Response(200, pages.connect_page(self, owner, p.rsplit("/", 1)[1], msg))
         view = {"/": pages.requests_page, "/projects": pages.projects_page,

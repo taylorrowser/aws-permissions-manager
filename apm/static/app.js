@@ -236,12 +236,14 @@ if (typeof document !== "undefined") {
     const form = event.target;
     if (form.method.toLowerCase() !== "post" || form.hasAttribute("data-native") || form.closest("dialog")) return;
     event.preventDefault();
+    if (busy) return; // one submit at a time, or a later response could replace an earlier one (a new key)
     if (!navigator.onLine) {
       showOffline(true);
       $("offline").focus?.();
       return;
     }
     if (form.dataset.confirm && !(await askConfirm(form))) return;
+    if (busy) return; // something else was submitted while the dialog was open
     const button = form.querySelector("button");
     const label = button?.textContent;
     if (button) { button.disabled = true; button.textContent += "…"; }

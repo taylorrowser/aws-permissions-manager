@@ -207,6 +207,22 @@ class PollTests(Base):
         version = re.search(r'data-version="([^"]+)"', body).group(1)
         self.assertNotEqual(version, json.loads(self.get("/poll").body)["v"])
 
+    def test_request_screen_fingerprint_is_read_before_the_request(self):
+        # Same for a single request: a decision made on another device while this page renders
+        # must either show on the page or make the next poll refresh it.
+        rid = self.agent_request()
+        original, done = self.app.store.list, []
+
+        def decide_then_list(*a, **kw):
+            if not done:
+                done.append(1)
+                self.app.store.set_status(rid, "rejected", expect="pending")
+            return original(*a, **kw)
+        with mock.patch.object(self.app.store, "list", side_effect=decide_then_list):
+            body = self.get(f"/requests/{rid}").body
+        version = re.search(r'data-version="([^"]+)"', body).group(1)
+        self.assertTrue("Rejected" in body or version != json.loads(self.get("/poll").body)["v"])
+
     def test_poll_needs_a_session(self):
         resp = self.get("/poll", owner=False)
         self.assertEqual((resp.status, resp.content_type), (401, "application/json"))

@@ -231,8 +231,8 @@ def requests_page(app, owner, msg=""):
     return layout(app, owner, "requests", "Requests", "".join(out), st, msg, heading)
 
 
-def request_page(app, owner, r, msg=""):
-    st, rid = state(app), r["id"]
+def request_page(app, owner, r, msg="", st=None):
+    st, rid = st or state(app), r["id"]
     body = []
     if r["status"] != "pending":
         when = _time(r["decided_at"])
