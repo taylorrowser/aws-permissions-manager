@@ -1,5 +1,7 @@
-// Owner web app behaviour. Pages work without it; this adds confirm prompts, offline and
-// double-submit protection, local times, install help and push notification sign-up.
+// Owner web app behaviour. Pages work without it; this adds live refresh (the page polls /poll
+// while visible and swaps its data-live regions when something changed), in-page form submits,
+// confirm dialogs, offline and double-submit protection, local times, install help and push
+// notification sign-up.
 "use strict";
 
 // ---------- pure helpers (also loaded by tests/js) ----------
@@ -77,8 +79,15 @@ async function rotateIfKeyChanged(registration, key, register) {
   return sub;
 }
 
+// Whether a background refresh may replace what's on screen right now. Never while the owner is
+// mid-task: typing (or with unsaved text in a field), confirming, submitting, looking at a new
+// key, or while offline or hidden.
+function canRefresh(s) {
+  return Boolean(s.visible && s.online && !s.busy && !s.dialogOpen && !s.typing && !s.dirty && !s.secret);
+}
+
 if (typeof module !== "undefined") {
-  module.exports = { isIOS, pushState, deniedHelp, keyBytes, sameKey, legacyTarget, relativeTime, rotateIfKeyChanged };
+  module.exports = { isIOS, pushState, deniedHelp, keyBytes, sameKey, legacyTarget, relativeTime, rotateIfKeyChanged, canRefresh };
 }
 
 // ---------- page behaviour ----------
@@ -94,61 +103,174 @@ if (typeof document !== "undefined") {
   // Drop ?msg= so a reload doesn't repeat the message.
   if (location.search.includes("msg=")) history.replaceState(null, "", location.pathname + location.hash);
 
-  for (const t of document.querySelectorAll("time[datetime]")) {
-    const d = new Date(t.getAttribute("datetime"));
-    t.title = d.toLocaleString();
-    t.textContent = relativeTime(d, new Date());
+  // The body is sized to the visual viewport, so the tab bar stays in place when the keyboard opens.
+  const vv = window.visualViewport;
+  if (vv) {
+    const fit = () => { document.documentElement.style.setProperty("--vvh", `${vv.height}px`); scrollTo(0, 0); };
+    vv.addEventListener("resize", fit);
+    vv.addEventListener("scroll", fit);
   }
 
-  // Forms: confirm, block while offline, and stop double submits.
-  document.addEventListener("submit", (event) => {
-    const form = event.target;
-    if (!navigator.onLine) {
-      event.preventDefault();
-      showOffline(true);
-      $("offline").focus?.();
-      return;
+  let thisDevice = null; // device id of this browser's push subscription, once known
+  function hydrate(root = document) {
+    for (const t of root.querySelectorAll("time[datetime]")) {
+      const d = new Date(t.getAttribute("datetime"));
+      t.title = d.toLocaleString();
+      t.textContent = relativeTime(d, new Date());
     }
-    if (form.dataset.confirm && !confirm(form.dataset.confirm)) {
-      event.preventDefault();
-      return;
+    for (const li of root.querySelectorAll("[data-device]")) {
+      li.querySelector(".chip.this").hidden = li.dataset.device !== thisDevice;
     }
-    const button = form.querySelector("button");
-    if (button) setTimeout(() => { button.disabled = true; button.dataset.label = button.textContent; button.textContent += "…"; });
-  });
-  window.addEventListener("pageshow", () => {
-    for (const b of document.querySelectorAll("form button:disabled")) {
-      b.disabled = false;
-      if (b.dataset.label) b.textContent = b.dataset.label;
-    }
-  });
+  }
+  hydrate();
 
   function showOffline(offline) {
     const banner = $("offline");
     if (banner) banner.hidden = !offline;
   }
-  addEventListener("online", () => showOffline(false));
+  addEventListener("online", () => { showOffline(false); poll(); });
   addEventListener("offline", () => showOffline(true));
   showOffline(!navigator.onLine);
 
-  // Reopening the app shows fresh requests (but never while a new key is on screen or you're typing).
-  let hiddenAt = 0;
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") { hiddenAt = Date.now(); return; }
-    swReady?.then((r) => r.update()).catch(() => {});
-    if (page === "requests" && hiddenAt && Date.now() - hiddenAt > 30000 && navigator.onLine
-        && !document.querySelector(".secret") && !document.activeElement?.matches("input,textarea")) {
-      location.reload();
-    }
-  });
-
-  if (signedIn && "setAppBadge" in navigator) {
+  function badge() {
+    if (!signedIn || !("setAppBadge" in navigator)) return;
     const n = Number(document.body.dataset.pending);
     (n ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(() => {});
   }
+  badge();
 
-  const copy = $("copy-key");
-  copy?.addEventListener("click", async () => {
+  function flash(text, error = false) {
+    const slot = $("flash-slot");
+    if (!slot) return;
+    slot.innerHTML = "";
+    const p = document.createElement("p");
+    p.className = error ? "flash error" : "flash";
+    p.setAttribute("role", "status");
+    p.tabIndex = -1;
+    p.textContent = text;
+    slot.append(p);
+    p.focus({ preventScroll: true });
+  }
+
+  // ----- live refresh -----
+  // Replace every data-live region with the same region from a freshly rendered page. Elements
+  // marked data-keep (the push controls, which hold script state) are carried over by id.
+  let busy = false;
+  function apply(html) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const regions = doc.querySelectorAll("[data-live]");
+    if (!regions.length) { location.reload(); return; } // not a signed-in screen any more
+    for (const fresh of regions) {
+      const old = document.querySelector(`[data-live="${fresh.dataset.live}"]`);
+      if (!old) continue;
+      for (const keep of old.querySelectorAll("[data-keep]")) {
+        const slot = fresh.querySelector(`#${CSS.escape(keep.id)}`);
+        if (slot) slot.replaceWith(keep);
+      }
+      old.replaceWith(fresh);
+    }
+    for (const k of ["pending", "version"]) document.body.dataset[k] = doc.body.dataset[k] ?? "";
+    hydrate();
+    badge();
+    document.querySelector("#flash-slot .flash")?.focus({ preventScroll: true });
+  }
+
+  // A background refresh is checked again when its response arrives: the owner may have started
+  // typing, opened a confirm or submitted something meanwhile, and a submit's own response
+  // (which bumps `generation`) must never be overwritten by an older page.
+  let generation = 0;
+  async function refresh() {
+    if (!signedIn) return;
+    const started = generation;
+    const resp = await fetch(location.pathname, { credentials: "same-origin", headers: { Accept: "text/html" } });
+    if (!resp.ok) return;
+    const html = await resp.text();
+    if (started === generation && canRefresh(state())) apply(html);
+  }
+
+  const state = () => ({
+    visible: document.visibilityState === "visible", online: navigator.onLine, busy,
+    dialogOpen: Boolean($("confirm")?.open), typing: Boolean(document.activeElement?.matches("input,textarea")),
+    dirty: [...document.querySelectorAll("input[type=text],textarea")].some((i) => i.value !== ""),
+    secret: Boolean(document.querySelector(".secret")),
+  });
+
+  let polling = false;
+  async function poll() {
+    if (!signedIn || polling || !canRefresh(state())) return;
+    polling = true;
+    try {
+      const resp = await fetch("/poll", { credentials: "same-origin" });
+      if (resp.status === 401) { location.reload(); return; } // session ended: show sign-in
+      if (!resp.ok) return;
+      const { v } = await resp.json();
+      if (v !== document.body.dataset.version && canRefresh(state())) await refresh();
+    } catch (_) { /* offline or flaky; the next poll tries again */ } finally { polling = false; }
+  }
+  if (signedIn) setInterval(poll, 10000);
+  addEventListener("focus", poll);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    swReady?.then((r) => r.update()).catch(() => {});
+    poll();
+  });
+
+  // ----- forms: confirm, submit in place, block while offline, stop double submits -----
+  const dialog = $("confirm");
+  function askConfirm(form) {
+    return new Promise((resolve) => {
+      if (!dialog?.showModal) return resolve(confirm(form.dataset.confirm));
+      $("confirm-text").textContent = form.dataset.confirm;
+      $("confirm-ok").textContent = form.querySelector("button")?.textContent.replace(/…$/, "") || "Confirm";
+      dialog.returnValue = "";
+      dialog.addEventListener("close", () => resolve(dialog.returnValue === "ok"), { once: true });
+      dialog.showModal();
+    });
+  }
+
+  function errorText(html) {
+    return new DOMParser().parseFromString(html, "text/html").querySelector(".flash.error")?.textContent || "";
+  }
+
+  document.addEventListener("submit", async (event) => {
+    const form = event.target;
+    if (form.method.toLowerCase() !== "post" || form.hasAttribute("data-native") || form.closest("dialog")) return;
+    event.preventDefault();
+    if (busy) return; // one submit at a time, or a later response could replace an earlier one (a new key)
+    if (!navigator.onLine) {
+      showOffline(true);
+      $("offline").focus?.();
+      return;
+    }
+    if (form.dataset.confirm && !(await askConfirm(form))) return;
+    if (busy) return; // something else was submitted while the dialog was open
+    const button = form.querySelector("button");
+    const label = button?.textContent;
+    if (button) { button.disabled = true; button.textContent += "…"; }
+    busy = true;
+    generation++; // any background refresh in flight is now stale
+    const removingHere = form.closest("[data-device]")?.dataset.device === thisDevice;
+    try {
+      const resp = await fetch(form.action, { method: "POST", credentials: "same-origin",
+        headers: { Accept: "text/html" }, body: new URLSearchParams(new FormData(form)) });
+      const html = await resp.text();
+      // Sent somewhere else (a request decided from its own screen goes back to the list): go there.
+      // A direct 200 (a new key) and a redirect back here are applied in place.
+      if (resp.redirected && new URL(resp.url).pathname !== location.pathname) { location.replace(resp.url); return; }
+      if (!resp.ok) { flash(errorText(html) || `That didn't save (HTTP ${resp.status}). Reload and try again.`, true); return; }
+      if (removingHere) unsubscribeHere?.(); // the server dropped this device; the browser must too, or it re-registers
+      apply(html);
+    } catch (_) {
+      flash("Couldn't reach the server. Check your connection and try again.", true);
+    } finally {
+      busy = false;
+      if (button && button.isConnected) { button.disabled = false; button.textContent = label; }
+    }
+  });
+
+  document.addEventListener("click", async (event) => {
+    const copy = event.target.closest("#copy-key");
+    if (!copy) return;
     try {
       await navigator.clipboard.writeText($(copy.dataset.target).textContent);
       copy.textContent = "Copied";
@@ -179,14 +301,9 @@ if (typeof document !== "undefined") {
     : null;
   swReady?.catch((err) => console.warn("service worker registration failed", err));
 
+  // A notification arrived: something changed, so refresh whatever screen is open.
   navigator.serviceWorker?.addEventListener("message", (event) => {
-    if (event.data?.type === "push" && page === "requests") {
-      const flash = document.createElement("p");
-      flash.className = "flash";
-      flash.setAttribute("role", "status");
-      flash.innerHTML = 'Something new arrived. <a href="/">Show it</a>';
-      document.querySelector("main h1")?.after(flash);
-    }
+    if (event.data?.type === "push" && signedIn && canRefresh(state())) refresh().catch(() => {});
   });
 
   const status = $("push-status");
@@ -209,9 +326,8 @@ if (typeof document !== "undefined") {
   // (410) for a device the owner removed, so a removal sticks.
   async function save(subscription, replaces, auto = false) {
     const { device } = await post("/push/subscribe", { subscription: subscription.toJSON(), label: navigator.userAgent, replaces, auto });
-    for (const li of document.querySelectorAll("[data-device]")) {
-      li.querySelector(".chip.this").hidden = li.dataset.device !== device;
-    }
+    thisDevice = device;
+    hydrate();
     return device;
   }
 
@@ -262,6 +378,7 @@ if (typeof document !== "undefined") {
     }
   }
 
+  let unsubscribeHere = null; // set once this device's subscription is known
   async function setUpPush() {
     const e = env();
     let state = pushState({ ...e, subscribed: false });
@@ -288,6 +405,12 @@ if (typeof document !== "undefined") {
         console.warn("couldn't sync push subscription", err);
       }
     }
+    unsubscribeHere = () => {
+      sub?.unsubscribe().catch(() => {});
+      sub = null;
+      thisDevice = null;
+      render("off", "This device was removed from notifications. Turn them on again to get alerts here.");
+    };
     state = pushState({ ...e, subscribed: Boolean(sub) });
     if ($("push-nudge")) $("push-nudge").hidden = state !== "off";
     render(state, removedHere ? "This device was removed from notifications. Turn them on again to get alerts here." : undefined);
@@ -312,6 +435,7 @@ if (typeof document !== "undefined") {
           if (await testDevice(sub, { justEnabled: true, retrying: attempt === 1 }) !== "gone") break;
           sub = null;
         }
+        refresh().catch(() => {}); // the device list now includes this device
       } catch (err) {
         render("off", `Couldn't turn on notifications: ${err.message}`);
       } finally {
@@ -325,17 +449,13 @@ if (typeof document !== "undefined") {
         if (sub) await post("/push/unsubscribe", { endpoint: sub.endpoint });
         await sub?.unsubscribe();
         sub = null;
+        thisDevice = null;
         render("off", "Notifications are off for this device.");
-        document.querySelector(".chip.this:not([hidden])")?.closest("li")?.remove();
+        refresh().catch(() => {});
       } catch (err) {
         render("on", `Couldn't turn off notifications: ${err.message}`);
       }
     };
-    // Removing this device from the list also unsubscribes it, or it would re-register next time.
-    document.addEventListener("submit", (event) => {
-      const li = event.target.closest("[data-device]");
-      if (li && sub && !li.querySelector(".chip.this").hidden && !event.defaultPrevented) sub.unsubscribe().catch(() => {});
-    });
   }
 
   setUpPush().catch((err) => render("unsupported", `Couldn't check notifications: ${err.message}`));

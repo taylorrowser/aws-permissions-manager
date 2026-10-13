@@ -527,7 +527,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("Sign in", self.app(web.Request("GET", "/", cookies=forged)).body)
         self.request()
         page = self.app(web.Request("GET", "/", cookies=session_cookie(self.app))).body
-        self.assertIn("<h1>Requests (1)</h1>", page)
+        self.assertIn(">Requests (1)</h1>", page)
 
     def test_owner_posts_need_origin_and_session(self):
         r = self.request()

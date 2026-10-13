@@ -75,6 +75,8 @@ The app has four screens: **Requests** (the home screen, with pending requests a
 
 **Delivery.** When an agent asks for something, the Lambda sends to every device in parallel. It retries a timeout, 429 or 5xx once, then gives up; the Lambda can't queue work after it responds. Devices the push service reports as gone (404/410) are removed. Other failures are recorded per device and shown on the Notifications screen. Every send logs a JSON line (`"event": "push"`) to CloudWatch with the outcome and HTTP status. A missed notification never loses a request: the Requests screen always lists everything pending. Browsers that rotate a subscription re-register it themselves, as does the app whenever it opens.
 
+**Live updates.** Every signed-in screen keeps itself current without a reload. While the page is visible it asks `GET /poll` (session-authenticated, a fingerprint of requests, connects, keys and devices) every 10 seconds, and again whenever the app regains focus, becomes visible or a push notification arrives; when the fingerprint changes it re-fetches the screen and swaps the content in place. Approve, reject, revoke and delete submit in the page the same way. A refresh never interrupts you: it waits while you're typing, confirming, submitting or looking at a new key.
+
 **Offline and caching.** The service worker caches only static files (CSS, JS, icons and an offline page). Signed-in pages, approvals, keys and API responses are never cached (`Cache-Control: no-store`). Offline, buttons are disabled and opening a screen shows the offline page. Nothing is queued to send later.
 
 **For each machine:** install the plugin:

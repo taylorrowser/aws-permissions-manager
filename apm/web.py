@@ -202,6 +202,12 @@ class App:
             return self.callback(req)
 
         owner = self.owner(req)
+        if p == "/poll" and m == "GET":
+            # Polled by open pages (session-authenticated) to learn when something changed.
+            if not owner:
+                raise ApiError(401, "signed out")
+            version, pending = state_version(self.store)
+            return json_response({"v": version, "pending": pending})
         if m == "GET" and SCREENS.fullmatch(p):
             if not owner:
                 return Response(200, pages.login_page(self, req.query.get("error", ""), p))
@@ -239,10 +245,11 @@ class App:
     def screen(self, req, owner):
         p, msg = req.path, req.query.get("msg", "")
         if p.startswith("/requests/"):
+            st = pages.state(self)  # before reading the request, so a decision made meanwhile isn't hidden
             r = self.store.get(int(p.rsplit("/", 1)[1]))
             if not r:
                 return Response(404, pages.error_page(self, f"There is no request #{p.rsplit('/', 1)[1]}.", "/"))
-            return Response(200, pages.request_page(self, owner, r, msg))
+            return Response(200, pages.request_page(self, owner, r, msg, st))
         if p.startswith("/connect/"):
             return Response(200, pages.connect_page(self, owner, p.rsplit("/", 1)[1], msg))
         view = {"/": pages.requests_page, "/projects": pages.projects_page,
@@ -560,6 +567,20 @@ def _matches(term, item):
         if any(term in r.lower() for r in g["resources"]) or term in g["reason"].lower():
             return True
     return False
+
+
+def state_version(store):
+    """(fingerprint, pending count) of everything the screens show, read once, so an open page
+    can tell when to refresh. Key usage times are left out: an agent polling its request would
+    refresh the page every few seconds for nothing. Pages compute this *before* rendering, so a
+    change that lands mid-render makes the next poll differ and refresh, never hide it."""
+    requests, connects = store.list(), store.connects()
+    state = [[(r["id"], r["status"], r["digest"], r.get("decided_at")) for r in requests],
+             [(c["code"], c["status"]) for c in connects],
+             [k["pk"] for k in store.keys()],
+             [(s["pk"], s.get("last_ok_at"), s.get("last_error_at"), s.get("failures")) for s in store.subscriptions()]]
+    pending = sum(1 for r in requests if r["status"] == "pending") + len(connects)
+    return hashlib.sha256(json.dumps(state, default=str).encode()).hexdigest()[:16], pending
 
 
 def _public(r):
