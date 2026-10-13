@@ -91,7 +91,7 @@ try {
   await page.getByRole("button", { name: "Turn off" }).click();
   await page.waitForFunction(() => /off for this device/.test(document.getElementById("push-status").textContent));
   await page.reload();
-  assert.match(await page.textContent("main"), /All devices \(0\)/i);
+  assert.match(await page.textContent("main"), /No devices get notifications yet/i);
   log("turned off; device removed from server");
   console.log("PASS");
 } catch (err) {

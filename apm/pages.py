@@ -143,19 +143,34 @@ def risk(actions, resources):
     or IAM changes; write: specific write actions on named resources; read: read-only actions."""
     verbs = [_verb(a) for a in actions]
     if "*" in actions or any(v == "*" for v in verbs):
-        return "full", "Full access"
-    everything = _everything(resources)
-    iam_change = any(a.startswith("iam:") and not _is_read(_verb(a)) for a in actions)
-    if any("*" in v or "?" in v for v in verbs) or iam_change or (everything and not all(_is_read(v) for v in verbs)):
-        return "broad", "Broad"
-    if all(_is_read(v) for v in verbs):
-        return "read", "Read-only"
-    return "write", "Scoped"
+        level = "full"
+    elif (any("*" in v or "?" in v for v in verbs) or any(a.startswith("iam:") and not _is_read(_verb(a)) for a in actions)
+          or (_everything(resources) and not all(_is_read(v) for v in verbs))):
+        level = "broad"
+    elif all(_is_read(v) for v in verbs):
+        level = "read"
+    else:
+        level = "write"
+    return level, LABELS[level]
+
+
+LABELS = {"read": "Read-only", "write": "Scoped", "broad": "Broad", "full": "Full access"}
+LEVELS = list(LABELS)
+
+
+def _level_chip(level):
+    return f'<span class="chip risk-{level}">{LABELS[level]}</span>'
 
 
 def _risk_chip(actions, resources):
-    level, label = risk(actions, resources)
-    return f'<span class="chip risk-{level}">{label}</span>'
+    return _level_chip(risk(actions, resources)[0])
+
+
+def _worst_chip(statements):
+    """A project's label is its riskiest grant, each graded on its own: a read-everything grant
+    next to a scoped write grant must not add up to a broad write."""
+    return _level_chip(max((risk(_list(s.get("Action", [])), _list(s.get("Resource", [])))[0] for s in statements),
+                           key=LEVELS.index))
 
 
 def _summary(actions, resources):
@@ -334,9 +349,7 @@ def projects_page(app, owner, msg=""):
         grants = broker.grants(project)
         statements = grants["Statement"] if grants else []
         synced = broker.in_sync(project, store.approved(project))
-        all_actions = [a for s in statements for a in _list(s.get("Action", []))]
-        all_resources = sorted({r for s in statements for r in _list(s.get("Resource", []))})
-        worst = _risk_chip(all_actions, all_resources) if statements else ""
+        worst = _worst_chip(statements) if statements else ""
         warn = '<span class="chip risk-full">IAM mismatch</span>' if not synced else ""
         out.append(f'<details class="row project" id="project-{e(project)}"><summary>'
                    f'<span class=head><b>{e(project)}</b><span class=right>{_plural(len(statements), "grant")}</span></span>'

@@ -150,6 +150,14 @@ class ScreenTests(Base):
         for actions, resources, want in cases:
             self.assertEqual(risk(actions, resources)[0], want, (actions, resources))
 
+    def test_project_label_is_its_riskiest_grant_not_a_mix(self):
+        from apm.pages import _worst_chip
+        statements = [{"Action": ["s3:ListAllMyBuckets"], "Resource": ["*"]},
+                      {"Action": ["s3:PutObject"], "Resource": ["arn:aws:s3:::b/*"]}]
+        self.assertIn("risk-write", _worst_chip(statements))  # not "broad": the write is scoped
+        statements.append({"Action": ["dynamodb:*"], "Resource": ["arn:aws:dynamodb:us-east-1:1:table/t"]})
+        self.assertIn("risk-full", _worst_chip(statements))
+
     def test_requests_list_leads_with_project_reason_and_risk(self):
         rid = self.agent_request(actions=["s3:PutObject"], reason="upload the built site")
         body = self.get("/").body
