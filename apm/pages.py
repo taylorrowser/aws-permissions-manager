@@ -28,7 +28,7 @@ ICONS = {
 }
 TABS = [("/", "requests", "Requests"), ("/projects", "projects", "Projects"), ("/settings", "settings", "Settings")]
 
-READ_VERBS = ("Get", "List", "Describe", "Head", "Lookup", "Search", "Query", "Scan", "Select", "View", "Check", "Batch")
+READ_VERBS = ("Get", "List", "Describe", "Head", "Lookup", "Search", "Query", "Scan", "Select", "View", "Check", "BatchGet")
 
 
 def _icon(name):
@@ -133,6 +133,10 @@ def _is_read(verb):
     return verb.startswith(READ_VERBS) and "*" not in verb and "?" not in verb
 
 
+def _everything(resources):
+    return "*" in resources
+
+
 def risk(actions, resources):
     """How much a request (or grant) allows, as (level, label). Levels, worst first:
     full: a whole service (svc:*) or everything; broad: wildcard actions, writes on every resource,
@@ -140,7 +144,7 @@ def risk(actions, resources):
     verbs = [_verb(a) for a in actions]
     if "*" in actions or any(v == "*" for v in verbs):
         return "full", "Full access"
-    everything = resources == ["*"]
+    everything = _everything(resources)
     iam_change = any(a.startswith("iam:") and not _is_read(_verb(a)) for a in actions)
     if any("*" in v or "?" in v for v in verbs) or iam_change or (everything and not all(_is_read(v) for v in verbs)):
         return "broad", "Broad"
@@ -156,7 +160,7 @@ def _risk_chip(actions, resources):
 
 def _summary(actions, resources):
     services = sorted({_service(a) for a in actions})
-    where = "all resources" if resources == ["*"] else _plural(len(resources), "resource")
+    where = "all resources" if _everything(resources) else _plural(len(resources), "resource")
     return f"{_plural(len(actions), 'action')} · {', '.join(services)} · {where}"
 
 
@@ -190,7 +194,7 @@ def _scope_notes(r):
             notes.append(f"<code>{e(a)}</code> allows <b>every {e(_service(a))} action</b>, including deleting things.")
         elif "*" in verb or "?" in verb:
             notes.append(f"<code>{e(a)}</code> matches several {e(_service(a))} actions.")
-    if r["resources"] == ["*"] and not all(_is_read(_verb(a)) for a in r["actions"]):
+    if _everything(r["resources"]) and not all(_is_read(_verb(a)) for a in r["actions"]):
         notes.append("Applies to <b>every resource in the account</b>, not just this project's.")
     return notes
 
@@ -201,7 +205,7 @@ def request_body(app, r, projects, back="/"):
     rid, project = r["id"], r["project"]
     new = project not in projects
     stmt = policy.statement(rid, r["actions"], r["resources"])
-    on = ("<span>all resources in the account</span>" if r["resources"] == ["*"]
+    on = ("<span>all resources in the account</span>" if _everything(r["resources"])
           else f'<ul class=codes>{_codes(r["resources"])}</ul>')
     out = [f'<div class=grant><dl><dt>Allow</dt><dd><ul class=codes>{_codes(r["actions"])}</ul></dd>'
            f'<dt>On</dt><dd>{on}</dd><dt>From</dt><dd>{e(r.get("requester") or "unknown")} · {_time(r["created_at"])}</dd></dl>']
@@ -308,7 +312,7 @@ def _grant(project, s, store):
     sid = s.get("Sid", "")
     req = store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
     actions, resources = _list(s.get("Action", [])), _list(s.get("Resource", []))
-    on = ("<span>all resources</span>" if resources == ["*"] else f'<ul class=codes>{_codes(resources)}</ul>')
+    on = ("<span>all resources</span>" if _everything(resources) else f'<ul class=codes>{_codes(resources)}</ul>')
     why = (f'<p class=muted>{e(req["reason"])} · <a href="/requests/{req["id"]}">#{req["id"]}</a></p>' if req
            else f'<p class=muted>Grant <code>{e(sid)}</code></p>')
     return (f'<li><div><p class=line>{_risk_chip(actions, resources)}</p><ul class=codes>{_codes(actions)}</ul>'
@@ -332,7 +336,7 @@ def projects_page(app, owner, msg=""):
         synced = broker.in_sync(project, store.approved(project))
         all_actions = [a for s in statements for a in _list(s.get("Action", []))]
         all_resources = sorted({r for s in statements for r in _list(s.get("Resource", []))})
-        worst = _risk_chip(all_actions, ["*"] if "*" in all_resources else all_resources) if statements else ""
+        worst = _risk_chip(all_actions, all_resources) if statements else ""
         warn = '<span class="chip risk-full">IAM mismatch</span>' if not synced else ""
         out.append(f'<details class="row project" id="project-{e(project)}"><summary>'
                    f'<span class=head><b>{e(project)}</b><span class=right>{_plural(len(statements), "grant")}</span></span>'

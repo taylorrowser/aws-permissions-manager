@@ -124,6 +124,13 @@ class ScreenTests(Base):
         self.assertIn('data-confirm="Approve full access (dynamodb:*, s3:Get*) for web?"', body)
         narrow = self.agent_request(actions=["s3:GetObject"], reason="read")
         self.assertNotIn("data-confirm", self.get(f"/requests/{narrow}").body)
+        mixed = self.app(web.Request("POST", "/api/requests", headers={"Authorization": f"Bearer {self.key}"},
+                                     body=json.dumps({"project": "web", "actions": ["s3:DeleteObject"],
+                                                      "resources": ["*", "arn:aws:s3:::example/*"], "reason": "x"}).encode()))
+        body = self.get(f"/requests/{json.loads(mixed.body)['id']}").body
+        self.assertIn('class="chip risk-broad">Broad<', body)
+        self.assertIn("every resource in the account", body)
+        self.assertIn("data-confirm=", body)
 
     def test_risk_grading(self):
         from apm.pages import risk
@@ -136,6 +143,9 @@ class ScreenTests(Base):
             (["iam:PassRole"], ["arn:aws:iam::1:role/x"], "broad"),
             (["dynamodb:*"], ["arn:aws:dynamodb:us-east-1:1:table/t"], "full"),
             (["*"], ["*"], "full"),
+            (["dynamodb:BatchWriteItem"], ["*"], "broad"),  # Batch* is not read-only
+            (["dynamodb:BatchGetItem"], ["*"], "read"),
+            (["s3:DeleteObject"], ["*", "arn:aws:s3:::example/*"], "broad"),  # a "*" anywhere means everything
         ]
         for actions, resources, want in cases:
             self.assertEqual(risk(actions, resources)[0], want, (actions, resources))
