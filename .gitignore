@@ -28,4 +28,5 @@ credentials
 
 # Build output
 dist/
+build/
 rendered/

@@ -2,6 +2,8 @@
 
 Agents get AWS access per project without admin rights. They find a project, get short-lived credentials for it through an MCP server, and request new permissions. You approve or reject from a web app on your phone, which notifies you of each request.
 
+**Who it's for.** One person and one AWS account. It's a personal tool that its author runs for their own coding agents at `apm.taylorrowser.com`, published as is under the [MIT licence](LICENSE). Each deployment has one owner (or a short list of owner emails), with no tenants, teams or roles. To use it, deploy your own copy into your own AWS account ([Deploy](#deploy-owner)) and point the plugin at it. It isn't an AWS product and isn't affiliated with or endorsed by Amazon Web Services or WorkOS.
+
 ## How it works
 
 ```
@@ -45,7 +47,7 @@ Prerequisites:
 ```sh
 python3 -m venv .venv && .venv/bin/pip install -e .
 aws login
-.venv/bin/apm-admin deploy --domain apm.taylorrowser.com \
+.venv/bin/apm-admin deploy --domain apm.example.com \
   --owner-email you@example.com --workos-client-id client_...
 ```
 
@@ -99,6 +101,8 @@ codex plugin marketplace upgrade taylorrowser && codex plugin add aws-permission
 
 Both tools cache plugins by version, so bump `version` in both `plugin.json` files (and `VERSION` in `scripts/apm.py`) with any plugin change.
 
+The plugin talks to `https://apm.taylorrowser.com` unless told otherwise. For your own deployment, run `apm login --url https://<your-domain>` once per machine (it saves the URL in `~/.apm/client.json`) or set `APM_URL`.
+
 The first time an agent needs AWS on that machine, it calls the `connect` tool. The tool opens the dashboard and pings your phone, you check the code matches what the agent shows, and you tap Approve. The agent generates its own API key and sends only its hash, so no key is ever copied or pasted. Without an agent, `apm login` does the same from a terminal. `apm login --paste` or `APM_API_KEY` accept a key created in the dashboard instead.
 
 Agents then follow the bundled `aws-access` skill:
@@ -142,6 +146,6 @@ To try the web app locally against the same fakes (no AWS or WorkOS), with seede
 
 `tests/e2e/push_e2e.mjs` is an optional check in real Chrome. It turns on notifications, receives real Web Push through Chrome's push service, opens a request from the notification's link, and tests offline behaviour. It needs Playwright, Google Chrome and internet access; see the file's header.
 
-## Legacy
+## Licence
 
-`legacy/` holds the 7 October handoff package: an offline EC2-only broker with WorkOS auth. It's kept for reference and isn't used.
+[MIT](LICENSE). Report security problems as described in [SECURITY.md](SECURITY.md).

@@ -1,5 +1,0 @@
-{
-  "configured_max_body_bytes": 4096,
-  "received_bytes_before_rejection": 5120,
-  "status": 413
-}

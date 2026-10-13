@@ -1,7 +1,0 @@
-Reviewed memory-only AuthKit smoke scope only.
-Source fingerprint: bc8f5165f33fcdd7ea5436c790ac3b2cb3bf65bdab2e45ac9b4ca14f77c2c29c
-106 focused tests plus 9 independent controls passed; zero skips.
-No live auth or AWS has run. Separate exact user approval and runtime configuration remain mandatory.
-The current runbook is integration/WORKOS.md.
-Telemetry caveat: provider_refresh_attempted means adapter entry, not guaranteed HTTP dispatch; never use it as dispatch evidence. Only typed actual HTTP400 invalid_grant proves provider refresh denial.
-This archive does not contain a deployed broker, AWS grants, runtime secrets or production durable-store acceptance.
