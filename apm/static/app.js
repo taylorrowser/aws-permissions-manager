@@ -167,6 +167,9 @@ if (typeof document !== "undefined") {
         const slot = fresh.querySelector(`#${CSS.escape(keep.id)}`);
         if (slot) slot.replaceWith(keep);
       }
+      // Rows the owner opened stay open.
+      const open = new Set([...old.querySelectorAll("details[open][id]")].map((d) => d.id));
+      for (const d of fresh.querySelectorAll("details[id]")) if (open.has(d.id)) d.open = true;
       old.replaceWith(fresh);
     }
     for (const k of ["pending", "version"]) document.body.dataset[k] = doc.body.dataset[k] ?? "";

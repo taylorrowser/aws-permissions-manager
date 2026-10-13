@@ -66,14 +66,14 @@ aws ssm put-parameter --name /apm/workos-api-key --type SecureString --value "$(
 
 **On your phone:**
 1. Open the site and sign in.
-2. Install it. On iPhone or iPad, tap Share and then Add to Home Screen, then open it from the Home Screen. iOS only allows web push for Home Screen apps (iOS 16.4 or later). On Android or desktop Chrome or Edge, use **Install app** on the Notifications screen or the browser's install option.
-3. On the **Notifications** screen, tap **Turn on notifications**. A test notification is sent straight away. **Send a test** repeats it at any time.
+2. Install it. On iPhone or iPad, tap Share and then Add to Home Screen, then open it from the Home Screen. iOS only allows web push for Home Screen apps (iOS 16.4 or later). On Android or desktop Chrome or Edge, use **Install app** on the Settings screen or the browser's install option.
+3. On the **Settings** screen, tap **Turn on notifications**. A test notification is sent straight away. **Send a test** repeats it at any time.
 
-The app has four screens: **Requests** (the home screen, with pending requests and agents asking to connect), **Projects**, **Notifications** and **Keys**. Tapping a notification opens that request at `/requests/<id>` (or `/connect/<code>`). If you're signed out, you go back to it after signing in.
+The app has three screens: **Requests** (the home screen: agents asking to connect, then pending requests, each leading with the project, the reason and a risk label — Read-only, Scoped, Broad or Full access — and opening in place to show the exact actions, resources and the Approve and Reject buttons), **Projects** (each project opens to its live IAM grants, with Revoke and Delete) and **Settings** (notifications and devices, agent keys, account and sign out). Tapping a notification opens that request at `/requests/<id>` (or `/connect/<code>`). If you're signed out, you go back to it after signing in.
 
 **What notifications contain.** Only the project name, the request number and how many actions it asks for, so nothing sensitive shows on a lock screen. The reason, actions and resources appear only in the signed-in app. Nothing can be approved from a notification.
 
-**Delivery.** When an agent asks for something, the Lambda sends to every device in parallel. It retries a timeout, 429 or 5xx once, then gives up; the Lambda can't queue work after it responds. Devices the push service reports as gone (404/410) are removed. Other failures are recorded per device and shown on the Notifications screen. Every send logs a JSON line (`"event": "push"`) to CloudWatch with the outcome and HTTP status. A missed notification never loses a request: the Requests screen always lists everything pending. Browsers that rotate a subscription re-register it themselves, as does the app whenever it opens.
+**Delivery.** When an agent asks for something, the Lambda sends to every device in parallel. It retries a timeout, 429 or 5xx once, then gives up; the Lambda can't queue work after it responds. Devices the push service reports as gone (404/410) are removed. Other failures are recorded per device and shown under Settings. Every send logs a JSON line (`"event": "push"`) to CloudWatch with the outcome and HTTP status. A missed notification never loses a request: the Requests screen always lists everything pending. Browsers that rotate a subscription re-register it themselves, as does the app whenever it opens.
 
 **Live updates.** Every signed-in screen keeps itself current without a reload. While the page is visible it asks `GET /poll` (session-authenticated, a fingerprint of requests, connects, keys and devices) every 10 seconds, and again whenever the app regains focus, becomes visible or a push notification arrives; when the fingerprint changes it re-fetches the screen and swaps the content in place. Approve, reject, revoke and delete submit in the page the same way. A refresh never interrupts you: it waits while you're typing, confirming, submitting or looking at a new key.
 
@@ -112,7 +112,7 @@ Tell an agent which project to use in the prompt or in the repo's `CLAUDE.md`/`A
 
 The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `apm wait`, `apm use`. Claude Code puts the plugin's `bin/apm` on the agent's PATH.
 
-**When something goes wrong** (bad deploy, damaged data, a leaked key, session or device), see [docs/operations.md](docs/operations.md): deploy, rollback, table restore and secret rotation. [docs/v1-acceptance.md](docs/v1-acceptance.md) is the end-to-end check run before a release.
+**When something goes wrong** (bad deploy, damaged data, a leaked key, session or device), see [docs/operations.md](docs/operations.md): deploy, rollback, table restore and secret rotation. [docs/v1-acceptance.md](docs/v1-acceptance.md) is the end-to-end check run before the V1 release, and [docs/acceptance.md](docs/acceptance.md) the check to re-run after the dashboard redesign.
 
 ## Security notes
 

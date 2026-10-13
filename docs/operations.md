@@ -141,9 +141,9 @@ After reopening:
 
 | What | Do this | Effect |
 |---|---|---|
-| An agent API key | **Keys** → Delete it. Then reconnect that machine (`connect` tool or `apm login`). | The key stops working on its next call. Credentials it already fetched last up to 1 hour, but only with each role's current permissions. To cut those off now, revoke the grants they could use. |
+| An agent API key | **Settings** → Agent keys → Delete it. Then reconnect that machine (`connect` tool or `apm login`). | The key stops working on its next call. Credentials it already fetched last up to 1 hour, but only with each role's current permissions. To cut those off now, revoke the grants they could use. |
 | A grant was too broad | **Projects** → Revoke it. | The role's policy changes immediately, and that applies to sessions already issued too. |
-| Your phone or a browser session | In this order: 1) secure the email account, since sign-in codes go there; 2) in the WorkOS dashboard (production environment), revoke your user's sessions; 3) **Notifications** → Remove the device; 4) rotate the session secret (below). | Rotating last means the stolen device can't sign back in and get a new apm cookie in between. |
+| Your phone or a browser session | In this order: 1) secure the email account, since sign-in codes go there; 2) in the WorkOS dashboard (production environment), revoke your user's sessions; 3) **Settings** → Notifications → Remove the device; 4) rotate the session secret (below). | Rotating last means the stolen device can't sign back in and get a new apm cookie in between. |
 | The session secret | Rotate it as below. | All dashboard sessions end. |
 
 Rotate the session secret (the value is generated locally and never printed):
