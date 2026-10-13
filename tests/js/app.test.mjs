@@ -85,9 +85,9 @@ test("a page-driven key rotation the server didn't accept is dropped, not kept",
 });
 
 test("a live refresh waits until the owner isn't mid-task", () => {
-  const idle = { visible: true, online: true, busy: false, dialogOpen: false, typing: false, secret: false };
+  const idle = { visible: true, online: true, busy: false, dialogOpen: false, typing: false, dirty: false, secret: false };
   assert.equal(app.canRefresh(idle), true);
-  for (const block of [{ visible: false }, { online: false }, { busy: true }, { dialogOpen: true }, { typing: true }, { secret: true }]) {
+  for (const block of [{ visible: false }, { online: false }, { busy: true }, { dialogOpen: true }, { typing: true }, { dirty: true }, { secret: true }]) {
     assert.equal(app.canRefresh({ ...idle, ...block }), false, JSON.stringify(block));
   }
 });

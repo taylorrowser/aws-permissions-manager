@@ -61,19 +61,25 @@ def _flash(msg):
     return f'<p class="{cls}" role="status" tabindex="-1" id="flash">{e(msg)}</p>'
 
 
-def layout(app, owner, active, title, body, msg="", heading=None):
+def state(app):
+    """Call first in every page: (fingerprint, pending count) read before the body, so anything
+    that changes while rendering shows up on the next poll (see web.state_version)."""
+    from .web import state_version
+    return state_version(app.store)
+
+
+def layout(app, owner, active, title, body, state, msg="", heading=None):
     """The app shell. The body never scrolls: only <main> does, so the tab bar stays put on iOS
     (no position:fixed, no viewport units). Elements marked data-live are replaced in place by
     the page script when something changes (see /poll); data-keep elements inside them survive."""
-    from .web import state_version
-    pending = len(app.store.list(status="pending")) + len(app.store.connects())
+    version, pending = state
     tabs = []
     for href, key, label in TABS:
         current = ' aria-current="page"' if key == active else ""
         count = f' <span class=count aria-label="{pending} waiting">{pending}</span>' if key == "requests" and pending else ""
         tabs.append(f'<a href="{href}"{current}>{_icon(key)}<span class=label>{label}</span>{count}</a>')
     return (_head(app, title) + f'<body data-page="{e(active)}" data-pending="{pending}" '
-            f'data-version="{state_version(app.store)}" data-vapid="{e(app.s.vapid_public)}">'
+            f'data-version="{version}" data-vapid="{e(app.s.vapid_public)}">'
             '<a class=skip href="#main">Skip to content</a>'
             '<header class=top><a class=brand href="/"><img src="/icon-192.png" alt="" width=28 height=28>'
             f'<span>AWS Permissions</span></a>{_stage(app)}'
@@ -201,7 +207,7 @@ def _status_chip(status):
 
 
 def requests_page(app, owner, msg=""):
-    store = app.store
+    st, store = state(app), app.store
     pending, connects, projects = store.list(status="pending"), store.connects(), store.projects()
     out = ['<p class="nudge" id="push-nudge" hidden><a href="/devices">Turn on notifications</a> on this device '
            'to hear about new requests.</p>']
@@ -222,11 +228,11 @@ def requests_page(app, owner, msg=""):
         out.append("</ul>")
     n = len(pending) + len(connects)
     heading = f"Requests ({n})" if n else "Requests"
-    return layout(app, owner, "requests", "Requests", "".join(out), msg, heading)
+    return layout(app, owner, "requests", "Requests", "".join(out), st, msg, heading)
 
 
 def request_page(app, owner, r, msg=""):
-    rid = r["id"]
+    st, rid = state(app), r["id"]
     body = []
     if r["status"] != "pending":
         when = _time(r["decided_at"])
@@ -235,10 +241,11 @@ def request_page(app, owner, r, msg=""):
                     + (' See it in <a href="/projects">Projects</a>.' if r["status"] == "approved" else "") + "</p>")
     body.append(request_card(app, r, app.store.projects(), back=f"/requests/{rid}"))
     body.append('<p><a href="/">← All requests</a></p>')
-    return layout(app, owner, "requests", f"Request #{rid}", "".join(body), msg)
+    return layout(app, owner, "requests", f"Request #{rid}", "".join(body), st, msg)
 
 
 def connect_page(app, owner, code, msg=""):
+    st = state(app)
     match = [c for c in app.store.connects() if c["code"] == code]
     if match:
         body = connect_card(match[0], back=f"/connect/{code}")
@@ -246,13 +253,13 @@ def connect_page(app, owner, code, msg=""):
         body = ('<div class=empty><p><b>This connect request is no longer waiting.</b></p><p class=muted>It was '
                 'approved, rejected or expired (they last 15 minutes). If the agent still needs access, start '
                 'connecting again from the agent.</p></div>')
-    return layout(app, owner, "requests", "Connect an agent", body + '<p><a href="/">← All requests</a></p>', msg)
+    return layout(app, owner, "requests", "Connect an agent", body + '<p><a href="/">← All requests</a></p>', st, msg)
 
 
 # ---------- projects ----------
 
 def projects_page(app, owner, msg=""):
-    store, broker = app.store, app.broker
+    st, store, broker = state(app), app.store, app.broker
     projects = store.projects()
     out = ['<p class=muted>Each project is an IAM role agents can use. Grants are read live from IAM.</p>']
     if not projects:
@@ -295,7 +302,7 @@ def projects_page(app, owner, msg=""):
                    + _form({"op": "remove_project", "project": project}, f"Delete {project}", "danger",
                            f"Delete project {project} and all its grants?", "/projects")
                    + "</details></article>")
-    return layout(app, owner, "projects", "Projects", "".join(out), msg)
+    return layout(app, owner, "projects", "Projects", "".join(out), st, msg)
 
 
 # ---------- notifications ----------
@@ -320,7 +327,7 @@ def _health(s):
 
 
 def devices_page(app, owner, msg=""):
-    subs = app.store.subscriptions()
+    st, subs = state(app), app.store.subscriptions()
     # data-keep: this card is driven by the page script, so live refreshes leave it alone.
     out = ['<section class=card id=this-device data-keep aria-labelledby=this-device-t>'
            '<h2 id=this-device-t>This device</h2>'
@@ -355,13 +362,13 @@ def devices_page(app, owner, msg=""):
                'opens the request; you may need to sign in first. Nothing is approved from a notification.</p>'
                '<p>Devices that the browser has unsubscribed are removed automatically the next time a notification '
                'is sent. A device that keeps failing shows the error above.</p></details>')
-    return layout(app, owner, "devices", "Notifications", "".join(out), msg)
+    return layout(app, owner, "devices", "Notifications", "".join(out), st, msg)
 
 
 # ---------- keys ----------
 
 def keys_page(app, owner, msg="", new_key=None):
-    out = []
+    st, out = state(app), []
     if new_key:
         out.append('<section class="card new-key" aria-labelledby=new-key-t><h2 id=new-key-t>Copy your new key now</h2>'
                    "<p>It won't be shown again.</p>"
@@ -389,7 +396,7 @@ def keys_page(app, owner, msg="", new_key=None):
                '<input type="text" id=key-name name="name" placeholder="e.g. macbook" maxlength="40" required '
                'autocomplete=off autocapitalize=off>'
                '<button class=primary>Create key</button></div></form>')
-    return layout(app, owner, "keys", "Agent API keys", "".join(out), msg)
+    return layout(app, owner, "keys", "Agent API keys", "".join(out), st, msg)
 
 
 def _list(v):

@@ -80,9 +80,10 @@ async function rotateIfKeyChanged(registration, key, register) {
 }
 
 // Whether a background refresh may replace what's on screen right now. Never while the owner is
-// mid-task: typing, confirming, submitting, looking at a new key, or while offline or hidden.
+// mid-task: typing (or with unsaved text in a field), confirming, submitting, looking at a new
+// key, or while offline or hidden.
 function canRefresh(s) {
-  return Boolean(s.visible && s.online && !s.busy && !s.dialogOpen && !s.typing && !s.secret);
+  return Boolean(s.visible && s.online && !s.busy && !s.dialogOpen && !s.typing && !s.dirty && !s.secret);
 }
 
 if (typeof module !== "undefined") {
@@ -174,15 +175,23 @@ if (typeof document !== "undefined") {
     document.querySelector("#flash-slot .flash")?.focus({ preventScroll: true });
   }
 
+  // A background refresh is checked again when its response arrives: the owner may have started
+  // typing, opened a confirm or submitted something meanwhile, and a submit's own response
+  // (which bumps `generation`) must never be overwritten by an older page.
+  let generation = 0;
   async function refresh() {
     if (!signedIn) return;
+    const started = generation;
     const resp = await fetch(location.pathname, { credentials: "same-origin", headers: { Accept: "text/html" } });
-    if (resp.ok) apply(await resp.text());
+    if (!resp.ok) return;
+    const html = await resp.text();
+    if (started === generation && canRefresh(state())) apply(html);
   }
 
   const state = () => ({
     visible: document.visibilityState === "visible", online: navigator.onLine, busy,
     dialogOpen: Boolean($("confirm")?.open), typing: Boolean(document.activeElement?.matches("input,textarea")),
+    dirty: [...document.querySelectorAll("input[type=text],textarea")].some((i) => i.value !== ""),
     secret: Boolean(document.querySelector(".secret")),
   });
 
@@ -237,8 +246,8 @@ if (typeof document !== "undefined") {
     const label = button?.textContent;
     if (button) { button.disabled = true; button.textContent += "…"; }
     busy = true;
-    const li = form.closest("[data-device]");
-    if (li && li.dataset.device === thisDevice) unsubscribeHere?.(); // or the browser re-registers it
+    generation++; // any background refresh in flight is now stale
+    const removingHere = form.closest("[data-device]")?.dataset.device === thisDevice;
     try {
       const resp = await fetch(form.action, { method: "POST", credentials: "same-origin",
         headers: { Accept: "text/html" }, body: new URLSearchParams(new FormData(form)) });
@@ -247,6 +256,7 @@ if (typeof document !== "undefined") {
       // A direct 200 (a new key) and a redirect back here are applied in place.
       if (resp.redirected && new URL(resp.url).pathname !== location.pathname) { location.replace(resp.url); return; }
       if (!resp.ok) { flash(errorText(html) || `That didn't save (HTTP ${resp.status}). Reload and try again.`, true); return; }
+      if (removingHere) unsubscribeHere?.(); // the server dropped this device; the browser must too, or it re-registers
       apply(html);
     } catch (_) {
       flash("Couldn't reach the server. Check your connection and try again.", true);
@@ -393,7 +403,12 @@ if (typeof document !== "undefined") {
         console.warn("couldn't sync push subscription", err);
       }
     }
-    unsubscribeHere = () => { sub?.unsubscribe().catch(() => {}); sub = null; thisDevice = null; };
+    unsubscribeHere = () => {
+      sub?.unsubscribe().catch(() => {});
+      sub = null;
+      thisDevice = null;
+      render("off", "This device was removed from notifications. Turn them on again to get alerts here.");
+    };
     state = pushState({ ...e, subscribed: Boolean(sub) });
     if ($("push-nudge")) $("push-nudge").hidden = state !== "off";
     render(state, removedHere ? "This device was removed from notifications. Turn them on again to get alerts here." : undefined);

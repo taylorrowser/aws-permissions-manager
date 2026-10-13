@@ -1,6 +1,7 @@
 """The installable web app: screens, deep links through sign-in, caching rules, push sign-up and
 notification delivery. Service worker and page-script tests are in tests/js (run with node)."""
 import json
+import re
 import shutil
 import subprocess
 import unittest
@@ -190,6 +191,21 @@ class PollTests(Base):
         before = json.loads(self.get("/poll").body)["v"]
         self.app(web.Request("GET", "/api/whoami", headers={"Authorization": f"Bearer {self.key}"}))
         self.assertEqual(json.loads(self.get("/poll").body)["v"], before)
+
+    def test_page_fingerprint_is_read_before_its_content(self):
+        # A request that lands while a page renders must show up on the next poll, so the page's
+        # fingerprint must predate its content (otherwise the request stays hidden until the next change).
+        original, added = self.app.store.list, []
+
+        def list_and_add_once(*a, **kw):
+            rows = original(*a, **kw)
+            if not added:
+                added.append(self.agent_request())
+            return rows
+        with mock.patch.object(self.app.store, "list", side_effect=list_and_add_once):
+            body = self.get("/").body
+        version = re.search(r'data-version="([^"]+)"', body).group(1)
+        self.assertNotEqual(version, json.loads(self.get("/poll").body)["v"])
 
     def test_poll_needs_a_session(self):
         resp = self.get("/poll", owner=False)

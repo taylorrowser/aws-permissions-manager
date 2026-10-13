@@ -206,8 +206,8 @@ class App:
             # Polled by open pages (session-authenticated) to learn when something changed.
             if not owner:
                 raise ApiError(401, "signed out")
-            pending = len(self.store.list(status="pending")) + len(self.store.connects())
-            return json_response({"v": state_version(self.store), "pending": pending})
+            version, pending = state_version(self.store)
+            return json_response({"v": version, "pending": pending})
         if m == "GET" and SCREENS.fullmatch(p):
             if not owner:
                 return Response(200, pages.login_page(self, req.query.get("error", ""), p))
@@ -569,14 +569,17 @@ def _matches(term, item):
 
 
 def state_version(store):
-    """Fingerprint of everything the screens show, so an open page can tell when to refresh.
-    Key usage times are left out: an agent polling its request would refresh the page every
-    few seconds for nothing."""
-    state = [[(r["id"], r["status"], r["digest"], r.get("decided_at")) for r in store.list()],
-             [(c["code"], c["status"]) for c in store.connects()],
+    """(fingerprint, pending count) of everything the screens show, read once, so an open page
+    can tell when to refresh. Key usage times are left out: an agent polling its request would
+    refresh the page every few seconds for nothing. Pages compute this *before* rendering, so a
+    change that lands mid-render makes the next poll differ and refresh, never hide it."""
+    requests, connects = store.list(), store.connects()
+    state = [[(r["id"], r["status"], r["digest"], r.get("decided_at")) for r in requests],
+             [(c["code"], c["status"]) for c in connects],
              [k["pk"] for k in store.keys()],
              [(s["pk"], s.get("last_ok_at"), s.get("last_error_at"), s.get("failures")) for s in store.subscriptions()]]
-    return hashlib.sha256(json.dumps(state, default=str).encode()).hexdigest()[:16]
+    pending = sum(1 for r in requests if r["status"] == "pending") + len(connects)
+    return hashlib.sha256(json.dumps(state, default=str).encode()).hexdigest()[:16], pending
 
 
 def _public(r):
