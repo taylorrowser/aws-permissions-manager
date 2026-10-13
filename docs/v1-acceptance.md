@@ -19,8 +19,8 @@ This run approves and revokes real grants and creates and deletes a key and a de
 
 | # | Step | Expected | Result |
 |---|---|---|---|
-| 1 | iPhone: open https://apm.taylorrowser.com in Safari, sign in, Share → Add to Home Screen, then open the app from the Home Screen icon | Signed in, three tabs (Requests, Projects, Settings) | NOT RUN |
-| 2 | Settings → Turn on notifications → Allow | A test notification arrives; the device is listed | NOT RUN |
+| 1 | iPhone: open https://apm.taylorrowser.com in Safari, sign in, Share → Add to Home Screen, then open the app from the Home Screen icon | Signed in, four tabs | NOT RUN |
+| 2 | Notifications → Turn on notifications → Allow | A test notification arrives; the device is listed | NOT RUN |
 | 3 | Lock the phone | | NOT RUN |
 | 4 | In a fresh agent session on a machine with no key (or after deleting its key), ask the agent to connect; approve on the phone after checking the code | Connect push arrives; agent reports connected; `list_projects` works | NOT RUN |
 | 5 | Ask the agent to request `s3:ListAllMyBuckets` on `*` for a new project `v1check`, and to send a second, duplicate request | Lock screen shows only project, request number and action count. Tapping it opens `/requests/<id>` | NOT RUN |

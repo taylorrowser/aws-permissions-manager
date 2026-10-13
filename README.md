@@ -112,7 +112,7 @@ Tell an agent which project to use in the prompt or in the repo's `CLAUDE.md`/`A
 
 The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `apm wait`, `apm use`. Claude Code puts the plugin's `bin/apm` on the agent's PATH.
 
-**When something goes wrong** (bad deploy, damaged data, a leaked key, session or device), see [docs/operations.md](docs/operations.md): deploy, rollback, table restore and secret rotation. [docs/v1-acceptance.md](docs/v1-acceptance.md) is the end-to-end check run before a release.
+**When something goes wrong** (bad deploy, damaged data, a leaked key, session or device), see [docs/operations.md](docs/operations.md): deploy, rollback, table restore and secret rotation. [docs/v1-acceptance.md](docs/v1-acceptance.md) is the end-to-end check run before the V1 release, and [docs/acceptance.md](docs/acceptance.md) the check to re-run after the dashboard redesign.
 
 ## Security notes
 
