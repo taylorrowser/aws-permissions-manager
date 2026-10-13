@@ -1,0 +1,15 @@
+{
+  "simulation_only": true,
+  "passed": false,
+  "status": "rendered_browser_blocked",
+  "failure": "Standalone Chromium process_singleton_posix.cc socket() failed: Operation not permitted before navigation; an admitted escalated launch had the same runtime failure. Supported existing cloud browser then blocked loopback navigation with net::ERR_BLOCKED_BY_CLIENT.",
+  "historical_screenshot_reused": false,
+  "session_bodies_saved": false,
+  "supported_cloud_browser": {
+    "attempted": true,
+    "project_authorization_confirmed": true,
+    "navigation": "loopback synthetic recovery fixture",
+    "error": "net::ERR_BLOCKED_BY_CLIENT",
+    "fallback_host_exposed": false
+  }
+}

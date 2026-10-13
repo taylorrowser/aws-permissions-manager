@@ -1,0 +1,70 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "REVIEW ONLY. Deliberately blocked CloudFormation design; placeholders and missing deployment integration. Never deploy this file.",
+  "Metadata": {
+    "DeploymentReady": false,
+    "Authentication": "Separate WorkOS request and human-browser owner clients. Handler must bind issuer, audience, client, owner/org, actor class, session and manifest digest. IAM alone does not prove a human approval.",
+    "Execution": "No executor HTTP route. Administrator-preprovisioned revision-specific role identities are pinned. Durable fencing, change journal, recovery and propagation gates remain prerequisites.",
+    "State": "All ARNs below are review placeholders, not real account configuration. Separate tables stand for separate authority boundaries. No runtime can alter ceiling, capabilities, catalog, owner authentication or runtime roles.",
+    "IAMObservation": "Vendor role has STS only for AWS authorization and lease-table access. A separately authenticated read-only observation service or executor identity must implement the injected IAM observer; do not silently add IAM access to vendor.",
+    "SAM": "Lambda/API/SAM wiring is intentionally absent. No functions, code URIs, deployment bucket, API routes or live credentials are provided."
+  },
+  "Parameters": {
+    "ReviewOnlyAcknowledgement": {"Type": "String", "Default": "DO-NOT-DEPLOY", "AllowedValues": ["DO-NOT-DEPLOY"]}
+  },
+  "Rules": {
+    "DeploymentIsIntentionallyBlocked": {
+      "Assertions": [{"Assert": {"Fn::Equals": [{"Ref": "ReviewOnlyAcknowledgement"}, "DEPLOYMENT-IS-NOT-SUPPORTED"]}, "AssertDescription": "Review-only design with unresolved security and infrastructure prerequisites; deployment is intentionally impossible."}]
+    }
+  },
+  "Resources": {
+    "RequestRuntimeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]},
+        "Policies": [{"PolicyName": "RequestSubmissionOnly", "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+          {"Effect": "Allow", "Action": ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:Query"], "Resource": "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Requests"},
+          {"Effect": "Allow", "Action": ["dynamodb:GetItem"], "Resource": "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_PublicReadModel"},
+          {"Effect": "Deny", "Action": ["iam:*", "sts:AssumeRole", "lambda:InvokeFunction", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"], "Resource": ["arn:aws:iam::000000000000:role/*", "arn:aws:lambda:REVIEW_REGION:000000000000:function/*", "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Decisions", "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Capabilities", "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Ceilings"]}
+        ]}}]
+      }
+    },
+    "OwnerDecisionRuntimeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]},
+        "Policies": [{"PolicyName": "VerifiedHumanDecisionOnly", "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+          {"Effect": "Allow", "Action": ["dynamodb:GetItem"], "Resource": "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Requests"},
+          {"Effect": "Allow", "Action": ["dynamodb:PutItem", "dynamodb:GetItem"], "Resource": "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Decisions"},
+          {"Effect": "Deny", "Action": ["iam:*", "sts:AssumeRole", "lambda:InvokeFunction"], "Resource": "*"}
+        ]}}]
+      }
+    },
+    "PermissionExecutorRuntimeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]},
+        "Policies": [{"PolicyName": "PinnedRevisionInitializationOnly", "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+          {"Effect": "Allow", "Action": ["dynamodb:GetItem"], "Resource": ["arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Requests", "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Decisions", "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_AdminCatalog", "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Capabilities", "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Ceilings"]},
+          {"Effect": "Allow", "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"], "Resource": ["arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Fences", "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_ExecutionJournal"]},
+          {"Effect": "Allow", "Action": ["iam:GetRole", "iam:ListRolePolicies", "iam:GetRolePolicy", "iam:ListAttachedRolePolicies"], "Resource": "arn:aws:iam::000000000000:role/REVIEW_BrokerRevisions/REVIEW_EXACT_REVISION"},
+          {"Effect": "Allow", "Action": ["iam:GetPolicy", "iam:GetPolicyVersion"], "Resource": "arn:aws:iam::000000000000:policy/REVIEW_AdminOwnedCeiling"},
+          {"Effect": "Allow", "Action": "iam:PutRolePolicy", "Resource": "arn:aws:iam::000000000000:role/REVIEW_BrokerRevisions/REVIEW_EXACT_REVISION"},
+          {"Effect": "Deny", "Action": ["sts:AssumeRole", "iam:PassRole", "iam:CreateRole", "iam:DeleteRole", "iam:UpdateAssumeRolePolicy", "iam:PutRolePermissionsBoundary", "iam:DeleteRolePermissionsBoundary", "iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion", "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:TagRole", "iam:UntagRole"], "Resource": "*"}
+        ]}}]
+      }
+    },
+    "AssumeOnlyVendorRuntimeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]},
+        "Policies": [{"PolicyName": "ApprovedLeaseVendingOnly", "PolicyDocument": {"Version": "2012-10-17", "Statement": [
+          {"Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "arn:aws:iam::000000000000:role/REVIEW_BrokerRevisions/REVIEW_EXACT_REVISION"},
+          {"Effect": "Allow", "Action": ["dynamodb:GetItem"], "Resource": "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_ActiveGrantReadModel"},
+          {"Effect": "Allow", "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"], "Resource": "arn:aws:dynamodb:REVIEW_REGION:000000000000:table/REVIEW_Leases"},
+          {"Effect": "Deny", "Action": ["iam:*", "ec2:*", "lambda:InvokeFunction"], "Resource": "*"}
+        ]}}]
+      }
+    }
+  }
+}

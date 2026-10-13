@@ -1,0 +1,24 @@
+{
+  "preserved_original_candidate_files": 18,
+  "all_identical": true,
+  "files": {
+    "run_tests.py": true,
+    ".gitignore": true,
+    "README.md": true,
+    "dashboard.html": true,
+    "broker.py": true,
+    "executor.py": true,
+    "demo.py": true,
+    "browser_recovery.py": true,
+    "qa_fixture_server.py": true,
+    "browser_smoke.py": true,
+    "server.py": true,
+    "evidence/demo-results.json": true,
+    "evidence/release-manifest.json": true,
+    "evidence/test-results.json": true,
+    "evidence/browser-results.json": true,
+    "tests/test_broker.py": true,
+    "tests/test_recovery_http.py": true,
+    "tests/test_rebuild_regressions.py": true
+  }
+}

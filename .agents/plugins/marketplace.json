@@ -1,0 +1,12 @@
+{
+  "name": "taylorrowser",
+  "interface": { "displayName": "Taylor Rowser" },
+  "plugins": [
+    {
+      "name": "aws-permissions",
+      "source": { "source": "local", "path": "./plugins/aws-permissions" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Developer Tools"
+    }
+  ]
+}

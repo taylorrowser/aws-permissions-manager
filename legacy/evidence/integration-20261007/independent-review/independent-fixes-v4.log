@@ -1,0 +1,26 @@
+/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+  from starlette.testclient import TestClient as TestClient  # noqa
+test_aws_lifetime_boundaries_reject_before_admission (__main__.Fixed.test_aws_lifetime_boundaries_reject_before_admission) ... ok
+test_cancel_never_frees_unknown_write (__main__.Fixed.test_cancel_never_frees_unknown_write) ... ok
+test_concurrent_browser_decision_single_effect (__main__.Fixed.test_concurrent_browser_decision_single_effect) ... ok
+test_concurrent_request_idempotency_one_row (__main__.Fixed.test_concurrent_request_idempotency_one_row) ... ok
+test_credential_handle_parallel_redemption_exactly_one (__main__.Fixed.test_credential_handle_parallel_redemption_exactly_one) ... ok
+test_cross_actor_request_grant_and_lease_denied (__main__.Fixed.test_cross_actor_request_grant_and_lease_denied) ... ok
+test_invalid_receipt_durable_state_and_stale_finalization (__main__.Fixed.test_invalid_receipt_durable_state_and_stale_finalization) ... ok
+test_long_role_stays_within_aws_bound (__main__.Fixed.test_long_role_stays_within_aws_bound) ... ok
+test_mcp_reads_pure_no_credential_tools (__main__.Fixed.test_mcp_reads_pure_no_credential_tools) ... /opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/site-packages/pydantic_settings/sources/utils.py:47: IncompleteFieldDefinitionWarning: Field 'lifespan' has an incomplete definition: its annotation contains an unresolved forward reference, so settings sources may fail to correctly resolve its value. Call `model_rebuild()` on the model where the field is defined, once all the referenced types are defined.
+  warnings.warn(
+ok
+test_missed_activation_recovers_only_by_human_cancel (__main__.Fixed.test_missed_activation_recovers_only_by_human_cancel) ... ok
+test_pinned_same_policy_other_arn_never_reaches_sts (__main__.Fixed.test_pinned_same_policy_other_arn_never_reaches_sts) ... ok
+test_pure_reads_after_unknown_outcome_do_not_reconcile (__main__.Fixed.test_pure_reads_after_unknown_outcome_do_not_reconcile) ... ok
+test_rpc_reflections_scrubbed_and_logs_quiet (__main__.Fixed.test_rpc_reflections_scrubbed_and_logs_quiet) ... ok
+test_run_renewal_current_guard_syncs_and_rejects_forgery (__main__.Fixed.test_run_renewal_current_guard_syncs_and_rejects_forgery) ... ok
+test_stale_browser_form_and_same_owner_bearer_cannot_approve (__main__.Fixed.test_stale_browser_form_and_same_owner_bearer_cannot_approve) ... ok
+test_stop_is_not_undone_by_temporary_restoration (__main__.Fixed.test_stop_is_not_undone_by_temporary_restoration) ... ok
+test_stopped_grant_blocks_existing_prepared_handle (__main__.Fixed.test_stopped_grant_blocks_existing_prepared_handle) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 2.469s
+
+OK

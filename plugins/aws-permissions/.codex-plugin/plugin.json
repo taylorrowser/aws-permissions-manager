@@ -1,0 +1,15 @@
+{
+  "name": "aws-permissions",
+  "version": "0.3.1",
+  "description": "Scoped, owner-approved AWS access for agents: find a project, get its AWS profile, request new permissions.",
+  "author": { "name": "Taylor Rowser" },
+  "repository": "https://github.com/taylorrowser/aws-permissions-manager",
+  "keywords": ["aws", "iam", "permissions", "mcp"],
+  "skills": "./skills/",
+  "mcpServers": "./codex-mcp.json",
+  "interface": {
+    "displayName": "AWS Permissions",
+    "shortDescription": "Owner-approved AWS access for agents",
+    "category": "Developer Tools"
+  }
+}
