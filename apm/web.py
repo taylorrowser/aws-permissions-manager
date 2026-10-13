@@ -1,7 +1,7 @@
 """The hosted service: one Lambda behind API Gateway at https://$DOMAIN.
 
-- Owner dashboard (installable web app): WorkOS AuthKit sign-in, approve/reject/revoke, API keys,
-  push notification devices.
+- Owner dashboard (installable web app): WorkOS AuthKit sign-in, approve/reject/revoke, projects,
+  and settings (push notification devices, API keys, account).
 - Agent API (Bearer API key): list projects and grants, request permissions, check requests,
   get short-lived credentials for a project role.
 """
@@ -42,7 +42,7 @@ ASSET_VERSION = hashlib.sha256(b"".join((STATIC / n).read_bytes() for n, _ in ST
 # Checked by the browser on every start, so app updates arrive the next time the app opens.
 REVALIDATE = {"/sw.js", "/manifest.webmanifest", "/offline.html"}
 # Owner screens. Signed-out visits show the sign-in page and come back here after signing in.
-SCREENS = re.compile(r"/(projects|devices|keys|requests/[0-9]{1,12}|connect/[A-Z0-9]{4}-[A-Z0-9]{4})?")
+SCREENS = re.compile(r"/(projects|settings|devices|keys|requests/[0-9]{1,12}|connect/[A-Z0-9]{4}-[A-Z0-9]{4})?")
 SESSION_COOKIE = "__Host-apm_session"
 OAUTH_COOKIE = "__Host-apm_oauth"
 SESSION_SECONDS = 30 * 24 * 3600
@@ -252,8 +252,9 @@ class App:
             return Response(200, pages.request_page(self, owner, r, msg, st))
         if p.startswith("/connect/"):
             return Response(200, pages.connect_page(self, owner, p.rsplit("/", 1)[1], msg))
-        view = {"/": pages.requests_page, "/projects": pages.projects_page,
-                "/devices": pages.devices_page, "/keys": pages.keys_page}[p]
+        if p in ("/devices", "/keys"):  # old screens (and old notification links): now under Settings
+            return redirect("/settings")
+        view = {"/": pages.requests_page, "/projects": pages.projects_page, "/settings": pages.settings_page}[p]
         return Response(200, view(self, owner, msg))
 
     # ----- owner auth (WorkOS AuthKit, PKCE) -----
@@ -306,7 +307,7 @@ class App:
             if op == "create_key":
                 name = re.sub(r"[^A-Za-z0-9 ._@-]", "", form.get("name", "")).strip()[:40] or "agent"
                 secret = self.store.create_key(name)
-                return Response(200, pages.keys_page(self, owner, f"Created API key {name!r}.", new_key=secret))
+                return Response(200, pages.settings_page(self, owner, f"Created API key {name!r}.", new_key=secret))
             msg = self.decide(form)
             # A decided request has nothing left to do on its own page; go back to the list.
             if op in ("approve", "reject") and back.startswith("/requests/"):
@@ -450,7 +451,7 @@ class App:
             if not self.s.vapid_private:
                 raise ApiError(503, "push isn't configured on the server (no VAPID private key)")
             results = self.notify({"title": "AWS Permissions", "body": "Test notification: this device will be "
-                                   "notified of new requests.", "url": "/devices", "tag": "test"}, only=only, ttl=300)
+                                   "notified of new requests.", "url": "/settings", "tag": "test"}, only=only, ttl=300)
             return json_response({"results": [{"device": pk, "outcome": o, "status": st}
                                               for pk, (o, st) in results.items()]})
         raise ApiError(404, "unknown endpoint")

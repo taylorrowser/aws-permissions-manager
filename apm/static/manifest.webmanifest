@@ -18,6 +18,6 @@
   ],
   "shortcuts": [
     {"name": "Requests", "url": "/", "icons": [{"src": "/icon-192.png", "sizes": "192x192"}]},
-    {"name": "Notifications", "url": "/devices", "icons": [{"src": "/icon-192.png", "sizes": "192x192"}]}
+    {"name": "Settings", "url": "/settings", "icons": [{"src": "/icon-192.png", "sizes": "192x192"}]}
   ]
 }

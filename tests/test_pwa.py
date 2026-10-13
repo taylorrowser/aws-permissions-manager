@@ -45,21 +45,26 @@ class Base(unittest.TestCase):
 class ScreenTests(Base):
     def test_every_screen_renders_for_the_owner(self):
         rid = self.agent_request()
-        for path, heading in [("/", "Requests (1)"), ("/projects", "Projects"), ("/devices", "Notifications"),
-                              ("/keys", "Agent API keys"), (f"/requests/{rid}", f"Request #{rid}"),
-                              ("/connect/ABCD-EFGH", "Connect an agent")]:
+        for path, heading in [("/", "Requests"), ("/projects", "Projects"), ("/settings", "Settings"),
+                              (f"/requests/{rid}", f"Request #{rid}"), ("/connect/ABCD-EFGH", "Connect an agent")]:
             with self.subTest(path=path):
                 resp = self.get(path)
                 self.assertEqual(resp.status, 200)
                 self.assertIn(f">{heading}</h1>", resp.body)
                 self.assertIn('aria-current="page"', resp.body)
+        self.assertIn('data-pending="1"', self.get("/").body)
+
+    def test_old_notifications_and_keys_links_land_on_settings(self):
+        for path in ["/devices", "/keys"]:
+            resp = self.get(path)
+            self.assertEqual((resp.status, resp.headers["Location"]), (303, "/settings"), path)
 
     def test_signed_out_screens_show_sign_in_that_returns_there(self):
-        for path in ["/", "/projects", "/devices", "/keys", "/requests/7", "/connect/ABCD-EFGH"]:
+        for path in ["/", "/projects", "/settings", "/requests/7", "/connect/ABCD-EFGH"]:
             with self.subTest(path=path):
                 body = self.get(path, owner=False).body
                 self.assertIn("Sign in", body)
-                self.assertNotIn("Requests (", body)
+                self.assertNotIn("data-pending", body)
                 if path != "/":
                     self.assertIn(f'href="/login?next={path.replace("/", "%2F")}"', body)
 
@@ -88,8 +93,8 @@ class ScreenTests(Base):
         r = self.app.store.get(rid)
         resp = self.action({"op": "reject", "id": rid, "digest": r["digest"], "back": "https://evil.test"})
         self.assertTrue(resp.headers["Location"].startswith("/?msg="))
-        resp = self.action({"op": "delete_device", "pk": "sub#x", "back": "/devices"})
-        self.assertTrue(resp.headers["Location"].startswith("/devices?msg="))
+        resp = self.action({"op": "delete_device", "pk": "sub#x", "back": "/settings"})
+        self.assertTrue(resp.headers["Location"].startswith("/settings?msg="))
 
     def test_deciding_from_the_request_screen_returns_to_the_list(self):
         rid = self.agent_request()
@@ -114,8 +119,34 @@ class ScreenTests(Base):
         self.assertIn("every DynamoDB action", body)
         self.assertIn("matches several S3 actions", body)
         self.assertIn("all resources in the account", body)
-        self.assertIn("Approving creates the project", body)
-        self.assertIn('data-confirm="Approve broad access', body)
+        self.assertIn("Approving creates project", body)
+        self.assertIn('class="chip risk-full">Full access<', body)
+        self.assertIn('data-confirm="Approve full access (dynamodb:*, s3:Get*) for web?"', body)
+        narrow = self.agent_request(actions=["s3:GetObject"], reason="read")
+        self.assertNotIn("data-confirm", self.get(f"/requests/{narrow}").body)
+
+    def test_risk_grading(self):
+        from apm.pages import risk
+        cases = [
+            (["s3:GetObject", "s3:ListBucket"], ["arn:aws:s3:::b", "arn:aws:s3:::b/*"], "read"),
+            (["s3:GetObject"], ["*"], "read"),
+            (["s3:PutObject"], ["arn:aws:s3:::b/*"], "write"),
+            (["s3:PutObject"], ["*"], "broad"),
+            (["s3:Get*"], ["arn:aws:s3:::b/*"], "broad"),
+            (["iam:PassRole"], ["arn:aws:iam::1:role/x"], "broad"),
+            (["dynamodb:*"], ["arn:aws:dynamodb:us-east-1:1:table/t"], "full"),
+            (["*"], ["*"], "full"),
+        ]
+        for actions, resources, want in cases:
+            self.assertEqual(risk(actions, resources)[0], want, (actions, resources))
+
+    def test_requests_list_leads_with_project_reason_and_risk(self):
+        rid = self.agent_request(actions=["s3:PutObject"], reason="upload the built site")
+        body = self.get("/").body
+        row = body[body.index(f'id="req-{rid}"'):body.index("</summary>", body.index(f'id="req-{rid}"'))]
+        for text in ("<b>web</b>", "upload the built site", 'class="chip risk-broad">Broad<', "1 action · S3 · all resources"):
+            self.assertIn(text, row)
+        self.assertNotIn("s3:PutObject", row)  # details stay folded until the row is opened
 
     def test_reason_and_names_are_escaped(self):
         rid = self.agent_request(reason="<script>alert(1)</script>")
@@ -130,7 +161,7 @@ class ScreenTests(Base):
         self.assertEqual(self.app(web.Request("POST", "/logout", headers={"Origin": "https://evil.test"})).status, 403)
 
     def test_every_screen_carries_the_push_key(self):
-        for path in ["/", "/projects", "/keys"]:
+        for path in ["/", "/projects", "/settings"]:
             self.assertIn('data-vapid="VAPIDPUB"', self.get(path).body)
 
     def test_stage_badge_only_outside_prod(self):
@@ -141,7 +172,7 @@ class ScreenTests(Base):
         self.assertIn("<title>[pr-12] Requests", body)
 
     def test_app_shell_keeps_the_tab_bar_out_of_the_scroll_and_marks_live_regions(self):
-        body = self.get("/devices").body
+        body = self.get("/settings").body
         self.assertLess(body.index("<main"), body.index("<nav class=tabs"))  # tabs after main: bottom bar in flow
         for region in ("title", "flash", "page", "nav"):
             self.assertIn(f"data-live={region}", body)
@@ -154,7 +185,9 @@ class ScreenTests(Base):
     def test_empty_states(self):
         self.assertIn("Nothing to review", self.get("/").body)
         self.assertIn("No projects yet", self.get("/projects").body)
-        self.assertIn("No devices get notifications yet", self.get("/devices").body)
+        self.assertIn("No devices get notifications yet", self.get("/settings").body)
+        self.app.store.delete_key(self.app.store.keys()[0]["pk"])
+        self.assertIn("No keys yet", self.get("/settings").body)
 
 
 class PollTests(Base):
@@ -230,7 +263,7 @@ class PollTests(Base):
 
 class CachingTests(Base):
     def test_signed_in_pages_and_api_are_never_cached(self):
-        for resp in [self.get("/"), self.get("/devices"), self.get("/", owner=False),
+        for resp in [self.get("/"), self.get("/settings"), self.get("/", owner=False),
                      self.app(web.Request("GET", "/api/whoami", headers={"Authorization": f"Bearer {self.key}"}))]:
             self.assertEqual(resp.lambda_result()["headers"]["Cache-Control"], "no-store")
 
@@ -287,7 +320,7 @@ class PushApiTests(Base):
 
     def test_removed_device_cannot_silently_resubscribe(self):
         _, data = self.post_json("/push/subscribe", {"subscription": SUB})
-        self.action({"op": "delete_device", "pk": data["device"], "back": "/devices"})
+        self.action({"op": "delete_device", "pk": data["device"], "back": "/settings"})
         self.assertEqual(self.app.store.subscriptions(), [])
         # The phone's browser still holds its subscription; background syncs are refused...
         self.assertEqual(self.post_json("/push/subscribe", {"subscription": SUB, "auto": True})[0], 410)
@@ -382,12 +415,12 @@ class DeliveryTests(Base):
         self.assertEqual(send.call_count, 2)
         sub = self.app.store.subscriptions()[0]
         self.assertEqual((sub["last_status"], sub["failures"]), (403, 2))
-        self.assertIn("Last notification failed (HTTP 403)", self.get("/devices").body)
+        self.assertIn("Last notification failed (HTTP 403)", self.get("/settings").body)
         with mock.patch("apm.push.send", return_value=201):
             self.agent_request()
         sub = self.app.store.subscriptions()[0]
         self.assertEqual(sub["failures"], 0)
-        self.assertIn("Last notified", self.get("/devices").body)
+        self.assertIn("Last notified", self.get("/settings").body)
 
     def test_one_bad_device_does_not_block_others(self):
         other = {**SUB, "endpoint": "https://push.example/device-2"}
