@@ -202,6 +202,12 @@ class App:
             return self.callback(req)
 
         owner = self.owner(req)
+        if p == "/poll" and m == "GET":
+            # Polled by open pages (session-authenticated) to learn when something changed.
+            if not owner:
+                raise ApiError(401, "signed out")
+            pending = len(self.store.list(status="pending")) + len(self.store.connects())
+            return json_response({"v": state_version(self.store), "pending": pending})
         if m == "GET" and SCREENS.fullmatch(p):
             if not owner:
                 return Response(200, pages.login_page(self, req.query.get("error", ""), p))
@@ -560,6 +566,17 @@ def _matches(term, item):
         if any(term in r.lower() for r in g["resources"]) or term in g["reason"].lower():
             return True
     return False
+
+
+def state_version(store):
+    """Fingerprint of everything the screens show, so an open page can tell when to refresh.
+    Key usage times are left out: an agent polling its request would refresh the page every
+    few seconds for nothing."""
+    state = [[(r["id"], r["status"], r["digest"], r.get("decided_at")) for r in store.list()],
+             [(c["code"], c["status"]) for c in store.connects()],
+             [k["pk"] for k in store.keys()],
+             [(s["pk"], s.get("last_ok_at"), s.get("last_error_at"), s.get("failures")) for s in store.subscriptions()]]
+    return hashlib.sha256(json.dumps(state, default=str).encode()).hexdigest()[:16]
 
 
 def _public(r):

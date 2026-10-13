@@ -50,7 +50,7 @@ class ScreenTests(Base):
             with self.subTest(path=path):
                 resp = self.get(path)
                 self.assertEqual(resp.status, 200)
-                self.assertIn(f"<h1>{heading}</h1>", resp.body)
+                self.assertIn(f">{heading}</h1>", resp.body)
                 self.assertIn('aria-current="page"', resp.body)
 
     def test_signed_out_screens_show_sign_in_that_returns_there(self):
@@ -139,10 +139,61 @@ class ScreenTests(Base):
         self.assertIn("class=stage", body)
         self.assertIn("<title>[pr-12] Requests", body)
 
+    def test_app_shell_keeps_the_tab_bar_out_of_the_scroll_and_marks_live_regions(self):
+        body = self.get("/devices").body
+        self.assertLess(body.index("<main"), body.index("<nav class=tabs"))  # tabs after main: bottom bar in flow
+        for region in ("title", "flash", "page", "nav"):
+            self.assertIn(f"data-live={region}", body)
+        self.assertIn("id=this-device data-keep", body)  # script-driven card survives live refreshes
+        self.assertIn("<dialog id=confirm", body)
+        css = (ROOT / "apm" / "static" / "app.css").read_text()
+        for bad in ("position:fixed", "position:sticky", "100vh", "100dvh"):
+            self.assertNotIn(bad, css)  # these move with the page on iOS; the body never scrolls instead
+
     def test_empty_states(self):
         self.assertIn("Nothing to review", self.get("/").body)
         self.assertIn("No projects yet", self.get("/projects").body)
         self.assertIn("No devices get notifications yet", self.get("/devices").body)
+
+
+class PollTests(Base):
+    def test_poll_reports_a_version_that_changes_with_the_data(self):
+        resp = self.get("/poll")
+        self.assertEqual((resp.status, resp.content_type), (200, "application/json"))
+        self.assertEqual(resp.lambda_result()["headers"]["Cache-Control"], "no-store")
+        first = json.loads(resp.body)
+        self.assertEqual(first["pending"], 0)
+        self.assertIn(f'data-version="{first["v"]}"', self.get("/").body)  # pages carry the same fingerprint
+        rid = self.agent_request()
+        after_request = json.loads(self.get("/poll").body)
+        self.assertNotEqual(after_request["v"], first["v"])
+        self.assertEqual(after_request["pending"], 1)
+        self.assertEqual(json.loads(self.get("/poll").body)["v"], after_request["v"])  # stable while nothing changes
+        self.action({"op": "approve", "id": rid, "digest": self.app.store.get(rid)["digest"], "back": "/"})
+        after_decision = json.loads(self.get("/poll").body)
+        self.assertNotEqual(after_decision["v"], after_request["v"])
+        self.assertEqual(after_decision["pending"], 0)
+
+    def test_poll_sees_connects_keys_and_devices(self):
+        v = lambda: json.loads(self.get("/poll").body)["v"]  # noqa: E731
+        before = v()
+        self.app.store.add_connect("ci", "ab" * 32, "apm_abcdef")
+        after_connect = v()
+        self.assertNotEqual(after_connect, before)
+        self.app.store.create_key("phone")
+        after_key = v()
+        self.assertNotEqual(after_key, after_connect)
+        self.post_json("/push/subscribe", {"subscription": SUB})
+        self.assertNotEqual(v(), after_key)
+
+    def test_key_usage_does_not_change_the_version(self):
+        before = json.loads(self.get("/poll").body)["v"]
+        self.app(web.Request("GET", "/api/whoami", headers={"Authorization": f"Bearer {self.key}"}))
+        self.assertEqual(json.loads(self.get("/poll").body)["v"], before)
+
+    def test_poll_needs_a_session(self):
+        resp = self.get("/poll", owner=False)
+        self.assertEqual((resp.status, resp.content_type), (401, "application/json"))
 
 
 class CachingTests(Base):

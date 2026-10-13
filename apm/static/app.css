@@ -1,30 +1,36 @@
 :root{color-scheme:light dark;--bg:#f6f7f9;--fg:#15181d;--muted:#5d6470;--line:#d9dde3;--card:#fff;--accent:#0b63ce;--accent-fg:#fff;
---ok:#1a7f37;--danger:#b42318;--warn-bg:#fff4e0;--warn-fg:#7a4100;--note-bg:#eef4ff;--code:#eef0f3;--focus:#0b63ce;--nav-h:64px}
+--ok:#1a7f37;--danger:#b42318;--warn-bg:#fff4e0;--warn-fg:#7a4100;--note-bg:#eef4ff;--code:#eef0f3;--focus:#0b63ce;--nav-h:60px}
 @media (prefers-color-scheme:dark){:root{--bg:#111418;--fg:#eceef1;--muted:#a3aab5;--line:#2c323b;--card:#1a1e24;--accent:#4c9bff;--accent-fg:#06121f;
 --ok:#4ac26b;--danger:#ff7b72;--warn-bg:#3a2a10;--warn-fg:#ffd08a;--note-bg:#15253d;--code:#242a33;--focus:#7fb6ff}}
 *{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{margin:0;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg);
-padding:env(safe-area-inset-top) env(safe-area-inset-right) calc(var(--nav-h) + env(safe-area-inset-bottom) + 1rem) env(safe-area-inset-left)}
+html{-webkit-text-size-adjust:100%;height:100%}
+/* App shell: the body never scrolls, only <main> does. Header and tab bar sit in normal flow with
+   safe-area padding, so iOS can't drag them around on overscroll or when the keyboard opens.
+   --vvh is set by the script from the visual viewport (keyboard open); it falls back to 100%. */
+body{margin:0;height:var(--vvh,100%);display:flex;flex-direction:column;overflow:hidden;
+font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg)}
 a{color:var(--accent)}
 :focus-visible{outline:3px solid var(--focus);outline-offset:2px;border-radius:6px}
 .skip{position:absolute;left:-999px;top:0}.skip:focus{left:.5rem;top:.5rem;z-index:20;background:var(--card);padding:.5rem 1rem}
-.top{display:flex;align-items:center;gap:.6rem;padding:.6rem 1rem;max-width:760px;margin:0 auto}
+.top{flex:none;display:flex;align-items:center;gap:.6rem;width:100%;max-width:760px;margin:0 auto;
+padding:calc(.5rem + env(safe-area-inset-top)) calc(1rem + env(safe-area-inset-right)) .5rem calc(1rem + env(safe-area-inset-left))}
 .brand{display:flex;align-items:center;gap:.5rem;font-weight:650;color:inherit;text-decoration:none;margin-right:auto}
 .brand img{border-radius:7px}
 .stage{font:600 12px/1 ui-monospace,Menlo,monospace;text-transform:uppercase;letter-spacing:.04em;background:#b54708;color:#fff;padding:.3rem .45rem;border-radius:6px}
-main{max-width:760px;margin:0 auto;padding:0 1rem}
-h1{font-size:1.6rem;line-height:1.2;margin:.6rem 0 1rem}
+main{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
+padding:0 calc(1rem + env(safe-area-inset-right)) 1.5rem calc(1rem + env(safe-area-inset-left))}
+.wrap{max-width:760px;margin:0 auto}
+h1{font-size:1.6rem;line-height:1.2;margin:.4rem 0 1rem}
 h2{font-size:1.1rem;margin:0}
 h2.section{margin:2rem 0 .6rem;font-size:1rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
-footer{max-width:760px;margin:2.5rem auto 0;padding:0 1rem;color:var(--muted);font-size:.85rem;overflow-wrap:anywhere}
+footer{margin:2.5rem 0 0;color:var(--muted);font-size:.85rem;overflow-wrap:anywhere}
 .muted{color:var(--muted)}
 code,pre,.secret,.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 code{font-size:.88em;background:var(--code);padding:.1em .35em;border-radius:5px;overflow-wrap:anywhere}
 pre{font-size:13px;background:var(--code);padding:.75rem;border-radius:10px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
 
 /* tabs: bottom bar on phones, inline under the header on wider screens */
-.tabs{position:fixed;left:0;right:0;bottom:0;z-index:10;display:flex;background:var(--card);border-top:1px solid var(--line);
+.tabs{flex:none;display:flex;background:var(--card);border-top:1px solid var(--line);
 padding:0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
 .tabs a{flex:1;min-height:var(--nav-h);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
 color:var(--muted);text-decoration:none;font-size:.72rem;font-weight:600;position:relative}
@@ -33,8 +39,8 @@ color:var(--muted);text-decoration:none;font-size:.72rem;font-weight:600;positio
 .count{position:absolute;top:8px;left:calc(50% + 6px);min-width:20px;height:20px;padding:0 6px;border-radius:10px;background:var(--danger);
 color:#fff;font-size:.72rem;line-height:20px;text-align:center}
 @media (min-width:720px){
-body{padding-bottom:2rem}
-.tabs{position:static;max-width:760px;margin:0 auto .5rem;padding:0 1rem;background:none;border:0;border-bottom:1px solid var(--line);justify-content:flex-start;gap:.25rem}
+.top{order:-2}
+.tabs{order:-1;width:100%;max-width:760px;margin:0 auto .5rem;padding:0 1rem;background:none;border:0;border-bottom:1px solid var(--line);justify-content:flex-start;gap:.25rem}
 .tabs a{flex:none;flex-direction:row;min-height:48px;padding:0 .9rem;font-size:.95rem;gap:.45rem;border-bottom:3px solid transparent;margin-bottom:-1px}
 .tabs a[aria-current=page]{border-bottom-color:var(--accent)}
 .icon{width:20px;height:20px}.count{position:static}
@@ -79,7 +85,7 @@ summary{cursor:pointer;min-height:44px;display:flex;align-items:center;color:var
 .empty{text-align:center;padding:2rem 1rem;border:1px dashed var(--line);border-radius:16px;margin-bottom:1rem}
 .empty p{margin:.3rem 0}
 .nudge{background:var(--note-bg);padding:.7rem 1rem;border-radius:12px}
-.banner{position:sticky;top:0;z-index:15;background:var(--warn-bg);color:var(--warn-fg);padding:.6rem 1rem;text-align:center;font-weight:600}
+.banner{flex:none;background:var(--warn-bg);color:var(--warn-fg);padding:.6rem 1rem;text-align:center;font-weight:600}
 
 /* lists */
 .list,.grants{list-style:none;padding:0;margin:0 0 1rem;background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden}
@@ -103,9 +109,14 @@ input[type=text]{font:inherit;flex:1;min-width:0;min-height:44px;padding:.5rem .
 .steps{margin-top:1rem;padding:.75rem 1rem;background:var(--bg);border-radius:12px}
 .steps ol{padding-left:1.3rem;margin:.4rem 0}
 
+/* confirm dialog (replaces window.confirm) */
+.confirm{border:0;border-radius:16px;padding:1.25rem;width:min(92vw,420px);background:var(--card);color:var(--fg);box-shadow:0 12px 40px rgba(0,0,0,.3)}
+.confirm::backdrop{background:rgba(0,0,0,.45)}
+.confirm p{margin:0 0 1rem;font-size:1.05rem}
+.confirm .decide{margin:0}
+
 /* sign-in and error pages */
-body.center{padding-bottom:2rem}
-.signin{max-width:420px;text-align:center;padding-top:12vh}
+.signin{max-width:420px;text-align:center;margin:0 auto;padding-top:12vh}
 .signin img{border-radius:16px}
 @media (prefers-reduced-motion:no-preference){button,.button{transition:filter .15s}button:active{filter:brightness(.92)}}
 button,.button,.chip{overflow-wrap:normal;white-space:nowrap}

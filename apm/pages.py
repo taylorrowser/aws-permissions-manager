@@ -62,6 +62,10 @@ def _flash(msg):
 
 
 def layout(app, owner, active, title, body, msg="", heading=None):
+    """The app shell. The body never scrolls: only <main> does, so the tab bar stays put on iOS
+    (no position:fixed, no viewport units). Elements marked data-live are replaced in place by
+    the page script when something changes (see /poll); data-keep elements inside them survive."""
+    from .web import state_version
     pending = len(app.store.list(status="pending")) + len(app.store.connects())
     tabs = []
     for href, key, label in TABS:
@@ -69,16 +73,21 @@ def layout(app, owner, active, title, body, msg="", heading=None):
         count = f' <span class=count aria-label="{pending} waiting">{pending}</span>' if key == "requests" and pending else ""
         tabs.append(f'<a href="{href}"{current}>{_icon(key)}<span class=label>{label}</span>{count}</a>')
     return (_head(app, title) + f'<body data-page="{e(active)}" data-pending="{pending}" '
-            f'data-vapid="{e(app.s.vapid_public)}">'
+            f'data-version="{state_version(app.store)}" data-vapid="{e(app.s.vapid_public)}">'
             '<a class=skip href="#main">Skip to content</a>'
-            '<div id=offline class=banner role=status hidden>You\'re offline. Approving and rejecting need a connection; '
-            'nothing is saved for later.</div>'
             '<header class=top><a class=brand href="/"><img src="/icon-192.png" alt="" width=28 height=28>'
             f'<span>AWS Permissions</span></a>{_stage(app)}'
-            '<form method=post action="/logout"><button class=link>Sign out</button></form></header>'
-            f'<nav class=tabs aria-label="Sections">{"".join(tabs)}</nav>'
-            f'<main id=main><h1>{e(heading or title)}</h1>{_flash(msg)}{body}</main>'
+            '<form method=post action="/logout" data-native><button class=link>Sign out</button></form></header>'
+            '<div id=offline class=banner role=status hidden>You\'re offline. Approving and rejecting need a connection; '
+            'nothing is saved for later.</div>'
+            f'<main id=main><div class=wrap><h1 data-live=title>{e(heading or title)}</h1>'
+            f'<div id=flash-slot data-live=flash>{_flash(msg)}</div><div data-live=page>{body}</div>'
             f'<footer>AWS account {e(app.broker.account)} · {e(app.broker.region)} · signed in as {e(owner)}</footer>'
+            '</div></main>'
+            f'<nav class=tabs aria-label="Sections" data-live=nav>{"".join(tabs)}</nav>'
+            '<dialog id=confirm class=confirm aria-labelledby=confirm-text><form method=dialog>'
+            '<p id=confirm-text></p><div class=decide><button value=cancel type=submit>Cancel</button>'
+            '<button value=ok type=submit id=confirm-ok class=primary>Confirm</button></div></form></dialog>'
             '</body></html>')
 
 
@@ -312,7 +321,8 @@ def _health(s):
 
 def devices_page(app, owner, msg=""):
     subs = app.store.subscriptions()
-    out = ['<section class=card id=this-device aria-labelledby=this-device-t>'
+    # data-keep: this card is driven by the page script, so live refreshes leave it alone.
+    out = ['<section class=card id=this-device data-keep aria-labelledby=this-device-t>'
            '<h2 id=this-device-t>This device</h2>'
            '<p id=push-status aria-live=polite>Checking notifications…</p>'
            '<div class=decide>'
