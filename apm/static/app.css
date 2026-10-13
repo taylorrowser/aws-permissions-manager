@@ -1,101 +1,111 @@
-:root{color-scheme:light dark;--bg:#f3f4f6;--fg:#15181d;--muted:#5d6470;--line:#dfe3e8;--card:#fff;--accent:#0b63ce;--accent-fg:#fff;
---ok:#1a7f37;--danger:#b42318;--warn-bg:#fff4e0;--warn-fg:#7a4100;--note-bg:#eef4ff;--code:#eef0f3;--focus:#0b63ce;--nav-h:58px;
---read-bg:#dafbe1;--read-fg:#116329;--write-bg:#e8edf3;--write-fg:#3b4654;--broad-bg:#fff1d6;--broad-fg:#8a4b00;--full-bg:#ffe3e0;--full-fg:#a4211b}
-@media (prefers-color-scheme:dark){:root{--bg:#111418;--fg:#eceef1;--muted:#a3aab5;--line:#2c323b;--card:#1a1e24;--accent:#4c9bff;--accent-fg:#06121f;
---ok:#4ac26b;--danger:#ff7b72;--warn-bg:#3a2a10;--warn-fg:#ffd08a;--note-bg:#15253d;--code:#242a33;--focus:#7fb6ff;
+/* One ink, one muted grey, and the four risk colours. Nothing else carries colour, so colour
+   always means something: how much a request allows, or that a decision needs confirming. */
+:root{color-scheme:light dark;--bg:#f2f3f5;--fg:#172033;--muted:#687385;--line:#e2e5ea;--card:#fff;--ink:#172033;--ink-fg:#fff;
+--danger:#b42318;--warn-bg:#fff4df;--warn-fg:#7a4100;--note-bg:#eef1f6;--code:#eceef2;--focus:#172033;--nav-h:56px;
+--read-bg:#dcf5e3;--read-fg:#126233;--write-bg:#e6e9ee;--write-fg:#3b4654;--broad-bg:#fff0d2;--broad-fg:#8a4b00;--full-bg:#ffe1de;--full-fg:#a4211b}
+@media (prefers-color-scheme:dark){:root{--bg:#0f141b;--fg:#eef1f5;--muted:#9aa4b2;--line:#262d37;--card:#171d26;--ink:#f3f5f8;--ink-fg:#0f141b;
+--danger:#ff8a80;--warn-bg:#3a2a10;--warn-fg:#ffd08a;--note-bg:#1b2330;--code:#222a35;--focus:#9fc0ff;
 --read-bg:#12361f;--read-fg:#7ee2a0;--write-bg:#262d37;--write-fg:#b8c2cf;--broad-bg:#3d2c0e;--broad-fg:#ffc97a;--full-bg:#45181b;--full-fg:#ffaba8}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%;height:100%}
-/* App shell: the body never scrolls, only <main> does. Header and tab bar sit in normal flow with
-   safe-area padding, so iOS can't drag them around on overscroll or when the keyboard opens.
-   --vvh is set by the script from the visual viewport (keyboard open); it falls back to 100%. */
+/* App shell: the body never scrolls, only <main> does, so iOS can't drag the tab bar around.
+   --inset-top keeps text below the status bar and the blur iOS 26 draws under it (about 40pt)
+   when the app is installed; the content itself scrolls under that edge, like a native app.
+   --vvh follows the visual viewport (keyboard open) and falls back to 100%. */
 body{margin:0;height:var(--vvh,100%);display:flex;flex-direction:column;overflow:hidden;
-font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg)}
-a{color:var(--accent)}
+font:16px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--fg);--inset-top:.25rem}
+@media (display-mode:standalone){body{--inset-top:calc(env(safe-area-inset-top) + 2.5rem)}}
+@media (display-mode:standalone) and (orientation:landscape) and (max-height:500px){body{--inset-top:env(safe-area-inset-top)}}
+a{color:inherit}
 :focus-visible{outline:3px solid var(--focus);outline-offset:2px;border-radius:6px}
 .skip{position:absolute;left:-999px;top:0}.skip:focus{left:.5rem;top:.5rem;z-index:20;background:var(--card);padding:.5rem 1rem}
 .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-.top{flex:none;display:flex;align-items:center;gap:.6rem;width:100%;max-width:760px;margin:0 auto;
-padding:calc(.4rem + env(safe-area-inset-top)) calc(1rem + env(safe-area-inset-right)) .3rem calc(1rem + env(safe-area-inset-left))}
-.brand{display:flex;align-items:center;gap:.5rem;font-weight:650;font-size:.95rem;color:var(--muted);text-decoration:none;margin-right:auto}
-.brand img{border-radius:7px}
-.stage{font:600 11px/1 ui-monospace,Menlo,monospace;text-transform:uppercase;letter-spacing:.04em;background:#b54708;color:#fff;padding:.3rem .45rem;border-radius:6px}
+.top{display:none}
 main{flex:1 1 auto;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
-padding:0 calc(1rem + env(safe-area-inset-right)) 2rem calc(1rem + env(safe-area-inset-left))}
-.wrap{max-width:760px;margin:0 auto}
-h1{font-size:1.7rem;line-height:1.2;margin:.3rem 0 .9rem;letter-spacing:-.01em}
-h2{font-size:1.05rem;margin:0}
-h2.section{margin:1.6rem 0 .5rem;font-size:.8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
-.back{display:inline-block;margin:.5rem 0 0;text-decoration:none;font-weight:600}
+padding:var(--inset-top) calc(1rem + env(safe-area-inset-right)) 2rem calc(1rem + env(safe-area-inset-left))}
+.wrap{max-width:720px;margin:0 auto}
+.titlebar{display:flex;align-items:center;gap:.6rem;margin:.6rem 0 .9rem}
+h1{font-size:1.9rem;line-height:1.15;margin:0;letter-spacing:-.02em;font-weight:700}
+h2{font-size:1.05rem;margin:0;font-weight:650}
+h2.section{margin:1.75rem 0 .5rem}
+.stage{font:600 11px/1 ui-monospace,Menlo,monospace;text-transform:uppercase;letter-spacing:.04em;background:#b54708;color:#fff;padding:.3rem .45rem;border-radius:6px}
+.back{display:inline-block;margin:.4rem 0 0;text-decoration:none;font-weight:600;color:var(--muted)}
 .muted{color:var(--muted)}
+.muted a{color:inherit}
 code,pre,.secret,.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 code{font-size:.85em;background:var(--code);padding:.1em .35em;border-radius:5px;overflow-wrap:anywhere}
 pre{font-size:13px;background:var(--code);padding:.75rem;border-radius:10px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:.5rem 0}
 
-/* tabs: bottom bar on phones, inline under the header on wider screens */
+/* tabs: bottom bar on phones, a row under the wordmark on wider screens */
 .tabs{flex:none;display:flex;background:var(--card);border-top:1px solid var(--line);
 padding:0 env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
 .tabs a{flex:1;min-height:var(--nav-h);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
 color:var(--muted);text-decoration:none;font-size:.7rem;font-weight:600;position:relative}
-.tabs a[aria-current=page]{color:var(--accent)}
+.tabs a[aria-current=page]{color:var(--fg)}
 .icon{width:24px;height:24px}
 .count{position:absolute;top:6px;left:calc(50% + 6px);min-width:19px;height:19px;padding:0 5px;border-radius:10px;background:var(--danger);
 color:#fff;font-size:.7rem;line-height:19px;text-align:center}
 @media (min-width:720px){
-.top{order:-2}
-.tabs{order:-1;width:100%;max-width:760px;margin:0 auto .5rem;padding:0 1rem;background:none;border:0;border-bottom:1px solid var(--line);justify-content:flex-start;gap:.25rem}
-.tabs a{flex:none;flex-direction:row;min-height:46px;padding:0 .9rem;font-size:.95rem;gap:.45rem;border-bottom:3px solid transparent;margin-bottom:-1px}
-.tabs a[aria-current=page]{border-bottom-color:var(--accent)}
-.icon{width:20px;height:20px}.count{position:static}
+.top{flex:none;display:flex;align-items:center;gap:.6rem;width:100%;max-width:720px;margin:0 auto;order:-2;
+padding:calc(var(--inset-top) + .5rem) 1rem .25rem}
+.brand{display:flex;align-items:center;gap:.5rem;font-weight:650;font-size:.95rem;color:inherit;text-decoration:none;margin-right:auto}
+.brand img{border-radius:6px}
+.tabs{order:-1;width:100%;max-width:720px;margin:0 auto .25rem;padding:0 1rem;background:none;border:0;border-bottom:1px solid var(--line);justify-content:flex-start;gap:.25rem}
+.tabs a{flex:none;flex-direction:row;min-height:44px;padding:0 .8rem;font-size:.95rem;gap:.45rem;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs a[aria-current=page]{border-bottom-color:var(--fg)}
+.icon{width:18px;height:18px}.count{position:static}
+main{padding-top:0}
+.titlebar{margin-top:1.2rem}
+.titlebar .stage{display:none}
 }
 
-/* buttons */
-button,.button{font:inherit;font-weight:600;min-height:44px;padding:.5rem 1.1rem;border-radius:12px;border:1px solid var(--line);background:var(--card);
+/* buttons: the primary action is ink, everything else quiet */
+button,.button{font:inherit;font-weight:600;min-height:44px;padding:.5rem 1.1rem;border-radius:10px;border:1px solid var(--line);background:var(--card);
 color:var(--fg);cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:.4rem}
 button[hidden],[hidden]{display:none !important}
 button:disabled{opacity:.6;cursor:progress}
-.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+.primary{background:var(--ink);border-color:var(--ink);color:var(--ink-fg)}
 .danger{color:var(--danger)}
-.small{min-height:38px;padding:.3rem .8rem;font-size:.88rem}
+.small{min-height:36px;padding:.25rem .75rem;font-size:.88rem}
 .wide{width:100%}
 form{margin:0}
 .decide{display:flex;gap:.6rem;margin-top:.8rem}
 .decide form,.decide button{flex:1 1 7rem}
 .decide form button{width:100%}
 
-/* chips */
-.chip{font-size:.75rem;font-weight:650;padding:.12rem .5rem;border-radius:999px;background:var(--code);color:var(--muted);white-space:nowrap}
-.chip.new{background:var(--note-bg);color:var(--accent)}
+/* risk and status labels */
+.chip{font-size:.78rem;font-weight:650;padding:.12rem .5rem;border-radius:6px;background:var(--code);color:var(--muted);white-space:nowrap}
+.chip.new{background:var(--note-bg);color:var(--fg)}
 .chip.s-approved,.risk-read{background:var(--read-bg);color:var(--read-fg)}
 .chip.s-rejected,.chip.s-revoked{background:var(--full-bg);color:var(--full-fg)}
 .risk-write{background:var(--write-bg);color:var(--write-fg)}
 .risk-broad{background:var(--broad-bg);color:var(--broad-fg)}
 .risk-full{background:var(--full-bg);color:var(--full-fg)}
-.chip.this{margin-left:.4rem;background:var(--note-bg);color:var(--accent)}
+.chip.this{margin-left:.4rem;background:var(--note-bg);color:var(--fg)}
 
 /* rows: a list of things that open in place (requests, projects) */
-.rows{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;margin:0 0 1rem}
+.rows{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin:0 0 1rem}
 .row{border-top:1px solid var(--line)}
 .row:first-child{border-top:0}
-.row>summary{list-style:none;cursor:pointer;padding:.8rem 1rem;display:flex;flex-direction:column;gap:.25rem;position:relative}
+.row>summary{list-style:none;cursor:pointer;padding:.8rem 1rem;display:flex;flex-direction:column;gap:.2rem;position:relative}
 .row>summary::-webkit-details-marker{display:none}
-.row>summary::after{content:"";position:absolute;right:1rem;top:1.05rem;width:.5rem;height:.5rem;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);
+.row>summary::after{content:"";position:absolute;right:1rem;top:1.05rem;width:.5rem;height:.5rem;border-right:1.5px solid var(--muted);border-bottom:1.5px solid var(--muted);
 transform:rotate(45deg);transition:transform .15s}
 .row[open]>summary::after{transform:rotate(-135deg);top:1.25rem}
 .row[open]>summary{background:var(--bg)}
 .head{display:flex;align-items:baseline;gap:.3rem .5rem;padding-right:1.4rem;flex-wrap:wrap}
-.head b{font-size:1.02rem;min-width:0;overflow-wrap:anywhere}
-.head .right{margin-left:auto;color:var(--muted);font-size:.82rem;white-space:nowrap}
+.head b{font-size:1.03rem;min-width:0;overflow-wrap:anywhere}
+.head .right{margin-left:auto;color:var(--muted);font-size:.82rem;white-space:nowrap;display:flex;gap:.6rem;font-variant-numeric:tabular-nums}
 .reason{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;color:var(--fg)}
 .row[open] .reason{display:block;-webkit-line-clamp:none}
-.line{display:flex;align-items:center;gap:.5rem;font-size:.85rem;flex-wrap:wrap;margin:0}
+.line{display:flex;align-items:center;gap:.5rem;font-size:.85rem;flex-wrap:wrap;margin:.1rem 0 0}
 .row>*:not(summary){padding:0 1rem}
 .row>.grant,.row>p,.row>.danger-zone{margin:.6rem 0}
 .row>.grant{margin-top:.25rem}
 .row>.warn{margin:.75rem 1rem;padding:.6rem .75rem}
 .row>.grants{margin:0;padding:0}
-.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:1rem;margin:0 0 1rem;overflow-wrap:anywhere}
-.card p{margin:0 0 .5rem}.card .head{margin-bottom:.3rem}.card .line{margin-bottom:.6rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1rem;margin:0 0 1rem;overflow-wrap:anywhere}
+.card p{margin:0 0 .5rem}.card .head{margin-bottom:.3rem;padding-right:0}.card .line{margin-bottom:.6rem}
 .card.open .reason{display:block;-webkit-line-clamp:none;margin:.1rem 0 .5rem;font-size:1.02rem}
 
 /* an open request: Allow / On / From */
@@ -104,15 +114,15 @@ transform:rotate(45deg);transition:transform .15s}
 .grant dd{margin:0;min-width:0}
 ul.codes{list-style:none;padding:0;margin:0;display:flex;flex-wrap:wrap;gap:.3rem}
 .warn,.note{padding:.55rem .75rem;border-radius:10px;margin:.6rem 0;font-size:.92rem}
-ul.warn{padding-left:1.6rem}ul.warn li{margin:.15rem 0}
 .warn{background:var(--warn-bg);color:var(--warn-fg)}
+ul.warn{padding-left:1.6rem}ul.warn li{margin:.15rem 0}
 .note{background:var(--note-bg)}
 .warn-text{color:var(--danger)}
-details.policy,details.info,details.danger-zone{margin:.4rem 0}
-details.policy>summary,details.info>summary,details.danger-zone>summary{cursor:pointer;min-height:40px;display:flex;align-items:center;color:var(--accent);font-weight:500;font-size:.92rem}
+details.policy,details.danger-zone{margin:.4rem 0}
+details.policy>summary,details.danger-zone>summary{cursor:pointer;min-height:40px;display:flex;align-items:center;color:var(--muted);font-weight:600;font-size:.92rem}
 .danger-zone>summary{color:var(--danger)}
 .code-check{margin:.4rem 0 .6rem}.code-check .code{font-size:1.5rem;letter-spacing:.1em}
-.connect{border-color:var(--accent)}
+.connect{border-color:var(--fg)}
 
 /* grants inside a project */
 .grants{list-style:none;padding:0;margin:0}
@@ -122,8 +132,8 @@ details.policy>summary,details.info>summary,details.danger-zone>summary{cursor:p
 .grants .line{margin:0 0 .3rem}
 .on{display:flex;gap:.4rem;flex-wrap:wrap;align-items:baseline}
 
-/* flat lists (recent decisions, devices, keys) */
-.list{list-style:none;padding:0;margin:0 0 .75rem;background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+/* flat lists (decided, devices, keys) */
+.list{list-style:none;padding:0;margin:0 0 .75rem;background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}
 .list>li{border-top:1px solid var(--line);padding:.7rem 1rem;display:flex;gap:.75rem;align-items:center;justify-content:space-between}
 .list>li:first-child{border-top:0}
 .list>li.link-row{padding:0}
@@ -133,15 +143,17 @@ details.policy>summary,details.info>summary,details.danger-zone>summary{cursor:p
 .list .muted{font-size:.88rem}
 
 /* messages and states */
-.flash{background:var(--note-bg);padding:.7rem 1rem;border-radius:12px;margin:0 0 1rem}
+.flash{background:var(--note-bg);padding:.7rem 1rem;border-radius:10px;margin:0 0 1rem}
 .flash.error{background:var(--warn-bg);color:var(--warn-fg)}
-.empty{text-align:center;padding:2.2rem 1rem;border:1px dashed var(--line);border-radius:16px;margin-bottom:1rem}
+.empty{text-align:center;padding:2.2rem 1rem;border:1px dashed var(--line);border-radius:14px;margin-bottom:1rem}
 .empty p{margin:.3rem 0}
-.nudge{background:var(--note-bg);padding:.6rem 1rem;border-radius:12px;margin:0 0 1rem;font-size:.92rem}
-.banner{flex:none;background:var(--warn-bg);color:var(--warn-fg);padding:.6rem 1rem;text-align:center;font-weight:600}
+.nudge{background:var(--note-bg);padding:.6rem 1rem;border-radius:10px;margin:0 0 1rem;font-size:.92rem}
+/* The offline banner is the first thing on screen on phones, so it takes the top inset instead of main. */
+.banner{flex:none;background:var(--warn-bg);color:var(--warn-fg);padding:calc(var(--inset-top) + .4rem) 1rem .6rem;text-align:center;font-weight:600}
+.banner:not([hidden])+main{padding-top:.25rem}
 
-/* confirm dialog (replaces window.confirm) */
-.confirm{border:0;border-radius:16px;padding:1.25rem;width:min(92vw,420px);background:var(--card);color:var(--fg);box-shadow:0 12px 40px rgba(0,0,0,.3)}
+/* confirm dialog */
+.confirm{border:0;border-radius:14px;padding:1.25rem;width:min(92vw,420px);background:var(--card);color:var(--fg);box-shadow:0 12px 40px rgba(0,0,0,.3)}
 .confirm::backdrop{background:rgba(0,0,0,.45)}
 .confirm p{margin:0 0 1rem;font-size:1.05rem;overflow-wrap:anywhere}
 .confirm .decide{margin:0}
@@ -149,15 +161,15 @@ details.policy>summary,details.info>summary,details.danger-zone>summary{cursor:p
 /* forms */
 .field{display:flex;gap:.5rem}
 .create{margin:0 0 .4rem}
-input[type=text]{font:inherit;flex:1;min-width:0;min-height:44px;padding:.5rem .75rem;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+input[type=text]{font:inherit;flex:1;min-width:0;min-height:44px;padding:.5rem .75rem;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
 .secret{font-size:15px;padding:.75rem;background:var(--code);border-radius:10px;user-select:all;word-break:break-all}
-.new-key{border-color:var(--accent)}
-.steps{margin-top:.8rem;padding:.75rem 1rem;background:var(--bg);border-radius:12px;font-size:.92rem}
-.steps ol{padding-left:1.3rem;margin:.4rem 0}
-.steps p{margin:0 0 .3rem}
+.new-key{border-color:var(--fg)}
+.steps{margin-top:.8rem;padding:.75rem 1rem;background:var(--bg);border-radius:10px;font-size:.92rem}
+.steps p{margin:0}
 
 /* sign-in and error pages */
 .signin{max-width:420px;text-align:center;margin:0 auto;padding-top:14vh}
 .signin img{border-radius:16px}
+.signin h1{margin:.6rem 0 .3rem}
 @media (prefers-reduced-motion:no-preference){button,.button{transition:filter .15s}button:active{filter:brightness(.92)}}
 button,.button,.chip{overflow-wrap:normal;white-space:nowrap}

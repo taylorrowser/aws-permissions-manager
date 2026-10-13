@@ -119,7 +119,7 @@ class ScreenTests(Base):
         self.assertIn("every DynamoDB action", body)
         self.assertIn("matches several S3 actions", body)
         self.assertIn("all resources in the account", body)
-        self.assertIn("Approving creates project", body)
+        self.assertIn("Creates the project", body)
         self.assertIn('class="chip risk-full">Full access<', body)
         self.assertIn('data-confirm="Approve full access (dynamodb:*, s3:Get*) for web?"', body)
         narrow = self.agent_request(actions=["s3:GetObject"], reason="read")
@@ -162,7 +162,7 @@ class ScreenTests(Base):
         rid = self.agent_request(actions=["s3:PutObject"], reason="upload the built site")
         body = self.get("/").body
         row = body[body.index(f'id="req-{rid}"'):body.index("</summary>", body.index(f'id="req-{rid}"'))]
-        for text in ("<b>web</b>", "upload the built site", 'class="chip risk-broad">Broad<', "1 action · S3 · all resources"):
+        for text in ("<b>web</b>", "upload the built site", 'class="chip risk-broad">Broad<', "1 S3 action on all resources"):
             self.assertIn(text, row)
         self.assertNotIn("s3:PutObject", row)  # details stay folded until the row is opened
 
@@ -201,9 +201,9 @@ class ScreenTests(Base):
             self.assertNotIn(bad, css)  # these move with the page on iOS; the body never scrolls instead
 
     def test_empty_states(self):
-        self.assertIn("Nothing to review", self.get("/").body)
+        self.assertIn("Nothing waiting", self.get("/").body)
         self.assertIn("No projects yet", self.get("/projects").body)
-        self.assertIn("No devices get notifications yet", self.get("/settings").body)
+        self.assertIn("No devices yet", self.get("/settings").body)
         self.app.store.delete_key(self.app.store.keys()[0]["pk"])
         self.assertIn("No keys yet", self.get("/settings").body)
 
