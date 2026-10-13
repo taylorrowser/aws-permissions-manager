@@ -44,8 +44,11 @@ def _head(app, title):
             '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
             '<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">'
             '<meta name="apple-mobile-web-app-title" content="AWS Permissions">'
-            '<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">'
-            '<meta name="theme-color" content="#111418" media="(prefers-color-scheme: dark)">'
+            # black-translucent: the page runs under the status bar and env(safe-area-inset-top) is real.
+            # iOS 26 draws a blur about 40pt below the status bar; the stylesheet keeps text out of it.
+            '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">'
+            '<meta name="theme-color" content="#f2f3f5" media="(prefers-color-scheme: light)">'
+            '<meta name="theme-color" content="#0f141b" media="(prefers-color-scheme: dark)">'
             '<meta name="color-scheme" content="light dark">'
             '<link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/apple-touch-icon.png">'
             f'<link rel="icon" href="/icon-192.png"><title>{e(stage + title)} · AWS Permissions</title>'
@@ -84,11 +87,10 @@ def layout(app, owner, active, title, body, state, msg="", heading=None, back=No
     return (_head(app, title) + f'<body data-page="{e(active)}" data-pending="{pending}" '
             f'data-version="{version}" data-vapid="{e(app.s.vapid_public)}">'
             '<a class=skip href="#main">Skip to content</a>'
-            '<header class=top><a class=brand href="/"><img src="/icon-192.png" alt="" width=26 height=26>'
+            '<header class=top><a class=brand href="/"><img src="/icon-192.png" alt="" width=24 height=24>'
             f'<span>AWS Permissions</span></a>{_stage(app)}</header>'
-            '<div id=offline class=banner role=status hidden>You\'re offline. Decisions need a connection; '
-            'nothing is saved for later.</div>'
-            f'<main id=main><div class=wrap>{crumb}<h1 data-live=title>{e(heading or title)}</h1>'
+            '<div id=offline class=banner role=status hidden>You\'re offline. Nothing is saved until you\'re back.</div>'
+            f'<main id=main><div class=wrap>{crumb}<div class=titlebar><h1 data-live=title>{e(heading or title)}</h1>{_stage(app)}</div>'
             f'<div id=flash-slot data-live=flash>{_flash(msg)}</div><div data-live=page>{body}</div>'
             '</div></main>'
             f'<nav class=tabs aria-label="Sections" data-live=nav>{"".join(tabs)}</nav>'
@@ -174,9 +176,11 @@ def _worst_chip(statements):
 
 
 def _summary(actions, resources):
+    """One line a person can read: '2 S3 actions on 1 resource', '1 DynamoDB action on all resources'."""
     services = sorted({_service(a) for a in actions})
+    names = services[0] if len(services) == 1 else ", ".join(services[:-1]) + " and " + services[-1]
     where = "all resources" if _everything(resources) else _plural(len(resources), "resource")
-    return f"{_plural(len(actions), 'action')} · {', '.join(services)} · {where}"
+    return f"{len(actions)} {names} action{'' if len(actions) == 1 else 's'} on {where}"
 
 
 def login_page(app, error="", next_path="/"):
@@ -188,14 +192,14 @@ def login_page(app, error="", next_path="/"):
     return (_head(app, "Sign in") + '<body data-page="login" class=center><main id=main><div class=signin>'
             '<img src="/icon-192.png" alt="" width=72 height=72>'
             f'<h1>AWS Permissions {_stage(app)}</h1>'
-            '<p class=muted>Approve the AWS access your agents ask for.</p>' + msg + deep +
+            '<p class=muted>Approve what your agents ask for.</p>' + msg + deep +
             f'<p><a class="button primary wide" href="{e(href)}">Sign in</a></p>'
             '</div></main></body></html>')
 
 
 def error_page(app, text, back="/"):
     return (_head(app, "Problem") + '<body data-page="error" class=center><main id=main><div class=signin>'
-            f'<h1>Something needs attention</h1><p class="flash error" role="alert">{e(text)}</p>'
+            f'<h1>Something went wrong</h1><p class="flash error" role="alert">{e(text)}</p>'
             f'<p><a class="button wide" href="{e(back)}">Back to AWS Permissions</a></p></div></main></body></html>')
 
 
@@ -223,15 +227,15 @@ def request_body(app, r, projects, back="/"):
     on = ("<span>all resources in the account</span>" if _everything(r["resources"])
           else f'<ul class=codes>{_codes(r["resources"])}</ul>')
     out = [f'<div class=grant><dl><dt>Allow</dt><dd><ul class=codes>{_codes(r["actions"])}</ul></dd>'
-           f'<dt>On</dt><dd>{on}</dd><dt>From</dt><dd>{e(r.get("requester") or "unknown")} · {_time(r["created_at"])}</dd></dl>']
+           f'<dt>On</dt><dd>{on}</dd><dt>From</dt><dd>{e(r.get("requester") or "unknown")}, {_time(r["created_at"])}</dd></dl>']
     notes = _scope_notes(r)
     if len(notes) == 1:
         out.append(f'<p class=warn>{notes[0]}</p>')
     elif notes:
         out.append('<ul class=warn>' + "".join(f"<li>{n}</li>" for n in notes) + "</ul>")
     if new:
-        out.append(f'<p class=note>Approving creates project <b>{e(project)}</b> and its role <code>{e(policy.role_name(project))}</code>.</p>')
-    out.append(f'<details class=policy><summary>Exact policy statement</summary><pre>{e(json.dumps(stmt, indent=2))}</pre></details>')
+        out.append(f'<p class=note>Creates the project and its role <code>{e(policy.role_name(project))}</code>.</p>')
+    out.append(f'<details class=policy><summary>Policy JSON</summary><pre>{e(json.dumps(stmt, indent=2))}</pre></details>')
     if r["status"] == "pending":
         level, label = risk(r["actions"], r["resources"])
         confirm = (f"Approve {label.lower()} ({', '.join(a for a in r['actions'] if '*' in a) or 'every resource'}) "
@@ -249,7 +253,7 @@ def request_row(app, r, projects):
     rid = r["id"]
     new = '<span class="chip new">new project</span>' if r["project"] not in projects else ""
     return (f'<details class="row request" id="req-{rid}"><summary>'
-            f'<span class=head><b>{e(r["project"])}</b>{new}<span class=right>#{rid} · {_time(r["created_at"])}</span></span>'
+            f'<span class=head><b>{e(r["project"])}</b>{new}<span class=right><span>#{rid}</span>{_time(r["created_at"])}</span></span>'
             f'<span class=reason>{e(r["reason"])}</span>'
             f'<span class=line>{_risk_chip(r["actions"], r["resources"])}<span class=muted>{e(_summary(r["actions"], r["resources"]))}</span></span>'
             f'</summary>{request_body(app, r, projects)}</details>')
@@ -261,8 +265,7 @@ def connect_card(c, back="/"):
             f'<p class=head><b id="connect-{e(code)}-t">Connect “{e(c["name"])}”?</b>'
             f'<span class=right>{_time(c["created_at"])}</span></p>'
             f'<p class=code-check>Code <b class=code>{e(code)}</b></p>'
-            '<p class=muted>Approve only if you just started this and the agent shows the same code. '
-            'It gets a key that can ask, never approve.</p><div class=decide>'
+            '<p class=muted>Approve if the agent shows this code.</p><div class=decide>'
             + _form({"op": "approve_connect", "code": code}, "Approve", "primary", "", back)
             + _form({"op": "reject_connect", "code": code}, "Reject", "danger", "", back) + "</div></article>")
 
@@ -274,21 +277,20 @@ def _status_chip(status):
 def requests_page(app, owner, msg=""):
     st, store = state(app), app.store
     pending, connects, projects = store.list(status="pending"), store.connects(), store.projects()
-    out = ['<p class="nudge" id="push-nudge" hidden><a href="/settings">Turn on notifications</a> on this device '
-           'to hear about new requests.</p>']
+    out = ['<p class="nudge" id="push-nudge" hidden><a href="/settings">Turn on notifications</a> to hear about '
+           'new requests.</p>']
     for c in connects:
         out.append(connect_card(c))
     if pending:
         out.append('<div class=rows>' + "".join(request_row(app, r, projects) for r in pending) + "</div>")
     if not pending and not connects:
-        out.append('<div class=empty><p><b>Nothing to review.</b></p><p class=muted>New requests from agents show up '
-                   'here, and you get a notification.</p></div>')
+        out.append('<div class=empty><p><b>Nothing waiting.</b></p><p class=muted>New requests show up here.</p></div>')
     history = [r for r in store.list() if r["status"] != "pending"][:10]
     if history:
-        out.append('<h2 class=section>Recent decisions</h2><ul class=list>')
+        out.append('<h2 class=section>Decided</h2><ul class=list>')
         for r in history:
-            out.append(f'<li class=link-row><a href="/requests/{r["id"]}"><span><b>{e(r["project"])}</b> '
-                       f'<span class=muted>#{r["id"]} · {e(_summary(r["actions"], r["resources"]))}</span></span>'
+            out.append(f'<li class=link-row><a href="/requests/{r["id"]}"><span><b>{e(r["project"])}</b> <span class=muted>#{r["id"]}</span>'
+                       f'<br><span class=muted>{e(_summary(r["actions"], r["resources"]))}</span></span>'
                        f'<span class=right>{_status_chip(r["status"])}<br>{_time(r["decided_at"])}</span></a></li>')
         out.append("</ul>")
     return layout(app, owner, "requests", "Requests", "".join(out), st, msg)
@@ -302,7 +304,7 @@ def request_page(app, owner, r, msg="", st=None):
                     + (f' Note: {e(r["note"])}' if r.get("note") else "")
                     + (' See it in <a href="/projects">Projects</a>.' if r["status"] == "approved" else "") + "</p>")
     body.append(f'<article class="card request open" id="req-{rid}">'
-                f'<p class=head><b>{e(r["project"])}</b><span class=right>#{rid}</span></p>'
+                f'<p class=head><b>{e(r["project"])}</b><span class=right><span>#{rid}</span></span></p>'
                 f'<p class=reason>{e(r["reason"])}</p>'
                 f'<p class=line>{_risk_chip(r["actions"], r["resources"])}<span class=muted>{e(_summary(r["actions"], r["resources"]))}</span></p>'
                 + request_body(app, r, app.store.projects(), back=f"/requests/{rid}") + "</article>")
@@ -316,8 +318,7 @@ def connect_page(app, owner, code, msg=""):
         body = connect_card(match[0], back=f"/connect/{code}")
     else:
         body = ('<div class=empty><p><b>This connect request is no longer waiting.</b></p><p class=muted>It was '
-                'approved, rejected or expired (they last 15 minutes). Start connecting again from the agent '
-                'if it still needs access.</p></div>')
+                'approved, rejected or expired. Connect again from the agent.</p></div>')
     return layout(app, owner, "requests", "Connect an agent", body, st, msg, back=("/", "Requests"))
 
 
@@ -328,7 +329,7 @@ def _grant(project, s, store):
     req = store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
     actions, resources = _list(s.get("Action", [])), _list(s.get("Resource", []))
     on = ("<span>all resources</span>" if _everything(resources) else f'<ul class=codes>{_codes(resources)}</ul>')
-    why = (f'<p class=muted>{e(req["reason"])} · <a href="/requests/{req["id"]}">#{req["id"]}</a></p>' if req
+    why = (f'<p class=muted>{e(req["reason"])} <a href="/requests/{req["id"]}">#{req["id"]}</a></p>' if req
            else f'<p class=muted>Grant <code>{e(sid)}</code></p>')
     return (f'<li><div><p class=line>{_risk_chip(actions, resources)}</p><ul class=codes>{_codes(actions)}</ul>'
             f'<p class=on>on {on}</p>{why}</div>'
@@ -355,17 +356,17 @@ def projects_page(app, owner, msg=""):
                    f'<span class=head><b>{e(project)}</b><span class=right>{_plural(len(statements), "grant")}</span></span>'
                    f'<span class=line>{warn}{worst}<span class=muted>profile <code>apm-{e(project)}</code></span></span></summary>')
         if not synced:
-            out.append('<div class=warn role=alert><p><b>IAM doesn\'t match your decisions.</b> An update failed or was '
-                       'interrupted, so the grants below may differ from what you approved.</p>'
+            out.append('<div class=warn role=alert><p><b>IAM doesn\'t match your decisions.</b> An update failed; '
+                       'the grants below may be wrong until you re-apply.</p>'
                        + _form({"op": "sync_project", "project": project}, "Re-apply decisions", "primary", "", "/projects")
                        + "</div>")
         if not statements:
-            out.append("<p class=muted>No permissions granted. Agents can't use this project until you approve a request.</p>")
+            out.append("<p class=muted>No grants yet.</p>")
         else:
             out.append("<ul class=grants>" + "".join(_grant(project, s, store) for s in statements) + "</ul>")
         out.append(f'<p class=muted>Role <code>{e(policy.role_name(project))}</code></p>'
                    '<details class=danger-zone><summary>Delete project…</summary>'
-                   '<p class=muted>Deletes the role and every grant. Agents lose access within an hour.</p>'
+                   '<p class=muted>Removes the role and every grant. Agents lose access within an hour.</p>'
                    + _form({"op": "remove_project", "project": project}, f"Delete {project}", "danger",
                            f"Delete project {project} and all its grants?", "/projects")
                    + "</details></details>")
@@ -402,7 +403,7 @@ def settings_page(app, owner, msg="", new_key=None):
         out.append('<section class="card new-key" aria-labelledby=new-key-t><h2 id=new-key-t>Copy your new key now</h2>'
                    "<p class=muted>It won't be shown again.</p>"
                    f'<p class=secret id=secret>{e(new_key)}</p><p><button id=copy-key data-target=secret class=primary>Copy key</button></p>'
-                   "<p class=muted>On the agent's machine run <code>apm login --paste</code>, or set "
+                   "<p class=muted>Run <code>apm login --paste</code> on the agent's machine, or set "
                    "<code>APM_API_KEY</code>.</p></section>")
     # data-keep: this card is driven by the page script, so live refreshes leave it alone.
     out.append('<h2 class=section>Notifications</h2>'
@@ -413,52 +414,45 @@ def settings_page(app, owner, msg="", new_key=None):
                '<button id=push-test hidden>Send a test</button>'
                '<button id=push-disable class=danger hidden>Turn off</button>'
                '<button id=install-app hidden>Install app</button></div>'
-               '<div id=install-ios class=steps hidden><p><b>On iPhone and iPad, notifications only work from the '
-               'Home Screen app.</b></p><ol><li>Tap <b>Share</b> <span aria-hidden=true>(□↑)</span> in Safari.</li>'
-               '<li>Choose <b>Add to Home Screen</b>, then <b>Add</b>.</li>'
-               '<li>Open <b>AWS Permissions</b> from your Home Screen and come back here.</li></ol>'
-               '<p class=muted>Needs iOS or iPadOS 16.4 or later.</p></div>'
+               '<div id=install-ios class=steps hidden><p>Notifications need the Home Screen app: in Safari tap '
+               '<b>Share</b>, then <b>Add to Home Screen</b>, and open it from there.</p></div>'
                '<div id=push-denied class=steps hidden><p id=push-denied-help></p></div>'
                '</section>')
     if not subs:
-        out.append('<p class=muted>No devices get notifications yet. Turn them on above on each phone or computer '
-                   'you want alerted.</p>')
+        out.append('<p class=muted>No devices yet.</p>')
     else:
         out.append('<ul class="list devices">')
         for s in subs:
             out.append(f'<li data-device="{e(s["pk"])}"><span><b>{e(_device(s["label"]))}</b>'
                        '<span class="chip this" hidden>This device</span>'
-                       f'<br><span class=muted>Added {_time(s["created_at"])} · {_health(s)}</span></span>'
+                       f'<br><span class=muted>{_health(s)}, added {_time(s["created_at"])}</span></span>'
                        + _form({"op": "delete_device", "pk": s["pk"]}, "Remove", "danger small",
                                "Stop notifications to this device?", "/settings") + "</li>")
         out.append("</ul>")
-    out.append('<details class=info><summary>What notifications show</summary><p class=muted>Only the project and '
-               'request number, so nothing sensitive appears on a lock screen. Tapping one opens the request; nothing '
-               'is approved from a notification. Devices the browser has unsubscribed are removed automatically.</p></details>')
+    out.append('<p class=muted>Notifications show only the project and request number.</p>')
 
     out.append('<h2 class=section>Agent keys</h2>')
     if keys:
         out.append('<ul class=list>')
         for k in keys:
             out.append(f'<li><span><b>{e(k["name"])}</b> <code>{e(k["prefix"])}…</code><br>'
-                       f'<span class=muted>Created {_time(k["created_at"])} · last used '
-                       f'{_time(k["last_used"]) or "never"}</span></span>'
+                       f'<span class=muted>{"Last used " + _time(k["last_used"]) if k["last_used"] else "Never used"}, '
+                       f'created {_time(k["created_at"])}</span></span>'
                        + _form({"op": "delete_key", "pk": k["pk"]}, "Delete", "danger small",
                                f"Delete key {k['name']}? Agents using it stop working.", "/settings") + "</li>")
         out.append("</ul>")
     else:
-        out.append('<p class=muted>No keys yet. Agents with the plugin connect themselves (you approve them under '
-                   'Requests); create a key here for anything else.</p>')
+        out.append('<p class=muted>No keys yet. Agents with the plugin connect themselves.</p>')
     out.append('<form method="post" action="/action" class=create><input type="hidden" name="op" value="create_key">'
                '<input type="hidden" name="back" value="/settings">'
                '<label for=key-name class=sr-only>New key name</label><div class=field>'
                '<input type="text" id=key-name name="name" placeholder="New key name, e.g. macbook" maxlength="40" required '
                'autocomplete=off autocapitalize=off>'
                '<button>Create key</button></div></form>'
-               '<p class=muted>A key lets an agent list projects, ask for permissions and get credentials. It can never approve.</p>')
+               '<p class=muted>Keys let agents ask for access. They can never approve it.</p>')
 
     out.append('<h2 class=section>Account</h2><section class=card>'
-               f'<p><b>{e(owner)}</b><br><span class=muted>AWS account {e(app.broker.account)} · {e(app.broker.region)}</span></p>'
+               f'<p><b>{e(owner)}</b><br><span class=muted>AWS account {e(app.broker.account)}, {e(app.broker.region)}</span></p>'
                '<form method=post action="/logout" data-native><button class=danger>Sign out</button></form></section>')
     return layout(app, owner, "settings", "Settings", "".join(out), st, msg)
 

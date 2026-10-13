@@ -1,0 +1,13 @@
+<!-- App icon source. Render to apm/static/icon-512.png (then 192 and 180 with sips); see scripts/README-icon.md -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" fill="#172033"/>
+  <g transform="translate(256 256) scale(0.84) translate(-256 -256)">
+  <g fill="none" stroke="#f8fafc" stroke-width="40" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="188" cy="208" r="86"/>
+    <path d="M252 270 L404 422"/>
+    <path d="M352 370 L392 330"/>
+    <path d="M396 414 L436 374"/>
+  </g>
+  <circle cx="188" cy="208" r="26" fill="#f5a524"/>
+  </g>
+</svg>
