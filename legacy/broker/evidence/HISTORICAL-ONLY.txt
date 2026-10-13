@@ -1,1 +1,0 @@
-All evidence files in this directory were copied from the frozen recovered synthetic candidate. They are historical provenance ONLY and do not prove the new integration package. Fresh test runs and review hashes are in the separate integration evidence deliverable.

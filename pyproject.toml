@@ -2,14 +2,21 @@
 name = "aws-permissions-manager"
 version = "0.1.0"
 description = "Agents request scoped AWS permissions per project; the owner approves them in a hosted dashboard."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Taylor Rowser" }]
 requires-python = ">=3.11"
 dependencies = ["boto3[crt]>=1.40", "cryptography>=43"]
+
+[project.urls]
+Repository = "https://github.com/taylorrowser/aws-permissions-manager"
 
 [project.scripts]
 apm-admin = "apm.cli:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

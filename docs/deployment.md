@@ -344,25 +344,25 @@ not exercised against AWS. Expect the first real deploy to surface a missing act
 
 ## GitHub plan limits
 
-This repo is **private and personal** (`taylorrowser/aws-permissions-manager`), and its plan wasn't
-verified from here. Per [GitHub's docs](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments):
-- **GitHub Free, private repos:**
-  - no environment secrets;
-  - no deployment branch policies;
-  - no branch protection or rulesets.
-- **GitHub Pro (personal) or Team (org):** deployment branches and tags, plus environment secrets
-  and variables, for private repos.
-- **Required reviewers and wait timers on private repos:** not available on Free, Pro or Team. Per
-  the policy, that may need Enterprise.
+This repo is **public and personal** (`taylorrowser/aws-permissions-manager`). Per [GitHub's docs](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments),
+public repos on GitHub Free get environment secrets and variables, deployment branch policies,
+required reviewers and wait timers, and branch protection or rulesets. (While the repo was private on
+Free, none of these were available, so the pipeline was built not to depend on them.)
 
-So this pipeline claims **no approval gate**. The prod controls are:
+The pipeline still claims **no approval gate**. The prod controls are:
 - `workflow_dispatch` from `main` only, re-checked inside the reusable workflow;
 - the release record checks (health, currency, digest, GitHub provenance, ancestry);
 - the exact OIDC trust.
 
-On Pro or Team, add a `production` deployment branch policy limited to `main`. Anyone who can push
-to `main` can promote, which suits a solo owner. Don't enable "prevent self-review" or required
-reviewers that only you could satisfy.
+Recommended now that the features exist: a `production` (and `dev`, `preview`) environment
+deployment branch policy limited to `main`. Anyone who can push to `main` can promote, which suits
+a solo owner. Don't enable "prevent self-review" or required reviewers that only you could satisfy.
+
+**Fork pull requests.** CI (`pull_request`) runs fork code with a read-only token, no secrets and no
+`id-token`, so it can't reach AWS. Preview, dev and prod workflows never check out PR code, and
+`apm-admin preview plan` refuses fork PRs and fork CI runs. Keep it that way: never run fork code on a
+self-hosted or persistent runner (`APM_RUNNER`), and keep GitHub's default of requiring approval
+before workflows run for first-time contributors.
 
 ## Runners
 
