@@ -101,7 +101,7 @@ codex plugin marketplace upgrade taylorrowser && codex plugin add aws-permission
 
 Both tools cache plugins by version, so bump `version` in both `plugin.json` files (and `VERSION` in `scripts/apm.py`) with any plugin change.
 
-The plugin talks to `https://apm.taylorrowser.com` unless told otherwise. For your own deployment, run `apm login --url https://<your-domain>` once per machine (it saves the URL in `~/.apm/client.json`) or set `APM_URL`.
+The plugin talks to `https://apm.taylorrowser.com` unless told otherwise. For your own deployment, run `python3 plugins/aws-permissions/scripts/apm.py login --url https://<your-domain>` from a checkout of this repo once per machine (it saves the URL in `~/.apm/client.json`, which the installed plugin reads), or set `APM_URL` in the agent's environment.
 
 The first time an agent needs AWS on that machine, it calls the `connect` tool. The tool opens the dashboard and pings your phone, you check the code matches what the agent shows, and you tap Approve. The agent generates its own API key and sends only its hash, so no key is ever copied or pasted. Without an agent, `apm login` does the same from a terminal. `apm login --paste` or `APM_API_KEY` accept a key created in the dashboard instead.
 
