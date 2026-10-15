@@ -567,8 +567,9 @@ TOOLS = [
     {"name": "request_permissions",
      "description": "Ask the owner to grant IAM permissions to a project; they approve or reject on their phone. "
                     "Request exactly what failed (from the AccessDenied message), with specific resource ARNs where "
-                    "possible. A new project name creates that project on approval. IAM, STS AssumeRole, "
-                    "Organizations, account, SSO and billing actions can never be granted. Run-as actions such as "
+                    "possible. A new project name creates that project on approval. IAM changes, STS AssumeRole, "
+                    "Organizations, account, SSO and billing actions can never be granted; iam:Get*, iam:List* and "
+                    "iam:PassRole (for this deployment's agent roles) can. Run-as actions such as "
                     "lambda:UpdateFunctionCode on every resource, and CloudFormation stack writes on every stack, a "
                     "wildcard region or a stack with a stored service role, are refused: name the resources. Give either actions "
                     "(and resources) or grants, one per resource set, to ask for everything one task needs at once. "
