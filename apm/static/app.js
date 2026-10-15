@@ -318,6 +318,7 @@ if (typeof document !== "undefined") {
       }
       old.replaceWith(fresh);
     }
+    document.querySelectorAll("form[data-size]").forEach(checkSize); // picks restored above
     const list = $("decided-list");
     if (list && oldDecided.length) {
       const id = (li) => Number(li.querySelector("a")?.id.slice(4));
@@ -559,14 +560,14 @@ if (typeof document !== "undefined") {
       } catch (_) {
         flash("Couldn't reach the server. Check your connection and try again.");
       } finally {
-        if (button && button.isConnected) { button.disabled = false; button.textContent = label; }
+        if (button && button.isConnected) { button.disabled = false; button.textContent = label; checkSize(button.form); }
       }
     });
   });
 
-  // A duration picker changed: re-check the size, and only offer Approve if it fits.
-  document.addEventListener("change", (event) => {
-    const form = event.target.form;
+  // Only offer Approve while the chosen durations fit (see overLimit). Runs when a picker changes,
+  // and after a refresh or a submit, which can restore picks or re-enable the button.
+  function checkSize(form) {
     if (!form || !form.dataset.size) return;
     const d = form.dataset;
     const hours = [...form.elements].filter((el) => el.tagName === "SELECT").map((el) => el.value);
@@ -575,7 +576,8 @@ if (typeof document !== "undefined") {
     const slot = $(form.getAttribute("id").replace("approve-", "size-")), button = form.querySelector("button.approve");
     if (slot) { slot.textContent = warning; slot.hidden = !warning; }
     if (button) button.disabled = Boolean(warning);
-  });
+  }
+  document.addEventListener("change", (event) => checkSize(event.target.form));
 
   document.addEventListener("click", async (event) => {
     const copy = event.target.closest("#copy-key, button.copy");
