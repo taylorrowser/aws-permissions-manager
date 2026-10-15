@@ -1,3 +1,0 @@
-#!/bin/sh
-# `apm` on the agent's PATH (Claude Code adds plugin bin/ directories to the Bash tool's PATH).
-exec python3 "$(dirname "$0")/../scripts/apm.py" "$@"
