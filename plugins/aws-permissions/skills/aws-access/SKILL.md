@@ -13,7 +13,7 @@ You never get admin AWS credentials. AWS access is organised into **projects**, 
 2. **Get access.** Call `get_aws_credentials` with the project (or `apm use <project>`). This sets up the AWS profile `apm-<project>`. Then run AWS commands with `--profile apm-<project>` or `AWS_PROFILE=apm-<project>`.
    - Never use other AWS profiles or the default credentials.
    - Never try to print, export or copy credentials. The profile refreshes them automatically.
-   - If it refuses because the project holds grants that need revoking, read the reasons it names. If one says AWS couldn't list stacks, that's temporary: try again in a minute. Otherwise tell the user which grants it named. If the task doesn't need one of them, you can drop it with `remove_permissions`; otherwise the owner revokes or narrows it in the dashboard.
+   - If it refuses because the project holds grants that need revoking, read the reasons it names. If one says AWS couldn't list stacks, that's temporary: try again in a minute. Otherwise tell the user which grants it named. If you're sure nothing needs one of them, checked the same way as in "Cleaning up a project" below (ask the user first if something deployed or scheduled might), you can drop it with `remove_permissions`; otherwise the owner revokes or narrows it in the dashboard.
 3. **When a call fails with AccessDenied**, call `request_permissions` (or `apm request ... --wait`).
    - Ask for exactly the denied action(s) on the specific resource ARN(s) from the error message.
    - Give a one-sentence reason the owner will understand. An AI reviewer may also comment on the request for the owner; write the reason for the owner, and don't argue for approval in it.
