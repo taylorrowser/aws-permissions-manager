@@ -215,7 +215,8 @@ if (typeof document !== "undefined") {
     for (const t of root.querySelectorAll("time[datetime]")) {
       const d = new Date(t.getAttribute("datetime"));
       t.title = d.toLocaleString();
-      t.textContent = relativeTime(d, new Date());
+      const now = new Date();
+      t.textContent = ("ends" in t.dataset ? (d > now ? "Ends " : "Ended ") : "") + relativeTime(d, now);
     }
     for (const li of root.querySelectorAll("[data-device]")) {
       li.querySelector(".badge.this").hidden = li.dataset.device !== thisDevice;
@@ -397,6 +398,7 @@ if (typeof document !== "undefined") {
     } catch (_) { /* offline or flaky; the next poll tries again */ } finally { polling = false; }
   }
   if (signedIn) setInterval(poll, 10000);
+  if (signedIn) setInterval(() => hydrate(), 30000); // countdowns and "5 min ago" keep moving while idle
   addEventListener("focus", poll);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;

@@ -639,6 +639,7 @@ class TimeLimitTests(unittest.TestCase):
         ev = self.app.store.events()[-1]
         self.assertEqual((ev["op"], ev["outcome"], ev["actor"], ev["request_ids"], ev["grants"]),
                          ("expire", "applied", "APM (time limit)", [1, 2], ["Req2"]))  # every live grant, as for any write
+        self.assertEqual(ev["targets"], [1])
         before = (len(self.app.store.events()), repr(sorted(self.iam.policies.items())))
         self.assertEqual(self.app.sweep(later), {"expired": {}})
         self.assertEqual((len(self.app.store.events()), repr(sorted(self.iam.policies.items()))), before)
@@ -663,6 +664,7 @@ class TimeLimitTests(unittest.TestCase):
         self.approve(self.ask()[1]["id"], 1)
         page = self.app(web.Request("GET", "/projects", cookies=session_cookie(self.app))).body
         self.assertIn("Revoke early", page)
+        self.assertIn("<time data-ends datetime=", page)  # the page script keeps the countdown moving
         self.assertIn('name="op" value="extend"', page)
         self.assertEqual(self.app.decide({"op": "extend", "project": "myapp", "sid": "Req1", "hours": "0"}, "owner"),
                          "Extended Req1 on myapp permanently.")

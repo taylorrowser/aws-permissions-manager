@@ -130,6 +130,12 @@ def _time(ts):
     return f'<time datetime="{iso}">{time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))}</time>'
 
 
+def _ends(ts):
+    """When a grant ends, as a countdown the page script keeps current ("Ends in 2 h", then "Ended")."""
+    word = "Ends" if ts > time.time() else "Ended"
+    return f'<time data-ends datetime="{policy.iso(ts)}">{word} {time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts))}</time>'
+
+
 def _codes(items):
     return "".join(f"<li><code>{e(x)}</code></li>" for x in items)
 
@@ -459,7 +465,7 @@ def _grant_card(g, form=""):
         suggested, name = g["suggested_hours"], "hours-%d" % g["n"]
         lasts = f'<label class=lasts>For {_durations(name, suggested or 0, suggested, form, f"{form}-{name}")}</label>'
     elif g["expires_at"]:
-        lasts = f'<p class=lasts>{"Ends" if g["expires_at"] > time.time() else "Ended"} {_time(g["expires_at"])}</p>'
+        lasts = f'<p class=lasts>{_ends(g["expires_at"])}</p>'
     else:
         lasts = ""
     return (f'<section class=grant><p class=grant-head><span class=plain>{e(plain(actions, resources))}</span>'
@@ -569,7 +575,7 @@ def _grant(project, s, store, reasons=()):
     ends = req.get("expires_at", 0) if req and req["status"] == "approved" else 0
     extend = ""
     if ends:  # a countdown, and Extend: a new duration from now, or permanent
-        why += f'<p class=muted>{"Ends" if ends > time.time() else "Ended"} {_time(ends)}</p>'
+        why += f'<p class=muted>{_ends(ends)}</p>'
         extend = ('<form method="post" action="/action" class=extend>'
                   + "".join(f'<input type="hidden" name="{k}" value="{e(v)}">'
                             for k, v in (("op", "extend"), ("project", project), ("sid", sid), ("back", "/projects")))
