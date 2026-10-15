@@ -43,6 +43,7 @@ ASSET_VERSION = hashlib.sha256(b"".join((STATIC / n).read_bytes() for n, _ in ST
 REVALIDATE = {"/sw.js", "/manifest.webmanifest", "/offline.html"}
 # Owner screens. Signed-out visits show the sign-in page and come back here after signing in.
 SCREENS = re.compile(r"/(projects|usage|settings|devices|keys|requests/[0-9]{1,12}|connect/[A-Z0-9]{4}-[A-Z0-9]{4})?")
+USAGE_SCREEN = re.compile(r"/usage\?project=[a-z][a-z0-9-]{1,40}")  # the one screen that takes a query
 SESSION_COOKIE = "__Host-apm_session"
 OAUTH_COOKIE = "__Host-apm_oauth"
 SESSION_SECONDS = 30 * 24 * 3600
@@ -210,7 +211,8 @@ class App:
             return json_response({"v": version, "pending": pending})
         if m == "GET" and SCREENS.fullmatch(p):
             if not owner:
-                return Response(200, pages.login_page(self, req.query.get("error", ""), p))
+                here = f"/usage?project={req.query.get('project', '')}" if p == "/usage" else p
+                return Response(200, pages.login_page(self, req.query.get("error", ""), _safe_next(here)))
             return self.screen(req, owner)
         if m == "POST":
             json_call = p.startswith("/push/")
@@ -647,7 +649,7 @@ def _q(s):
 def _safe_next(path):
     """Only ever redirect to one of our own screens, never to another site."""
     path = str(path or "/")
-    return path if SCREENS.fullmatch(path) else "/"
+    return path if SCREENS.fullmatch(path) or USAGE_SCREEN.fullmatch(path) else "/"
 
 
 def _http_json(url, body):

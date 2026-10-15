@@ -796,6 +796,9 @@ class UsageTests(WebCase):
         self.assertIn("about 4 hours late", page)
         self.assertEqual(page.count("chip unused"), 1)
         self.assertEqual(self.api("GET", "/api/usage?project=nope")[0], 404)
+        signed_out = self.app(web.Request("GET", "/usage", {"project": "myapp"})).body
+        self.assertIn('href="/login?next=%2Fusage%3Fproject%3Dmyapp"', signed_out)  # sign-in comes back here
+        self.assertEqual(web._safe_next("/usage?project=myapp&x=https://evil.test"), "/")
         missing = self.app(web.Request("GET", "/usage", {"project": "nope"}, cookies=session_cookie(self.app)))
         self.assertEqual(missing.headers["Location"], "/projects")
         self.assertEqual(self.iam.policies[("apm-myapp", policy.GRANTS_POLICY)]["Statement"][0]["Sid"], "Req1")
