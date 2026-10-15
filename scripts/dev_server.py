@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parent.parent
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 
-from apm import push, web  # noqa: E402
+from apm import policy, push, web  # noqa: E402
 from apm.broker import Broker  # noqa: E402
 from apm.store import Store  # noqa: E402
 from test_apm import FakeCloudFormation, FakeIAM, FakeSTS, FakeTable  # noqa: E402
@@ -83,6 +83,20 @@ def seed(app):
           "Check which assets are already uploaded before syncing.", "macbook")
     s.add("website", ["s3:PutBucketPolicy"], ["arn:aws:s3:::example-site"],
           "Let CloudFront read the bucket through an origin access control.", "macbook")
+    # Size checks: a project whose policy is near IAM's limit. One more is too big to approve; the
+    # same grants replacing the old ones fit, and the card lists what they replace.
+    media = [f"arn:aws:s3:::media-uploads-{n}/*" for n in range(160)]
+    old = s.add("media", ["s3:GetObject"], media, "Serve uploaded media to the transcoder.", "macbook")
+    decide(old)
+    s.add("media", ["s3:PutObject", "s3:GetObject"], media, "Write transcoded renditions next to each upload.", "macbook")
+    s.add("media", ["s3:PutObject", "s3:GetObject"], media, "Write transcoded renditions next to each upload.", "macbook",
+          replaces=[f"Req{old}"])
+    # Fits only while its grants are permanent: picking a time limit turns Approve off.
+    room = policy.MAX_INLINE_POLICY_CHARS - policy.size(policy.grants_document(s.approved("media")))
+    thumbs = [f"arn:aws:s3:::media-thumbs-{n}/*" for n in range(room // 31)]
+    while policy.size(policy.doc(policy.statement("Req99", ["s3:PutObject"], thumbs))) + 1 > room:
+        thumbs.pop()
+    s.add("media", ["s3:PutObject"], thumbs, "Write thumbnails for each upload.", "macbook", suggested_hours=3)
     # A stack write approved before its stack had a stored role: Projects shows it blocked.
     decide(s.add("infra", ["cloudformation:UpdateStack"], ["arn:aws:cloudformation:us-east-1:111122223333:stack/web-*/*"],
                  "Update the web stack's parameters.", "macbook"))

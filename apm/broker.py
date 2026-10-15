@@ -12,6 +12,10 @@ class BrokerError(Exception):
     pass
 
 
+# PutRolePolicy errors that mean IAM rejected the document and wrote nothing.
+IAM_REFUSALS = {"LimitExceeded", "MalformedPolicyDocument"}
+
+
 def _is_missing(err):
     return getattr(err, "response", {}).get("Error", {}).get("Code") == "NoSuchEntity"
 
@@ -72,11 +76,18 @@ class Broker:
                     if not _is_missing(e):
                         raise
                 return None
+            problem = policy.size_problem(project, new)
+            if problem:
+                raise BrokerError(f"{problem}; revoke or consolidate grants first")
             body = policy.dumps(new)
-            if len(body) > policy.MAX_INLINE_POLICY_CHARS:
-                raise BrokerError(f"project {project} would exceed the {policy.MAX_INLINE_POLICY_CHARS}-char inline policy limit; revoke or consolidate grants first")
             self._ensure_role(project)
-            self.iam.put_role_policy(RoleName=name, PolicyName=policy.GRANTS_POLICY, PolicyDocument=body)
+            try:
+                self.iam.put_role_policy(RoleName=name, PolicyName=policy.GRANTS_POLICY, PolicyDocument=body)
+            except Exception as e:
+                code = getattr(e, "response", {}).get("Error", {}).get("Code")
+                if code in IAM_REFUSALS:  # IAM said no, so nothing was written
+                    raise BrokerError(f"IAM refused the policy for {name} ({code}): {e}") from e
+                raise
             return new
 
     def remove_project(self, project):

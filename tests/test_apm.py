@@ -456,7 +456,7 @@ class GrantConsistencyTests(unittest.TestCase):
         self.approve(self.add(resources=big))
         r = self.add(actions=["s3:PutObject"], resources=big)
         msg = self.app.action({"op": "approve", "id": str(r["id"]), "digest": r["digest"]}, "owner")
-        self.assertIn("inline+policy+limit", msg.headers["Location"])
+        self.assertIn("inline+policy+apm-grants+on+role+apm-myapp+would+be+10%2C720+characters%2C+480+over", msg.headers["Location"])
         self.assertEqual(self.app.store.get(r["id"])["status"], "pending")
         self.assertEqual(self.sids(), ["Req1"])
 
@@ -528,7 +528,7 @@ class AuditTests(unittest.TestCase):
         self.assertIn("updating IAM failed", self.approve(self.add()))
         ev = self.events()
         self.assertEqual([e["outcome"] for e in ev], ["applied", "refused", "failed"])
-        self.assertIn("inline policy limit", ev[1]["error"])
+        self.assertIn("480 over the 10,240-character limit", ev[1]["error"])
         self.assertEqual(ev[2]["error"], "TimeoutError: read timed out")
 
     def test_a_grant_cleared_by_a_later_sync_traces_back_to_its_request(self):
@@ -1173,6 +1173,138 @@ class MultiGrantTests(unittest.TestCase):
         self.assertEqual(self.api("POST", "/api/credentials", {"project": "myapp"})[0], 200)
 
 
+class SizeAndReplacesTests(unittest.TestCase):
+    """Every write is size-checked first, and so is the card; a request can supersede grants."""
+    BIG = ["arn:aws:s3:::bucket-" + "x" * 60 + f"-{i}/*" for i in range(60)]  # about half the limit
+
+    def setUp(self):
+        self.app, self.iam, _ = make_app()
+        self.key = self.app.store.create_key("laptop")
+
+    api, owner_post, ask, approve, statements = (WebTests.api, WebTests.owner_post, MultiGrantTests.ask,
+                                                 MultiGrantTests.approve, MultiGrantTests.statements)
+
+    def big(self, action="s3:GetObject", **body):
+        status, r = self.ask(actions=[action], resources=self.BIG, **body)
+        self.assertEqual(status, 201, r)
+        return r
+
+    def card(self, rid):
+        return self.app(web.Request("GET", f"/requests/{rid}", cookies=session_cookie(self.app))).body
+
+    def test_replaces_is_validated_at_request_time(self):
+        self.approve(self.big()["id"])
+        self.big("s3:PutObject")  # #2, pending
+        status, other = self.api("POST", "/api/requests", {"project": "other", "actions": ["s3:GetObject"], "reason": "x"})
+        self.approve(other["id"])  # #3
+        for replaces, error in [(["Req9"], "Req9 isn't a grant myapp holds now"), (["Req2"], "Req2 isn't"),
+                                (["Req3"], "Req3 isn't"), (["Req1g1"], "Req1g1 isn't"), (["s3:GetObject"], "Req52g3"),
+                                ([1], "Req52g3"), (["Req1"] * 21, "up to 20")]:
+            with self.subTest(replaces=replaces):
+                status, r = self.ask(actions=["s3:GetObject"], replaces=replaces)
+                self.assertEqual(status, 400)
+                self.assertIn(error, r["error"])
+        status, r = self.ask(actions=["s3:GetObject"], replaces=["Req1", "Req1"])
+        self.assertEqual((status, r["replaces"]), (201, ["Req1"]))
+
+    def test_the_card_names_the_policy_and_offers_reject_with_a_note(self):
+        self.approve(self.big()["id"])
+        r = self.big("s3:PutObject")
+        page = self.card(r["id"])
+        self.assertIn("Too big to approve.", page)
+        self.assertIn("inline policy apm-grants on role apm-myapp would be 10,720 characters, 480 over", page)
+        self.assertNotIn(f'id="approve-{r["id"]}"', page)
+        self.assertIn("Reject and tell the agent", page)
+        note = re.search(r"<textarea[^>]*>([^<]*)</textarea>", page).group(1)
+        self.assertIn("--replaces", note)
+        self.owner_post({"op": "reject", "id": str(r["id"]), "digest": self.app.store.get(r["id"])["digest"],
+                         "note": "edited: use --replaces Req1"})
+        self.assertEqual(self.api("GET", f"/api/requests/{r['id']}")[1]["note"], "edited: use --replaces Req1")
+        # The same request superseding the first grant fits: the card lists it and offers Approve.
+        r = self.big("s3:PutObject", replaces=["Req1"])
+        page = self.card(r["id"])
+        self.assertNotIn("Too big", page)
+        self.assertIn(f'id="approve-{r["id"]}"', page)
+        self.assertIn("<code>Req1</code>", page)
+        self.assertIn("Approving revokes these first", page)
+
+    def test_the_card_checks_the_chosen_time_limits(self):
+        self.approve(self.big()["id"])
+        r = self.big("s3:PutObject", suggested_hours=1)
+        smallest = policy.size(self.app.approval(self.app.store.get(r["id"]), {1: 0}, self.app.store.approved("myapp"))[2])
+        with mock.patch.object(policy, "MAX_INLINE_POLICY_CHARS", smallest + 10):  # fits only if permanent
+            page = self.card(r["id"])
+            self.assertNotIn("Too big to approve", page)  # making it permanent fits, so no reject-only card
+            self.assertIn(f'data-size="{smallest}" data-per-limit="{policy.CONDITION_CHARS}"', page)
+            self.assertIn('<button class="approve" disabled>', page)
+            self.assertIn("Too big with these time limits: the inline policy apm-grants on role apm-myapp", page)
+            self.assertIn("62+over", self.app.action({"op": "approve", "id": str(r["id"]), "digest": self.app.store.get(r["id"])["digest"],
+                                                      "hours-1": "1"}, "owner").headers["Location"])
+            self.assertIn("Approved", self.approve(r["id"], **{"hours-1": "0"}))
+
+    def test_approving_revokes_the_replaced_grants_then_approves(self):
+        self.approve(self.big()["id"])
+        status, two = self.ask(grants=[{"actions": ["sqs:SendMessage"], "resources": ["arn:aws:sqs:us-east-1:1:q"]},
+                                       {"actions": ["sns:Publish"], "resources": ["arn:aws:sns:us-east-1:1:t"]}])
+        self.approve(two["id"])
+        r = self.big("s3:PutObject", replaces=["Req1", "Req2g2"])
+        self.assertEqual(self.approve(r["id"]), f"Approved request #{r['id']} for myapp. It replaced Req1, Req2g2.")
+        self.assertEqual(sorted(self.statements()), ["Req2g1", f"Req{r['id']}"])
+        old = self.app.store.get(1)
+        self.assertEqual((old["status"], old["note"]), ("revoked", f"replaced by #{r['id']}"))
+        self.assertEqual([g["ended"] for g in self.app.store.get(2)["grants"]], ["", "revoked"])
+        ev = self.app.store.events()[-1]
+        self.assertEqual((ev["op"], ev["outcome"], ev["request_ids"], ev["detail"]),
+                         ("approve", "applied", [1, 2, r["id"]], "replaces Req1, Req2g2"))
+
+    def test_a_failed_save_puts_the_replaced_grants_back(self):
+        self.approve(self.big()["id"])
+        r = self.big("s3:PutObject", replaces=["Req1"])
+        real = self.app.store.set_status
+
+        def flaky(rid, status, *a, **kw):
+            if rid == r["id"] and status == "approved":
+                raise RuntimeError("dynamodb down")
+            return real(rid, status, *a, **kw)
+        self.app.store.set_status = flaky
+        with self.assertRaises(RuntimeError):
+            self.approve(r["id"])
+        del self.app.store.set_status
+        self.assertEqual([self.app.store.get(i)["status"] for i in (1, r["id"])], ["approved", "pending"])
+        self.assertEqual(list(self.statements()), ["Req1"])
+        self.assertIn("Approved", self.approve(r["id"]))  # and it can simply be approved again
+
+    def test_the_size_check_runs_before_anything_changes(self):
+        self.approve(self.big()["id"])
+        status, small = self.ask(actions=["sqs:SendMessage"], resources=["arn:aws:sqs:us-east-1:1:q"])
+        self.approve(small["id"])
+        r = self.big("s3:PutObject", replaces=["Req2"])  # replacing the small grant isn't enough
+        from apm.broker import BrokerError
+        with self.assertRaisesRegex(BrokerError, "apm-grants on role apm-myapp .* over the 10,240-character limit"):
+            self.approve(r["id"])
+        self.assertEqual([self.app.store.get(i)["status"] for i in (1, 2, r["id"])], ["approved", "approved", "pending"])
+        self.assertEqual(self.app.store.events()[-1]["outcome"], "refused")
+
+    def test_a_refused_approval_that_replaced_grants_goes_back_to_pending(self):
+        self.approve(self.big()["id"])
+        r = self.big("s3:PutObject", replaces=["Req1"])
+        class LimitExceeded(Exception):  # what boto3 raises when IAM rejects the document
+            response = {"Error": {"Code": "LimitExceeded"}}
+        self.iam.put_role_policy = mock.Mock(side_effect=LimitExceeded("Maximum policy size exceeded"))
+        resp = self.owner_post({"op": "approve", "id": str(r["id"]), "digest": self.app.store.get(r["id"])["digest"]})
+        msg = parse_qs(urlparse(resp.headers["Location"]).query)["msg"][0]
+        self.assertIn("IAM refused the policy for apm-myapp (LimitExceeded): Maximum policy size exceeded. It's pending "
+                      "again, but the grants it replaces (Req1) were already revoked and IAM may still hold them: open "
+                      "Projects and tap Re-apply decisions for myapp.", msg)
+        self.assertEqual(self.app.store.get(r["id"])["status"], "pending")
+        self.assertEqual(self.app.store.get(1)["status"], "revoked")
+        self.assertEqual(list(self.statements()), ["Req1"])  # IAM still holds it until Re-apply
+        self.assertEqual(self.app.store.events()[-1]["outcome"], "refused")
+        del self.iam.put_role_policy
+        self.app.decide({"op": "sync_project", "project": "myapp"})
+        self.assertEqual(self.statements(), {})
+
+
 class ClientTests(unittest.TestCase):
     """The plugin's stdlib client, run with the system Python like Claude Code/Codex would."""
 
@@ -1393,6 +1525,8 @@ class ClientTests(unittest.TestCase):
                          [(["s3:GetObject", "s3:ListBucket"], ["arn:aws:s3:::b", "arn:aws:s3:::b/*"], 1),
                           (["sqs:SendMessage"], ["arn:aws:sqs:us-east-1:1:q"], 1)])
         self.assertIn("Req2g2: sqs:SendMessage on arn:aws:sqs:us-east-1:1:q", run("status", "2").stdout)
+        run("request", "--project", "web", "-a", "s3:PutObject", "--replaces", "Req1", "--reason", "swap")
+        self.assertEqual(self.app.store.get(3)["replaces"], ["Req1"])
         self.assertIn("not both", run("request", "--project", "web", "--grant", "s3:GetObject", "-a", "s3:GetObject",
                                       "--reason", "x").stderr)
         self.assertIn("not both", run("request", "--project", "web", "--grant", "s3:GetObject", "-r", "arn:aws:s3:::b",

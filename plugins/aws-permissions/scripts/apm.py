@@ -5,6 +5,7 @@
     apm projects [--search TEXT]   projects and what each is allowed to do
     apm request --project P -a ACTION [-r ARN] --reason WHY [--for 3h] [--wait]
     apm request --project P --grant 'a1,a2=arn1,arn2' [--grant ...] --reason WHY   several grants, one request
+    apm request ... --replaces Req22 [--replaces Req52g3]   grants the new request supersedes
     apm status [ID] | apm wait ID
     apm use PROJECT                set up AWS profile apm-PROJECT (credentials stay out of view)
     apm credentials PROJECT        AWS credential_process helper (used by the profile)
@@ -31,7 +32,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 DEFAULT_URL = "https://apm.taylorrowser.com"
 HOME = Path(os.environ.get("APM_HOME", Path.home() / ".apm"))
 CLIENT_FILE = HOME / "client.json"
@@ -167,15 +168,17 @@ def hours(duration):
 MAX_GRANTS = 9
 
 
-def request(project, actions, resources, reason, duration=None, grants=None):
+def request(project, actions, resources, reason, duration=None, grants=None, replaces=None):
     """grants: [{"actions", "resources", "duration" (optional)}], one per resource set, instead of
-    actions and resources. duration then applies to each grant that doesn't name its own."""
+    actions and resources. duration then applies to each grant that doesn't name its own. replaces:
+    grants of the project (Req22, Req52g3, as `apm projects` shows them) that approving it revokes."""
+    extra = {"replaces": list(replaces)} if replaces else {}
     if grants and (actions or resources):
         raise ApmError("give either grants or actions/resources, not both")
     if grants:
         if len(grants) > MAX_GRANTS:
             raise ApmError(f"at most {MAX_GRANTS} grants per request")
-        body = {"project": project, "reason": reason, "grants": []}
+        body = {"project": project, "reason": reason, "grants": [], **extra}
         for g in grants:
             item = {"actions": list(g.get("actions") or []), "resources": list(g.get("resources") or []) or ["*"]}
             d = g.get("duration") or duration
@@ -185,7 +188,7 @@ def request(project, actions, resources, reason, duration=None, grants=None):
         return call("POST", "/api/requests", body)
     if not actions:
         raise ApmError("give at least one action, or grants")
-    body = {"project": project, "actions": actions, "resources": resources or ["*"], "reason": reason}
+    body = {"project": project, "actions": actions, "resources": resources or ["*"], "reason": reason, **extra}
     if duration is not None:
         body["suggested_hours"] = hours(duration)
     return call("POST", "/api/requests", body)
@@ -375,6 +378,8 @@ def main(argv=None):
     s.add_argument("--reason", required=True)
     s.add_argument("--for", dest="duration", metavar="DURATION",
                    help="how long you need it: 1h, 3h, 1d, 1w or permanent (the owner decides)")
+    s.add_argument("--replaces", action="append", default=[], metavar="GRANT",
+                   help="a grant this request supersedes, as `apm projects` names it (Req22, Req52g3); repeatable")
     s.add_argument("--wait", action="store_true", help="block until the owner decides (up to 30 min)")
     s = sub.add_parser("status", help="show requests")
     s.add_argument("id", nargs="?", type=int)
@@ -431,7 +436,8 @@ def cmd_request(a):
         raise ApmError("use either --grant or --action/--resource, not both")
     if not a.grant and not a.action:
         raise ApmError("give --action (with --resource), or --grant")
-    r = request(a.project, a.action, a.resource, a.reason, a.duration, [parse_grant(g) for g in a.grant] or None)
+    r = request(a.project, a.action, a.resource, a.reason, a.duration, [parse_grant(g) for g in a.grant] or None,
+                a.replaces)
     print(f"Request #{r['id']} sent to the owner for approval.")
     if a.wait:
         return _finish(wait(r["id"], 1800))
@@ -529,7 +535,11 @@ TOOLS = [
                     "items": {"type": "object", "required": ["actions"], "properties": {
                         "actions": {"type": "array", "items": {"type": "string"}},
                         "resources": {"type": "array", "items": {"type": "string"}},
-                        "duration": {"type": "string", "enum": ["1h", "3h", "1d", "1w", "permanent"]}}}}}}},
+                        "duration": {"type": "string", "enum": ["1h", "3h", "1d", "1w", "permanent"]}}}},
+         "replaces": {"type": "array", "items": {"type": "string"},
+                      "description": "Grants of this project that the request supersedes, as list_projects names "
+                                     "them (e.g. Req22, Req52g3). Approving it revokes them, so the role's policy "
+                                     "stays under IAM's size limit."}}}},
     {"name": "check_request",
      "description": "Get the status of a permission request (pending, approved, rejected, revoked, expired). Set "
                     "wait_seconds (max 120) to wait for the owner's decision; call again if still pending.",
@@ -624,8 +634,9 @@ class McpServer:
                 f"`AWS_PROFILE={profile}`. Credentials refresh automatically and are never displayed. "
                 "If a call fails with AccessDenied, use request_permissions.")
 
-    def tool_request_permissions(self, project, reason, actions=None, resources=None, duration=None, grants=None):
-        r = request(project, list(actions or []), list(resources or []), reason, duration, grants)
+    def tool_request_permissions(self, project, reason, actions=None, resources=None, duration=None, grants=None,
+                                 replaces=None):
+        r = request(project, list(actions or []), list(resources or []), reason, duration, grants, replaces)
         return (f"Request #{r['id']} sent to the owner. Call check_request with request_id={r['id']} and "
                 "wait_seconds=120 to wait for the decision.")
 

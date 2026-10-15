@@ -176,6 +176,16 @@ function keyCommand(e, typing) {
   return { ArrowDown: "next", j: "next", ArrowUp: "prev", k: "prev", a: "approve", r: "reject" }[e.key] || null;
 }
 
+// The size check on the card (pages.request_pane): the grants policy with every grant permanent is
+// `size` characters, and each time-limited grant adds `perLimit`. Returns the warning to show, or "".
+function overLimit(size, perLimit, limit, policyName, hours) {
+  const total = size + perLimit * hours.filter((h) => h !== "0").length;
+  if (total <= limit) return "";
+  const n = (x) => x.toLocaleString("en-US");
+  return `Too big with these time limits: the inline policy ${policyName} would be ${n(total)} characters, ` +
+    `${n(total - limit)} over the ${n(limit)}-character limit. Make a grant permanent to approve.`;
+}
+
 // The row to move to from `current` (an id, or null for none) in `ids`.
 function step(ids, current, dir) {
   if (!ids.length) return null;
@@ -186,7 +196,8 @@ function step(ids, current, dir) {
 
 if (typeof module !== "undefined") {
   module.exports = { isIOS, pushState, deniedHelp, keyBytes, sameKey, legacyTarget, relativeTime, rotateIfKeyChanged,
-    canRefresh, createPager, isInboxPath, afterSubmit, onHistory, digestToSubmit, keepDecided, keyCommand, step };
+    canRefresh, createPager, isInboxPath, afterSubmit, onHistory, digestToSubmit, keepDecided, keyCommand, step,
+    overLimit };
 }
 
 // ---------- page behaviour ----------
@@ -307,6 +318,7 @@ if (typeof document !== "undefined") {
       }
       old.replaceWith(fresh);
     }
+    document.querySelectorAll("form[data-size]").forEach(checkSize); // picks restored above
     const list = $("decided-list");
     if (list && oldDecided.length) {
       const id = (li) => Number(li.querySelector("a")?.id.slice(4));
@@ -530,7 +542,7 @@ if (typeof document !== "undefined") {
       pager.claim(); // a row still loading must not replace the pane behind the dialog
       if (!(await askConfirm(form))) return;
     }
-    const button = form.querySelector("button");
+    const button = form.querySelector("button:not([type=button])"); // not e.g. Copy note
     const label = button?.textContent;
     const removingHere = form.closest("[data-device]")?.dataset.device === thisDevice;
     await pager.submit(async () => { // false if something else was submitted while the dialog was open
@@ -548,19 +560,34 @@ if (typeof document !== "undefined") {
       } catch (_) {
         flash("Couldn't reach the server. Check your connection and try again.");
       } finally {
-        if (button && button.isConnected) { button.disabled = false; button.textContent = label; }
+        if (button && button.isConnected) { button.disabled = false; button.textContent = label; checkSize(button.form); }
       }
     });
   });
 
+  // Only offer Approve while the chosen durations fit (see overLimit). Runs when a picker changes,
+  // and after a refresh or a submit, which can restore picks or re-enable the button.
+  function checkSize(form) {
+    if (!form || !form.dataset.size) return;
+    const d = form.dataset;
+    const hours = [...form.elements].filter((el) => el.tagName === "SELECT").map((el) => el.value);
+    const warning = overLimit(Number(d.size), Number(d.perLimit), Number(d.limit), d.policy, hours);
+    // getAttribute: form.id would be the form's hidden "id" input.
+    const slot = $(form.getAttribute("id").replace("approve-", "size-")), button = form.querySelector("button.approve");
+    if (slot) { slot.textContent = warning; slot.hidden = !warning; }
+    if (button) button.disabled = Boolean(warning);
+  }
+  document.addEventListener("change", (event) => checkSize(event.target.form));
+
   document.addEventListener("click", async (event) => {
-    const copy = event.target.closest("#copy-key");
+    const copy = event.target.closest("#copy-key, button.copy");
     if (!copy) return;
+    const target = $(copy.dataset.target);
     try {
-      await navigator.clipboard.writeText($(copy.dataset.target).textContent);
+      await navigator.clipboard.writeText(target.value ?? target.textContent);
       copy.textContent = "Copied";
     } catch (_) {
-      copy.textContent = "Select the key and copy it";
+      copy.textContent = copy.id === "copy-key" ? "Select the key and copy it" : "Select the note and copy it";
     }
   });
 

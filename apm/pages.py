@@ -507,6 +507,9 @@ def request_pane(app, r, projects, error=""):
     out += [_grant_card(g, f"approve-{rid}" if pending else "", approved, f"/requests/{rid}") for g in grants]
     if project not in projects and pending:
         out.append(f'<p class=note>Creates the project and its role <code>{e(policy.role_name(project))}</code>.</p>')
+    held = app.store.approved(project) if pending else []
+    if r.get("replaces"):
+        out.append(_replaces(r, held, pending))
     shown = policy.live_grants(r) if approved else grants  # what IAM holds, once approved
     stmts = [policy.statement(g["sid"], g["actions"], g["resources"], g["expires_at"]) for g in shown]
     out.append(f'<details class=more id="details-{rid}"><summary>Details</summary><dl class=meta>'
@@ -522,12 +525,66 @@ def request_pane(app, r, projects, error=""):
         wild = ", ".join(a for g in grants for a in g["actions"] if "*" in a) or "every resource"
         confirm = f"Approve {LABELS[level].lower()} ({wild}) for {project}?" if level in ("full", "broad") else ""
         back = f"/requests/{rid}"
-        out.append(f'<div class=pane-actions><div id=flash-slot>{_flash(error)}</div><div class=decide>'
-                   + _form({"op": "approve", "id": rid, "digest": r["digest"]}, "Approve", "approve", confirm, back,
-                           form_id=f"approve-{rid}")
+        # The same size check as at approval. With every grant permanent it's as small as it gets;
+        # if that doesn't fit, no time limit will. Each time limit adds a fixed amount, so the page
+        # script re-checks as the pickers change (data-size), starting from the agent's suggestions.
+        smallest = policy.size(app.approval(r, {g["n"]: 0 for g in grants}, held)[2])
+        too_big = policy.size_message(project, smallest)
+        if too_big:
+            out.append(_too_big(r, too_big, error, back))
+            return "".join(out) + "</section>"
+        timed = smallest + policy.CONDITION_CHARS * sum(1 for g in grants if g["suggested_hours"])
+        over = policy.size_message(project, timed)
+        approve = _form({"op": "approve", "id": rid, "digest": r["digest"]}, "Approve", "approve", confirm, back,
+                        form_id=f"approve-{rid}")
+        approve = approve.replace(f' id="approve-{rid}"', f' id="approve-{rid}" data-size="{smallest}" '
+                                  f'data-per-limit="{policy.CONDITION_CHARS}" data-limit="{policy.MAX_INLINE_POLICY_CHARS}" '
+                                  f'data-policy="{e(policy.GRANTS_POLICY)} on role {e(policy.role_name(project))}"', 1)
+        if over:
+            approve = approve.replace('<button class="approve">', '<button class="approve" disabled>', 1)
+        warn = _over_limits(over) if over else ""
+        out.append(f'<div class=pane-actions><div id=flash-slot>{_flash(error)}</div>'
+                   f'<p class="explain size-warn" id="size-{rid}"{"" if over else " hidden"}>{warn}</p><div class=decide>'
+                   + approve
                    + _form({"op": "reject", "id": rid, "digest": r["digest"]}, "Reject", "reject", "", back)
                    + "</div></div>")
     return "".join(out) + "</section>"
+
+
+def _replaces(r, held, pending):
+    """The grants a request supersedes. While it's pending, what each one is, from what's approved now."""
+    live = {g["sid"]: g for x in held for g in policy.live_grants(x)}
+    items = []
+    for x in r["replaces"]:
+        ref = policy.parse_sid(x)
+        mine = [g for g in live.values() if ref and policy.parse_sid(g["sid"])[0] == ref[0] and (g["sid"] == x or ref[1] is None)]
+        what = "; ".join(plain(g["actions"], g["resources"]) for g in mine)
+        link = f' <a href="/requests/{ref[0]}">#{ref[0]}</a>' if ref else ""
+        line = e(what) if what else ("no longer granted" if pending else "")
+        items.append(f'<li><code>{e(x)}</code>{link}{" " + line if line else ""}</li>')
+    lead = "Approving revokes these first:" if pending else "Replaces:"
+    return f'<section class=replaces><h3>Replaces</h3><p class=muted>{lead}</p><ul>{"".join(items)}</ul></section>'
+
+
+def _over_limits(problem):
+    """Approve is off until the chosen time limits fit (static/app.js words it the same way)."""
+    return f"Too big with these time limits: {e(problem)}. Make a grant permanent to approve."
+
+
+def _too_big(r, problem, error, back):
+    """Instead of Approve: why it can't fit, and a rejection that tells the agent what to do."""
+    rid = r["id"]
+    note = (f"Request #{rid} is too big to approve: {problem}. Ask again with a smaller request: drop actions you don't need, merge "
+            "grants on the same resources, or name the grants it supersedes with --replaces (see `apm projects`).")
+    hidden = "".join(f'<input type="hidden" name="{k}" value="{e(str(v))}">'
+                     for k, v in (("op", "reject"), ("id", rid), ("digest", r["digest"]), ("back", back)))
+    return (f'<div class=pane-actions><div id=flash-slot>{_flash(error)}</div>'
+            f'<form method="post" action="/action" class=too-big>{hidden}'
+            f'<p class=explain><b>Too big to approve.</b> {e(problem[0].upper() + problem[1:])}.</p>'
+            f'<label for="note-{rid}">Note for the agent</label>'
+            f'<textarea id="note-{rid}" name=note rows=4 maxlength=500>{e(note)}</textarea>'
+            f'<div class=decide><button type=button class=copy data-target="note-{rid}">Copy note</button>'
+            '<button class=reject>Reject and tell the agent</button></div></form></div>')
 
 
 def connect_pane(c, code, error=""):
