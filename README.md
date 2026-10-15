@@ -23,6 +23,7 @@ agent ── aws --profile apm-<project> ── credential_process ────�
   - assume them to vend credentials;
   - read and write its DynamoDB table;
   - list CloudFormation stacks (`DescribeStacks`, `ListStacks`), to refuse stack writes that would run as a stack's stored role.
+  - read, save and delete its one AI reviewer key parameter (`/apm/llm-key`), and invoke itself to queue a review.
 
   It can't remove a boundary or touch any other IAM resource, and no long-lived broker key exists anywhere.
 - **Agents hold only an API key.** It lets them list projects, request permissions, get credentials and remove access they no longer need (which applies at once and notifies you, since it only shrinks access). Approving needs your WorkOS sign-in. Any key can use any approved project; you tell each agent which one to use.
@@ -79,6 +80,8 @@ The app has three screens: **Requests** (the home screen: agents asking to conne
 **Delivery.** When an agent asks for something, the Lambda sends to every device in parallel. It retries a timeout, 429 or 5xx once, then gives up; the Lambda can't queue work after it responds. Devices the push service reports as gone (404/410) are removed. Other failures are recorded per device and shown under Settings. Every send logs a JSON line (`"event": "push"`) to CloudWatch with the outcome and HTTP status. A missed notification never loses a request: the Requests screen always lists everything pending. Browsers that rotate a subscription re-register it themselves, as does the app whenever it opens.
 
 **Live updates.** Every signed-in screen keeps itself current without a reload. While the page is visible it asks `GET /poll` (session-authenticated, a fingerprint of requests, connects, keys and devices) every 10 seconds, and again whenever the app regains focus, becomes visible or a push notification arrives; when the fingerprint changes it re-fetches the screen and swaps the content in place. Approve, reject, revoke and delete submit in the page the same way. A refresh never interrupts you: it waits while you're typing, confirming, submitting or looking at a new key.
+
+**AI reviewer (optional).** Paste an API key for an Anthropic Messages-compatible endpoint under **Settings → AI reviewer** and every new request gets a second opinion: a verdict (looks OK, narrow it or reject it), a sentence on why and, for narrowing, the narrower lists it would approve. It's advice in its own violet panel, never a decision. The key is stored as the SecureString `/apm/llm-key` and never shown again; Remove deletes it (SSM won't recreate it for about 30 seconds). The model sees only the request and its project's existing grants, never keys, sessions, who asked or other projects. The endpoint and model default to `https://api.anthropic.com/v1/messages` and `claude-sonnet-5-5`; the Lambda's `LLM_URL` and `LLM_MODEL` environment variables override them. Without a key, requests show "No AI review".
 
 **Offline and caching.** The service worker caches only static files (CSS, JS, icons and an offline page). Signed-in pages, approvals, keys and API responses are never cached (`Cache-Control: no-store`). Offline, buttons are disabled and opening a screen shows the offline page. Nothing is queued to send later.
 

@@ -454,10 +454,11 @@ def _durations(name, selected, suggested=None, form="", ident=""):
     return f'<select name="{e(name)}"{attrs}>{opts}</select>'
 
 
-def _grant_card(g, form="", project="", back="/"):
+def _grant_card(g, form="", project="", back="/", note=None):
     """One grant: the plain line and its risk, what it means, then the exact actions and ARNs. form:
     the Approve form's id while the request is pending, which the grant's duration picker joins.
-    project: set once the request is approved, to give a grant still in force its own Extend and Revoke."""
+    project: set once the request is approved, to give a grant still in force its own Extend and Revoke.
+    note: the AI reviewer's note on this grant, if it left one."""
     actions, resources = g["actions"], g["resources"]
     notes = _scope_notes(actions, resources)
     if form:
@@ -476,7 +477,39 @@ def _grant_card(g, form="", project="", back="/"):
     return (f'<section class=grant><p class=grant-head><span class=plain>{e(plain(actions, resources))}</span>'
             f'{_level_label(risk(actions, resources)[0])}</p>'
             + ('<ul class=notes>' + "".join(f"<li>{n}</li>" for n in notes) + "</ul>" if notes else "")
-            + f'<ul class=codes>{_codes(actions)}</ul><ul class=codes>{_codes(resources)}</ul>{lasts}</section>')
+            + f'<ul class=codes>{_codes(actions)}</ul><ul class=codes>{_codes(resources)}</ul>{_ai_note(note)}{lasts}</section>')
+
+
+# ----- the AI reviewer's opinion: violet, labelled as the AI's, never as APM's risk or a decision -----
+
+AI_VERDICTS = {"ok": "Looks OK", "narrow": "Suggests narrowing", "reject": "Suggests rejecting"}
+
+
+def _suggested(v):
+    out = ""
+    for field, label in (("suggested_actions", "Narrower actions"), ("suggested_resources", "Narrower resources")):
+        if v.get(field):
+            out += f'<p class=ai-sub>{label}</p><ul class=codes>{_codes(v[field])}</ul>'
+    return out
+
+
+def ai_panel(r):
+    """The AI reviewer's opinion of a request, or "No AI review" (no key, not reviewed yet, or an
+    answer that couldn't be read). Every string from the model is escaped."""
+    v = r.get("review")
+    if not v:
+        return '<p class="ai ai-none">No AI review</p>'
+    return (f'<section class=ai aria-labelledby="ai-{r["id"]}"><p class=ai-head id="ai-{r["id"]}">'
+            '<span class=ai-label>AI reviewer\'s opinion</span><span class=ai-sub>Advisory. You decide.</span></p>'
+            f'<p><b>{e(AI_VERDICTS.get(v["verdict"], v["verdict"]))}.</b> {e(v.get("reason", ""))}</p>'
+            f'{_suggested(v)}</section>')
+
+
+def _ai_note(note):
+    if not note:
+        return ""
+    return (f'<div class=ai-note><p><span class=ai-label>AI</span> {e(note.get("note", ""))}</p>'
+            f'{_suggested(note)}</div>')
 
 
 def _extend(project, sid, back):
@@ -506,7 +539,10 @@ def request_pane(app, r, projects, error=""):
                    + ('. See it in <a href="/projects">Projects</a>.' if r["status"] == "approved" else "") + "</p>")
         out.append(f'<div id=flash-slot>{_flash(error)}</div>')
     approved = project if r["status"] == "approved" else ""
-    out += [_grant_card(g, f"approve-{rid}" if pending else "", approved, f"/requests/{rid}") for g in grants]
+    out.append(ai_panel(r))
+    notes = {x["grant"]: x for x in (r.get("review") or {}).get("grant_notes", [])} if len(grants) > 1 else {}
+    out += [_grant_card(g, f"approve-{rid}" if pending else "", approved, f"/requests/{rid}", notes.get(g["n"]))
+            for g in grants]
     if project not in projects and pending:
         out.append(f'<p class=note>Creates the project and its role <code>{e(policy.role_name(project))}</code>.</p>')
     held = app.store.approved(project) if pending else []
@@ -897,10 +933,41 @@ def settings_page(app, owner, msg="", new_key=None):
                '<button>Create key</button></div></form>'
                '<p class=muted>Keys let agents ask for access. They can never approve it.</p>')
 
+    if app.reviewer:
+        out.append(_ai_settings(app))
     out.append('<h2 class=section>Account</h2><section class=card>'
                f'<p><b>{e(owner)}</b><br><span class=muted>AWS account {e(app.broker.account)}, {e(app.broker.region)}</span></p>'
                '<form method=post action="/logout" data-native><button class=danger>Sign out</button></form></section>')
     return layout(app, owner, "settings", "Settings", "".join(out), st, msg)
+
+
+def _ai_settings(app):
+    """Settings → AI reviewer: paste a key (kept in SSM, never shown again), replace it or remove it."""
+    try:
+        on = bool(app.reviewer.key())
+    except Exception as ex:  # SSM unreachable: say so, and still let the owner save or remove a key
+        print(json.dumps({"event": "llm_key_read_failed", "error": type(ex).__name__}))
+        on = None
+    if on:
+        status = (f'<p><b>On.</b> Each new request gets an advisory review from <code>{e(app.reviewer.model)}</code>. '
+                  'The key is stored encrypted in SSM and is never shown again.</p>')
+    elif on is None:
+        status = "<p><b>Couldn't check the key.</b> SSM didn't answer; reload to try again.</p>"
+    else:
+        status = ('<p><b>Off.</b> Paste an API key for an Anthropic Messages endpoint to get a second opinion on '
+                  'each new request. It\'s advice only: you still decide.</p>')
+    form = ('<form method="post" action="/action" class=create><input type="hidden" name="op" value="save_llm_key">'
+            '<input type="hidden" name="back" value="/settings">'
+            '<label for=llm-key class=sr-only>API key</label><div class=field>'
+            f'<input type="password" id=llm-key name="llm_key" placeholder="{"Replace the key" if on else "API key"}" '
+            'maxlength="500" required autocomplete=off autocapitalize=off spellcheck=false>'
+            '<button>Save key</button></div></form>')
+    remove = _form({"op": "remove_llm_key"}, "Remove key", "danger small",
+                   "Remove the AI reviewer's key? New requests get no AI review. SSM won't take a new key for "
+                   "about 30 seconds after.", "/settings") if on is not False else ""
+    return (f'<h2 class=section>AI reviewer</h2><section class=card>{status}{form}{remove}'
+            '<p class=muted>Only the request and its project\'s existing grants are sent: never keys, '
+            'sessions, who asked or other projects.</p></section>')
 
 
 def _list(v):

@@ -97,6 +97,13 @@ class ProdCompatibility(unittest.TestCase):
                           "Action": ["cloudformation:DescribeStacks", "cloudformation:ListStacks"]})
         # Intended change 5: the expiry sweep, a 15-minute schedule that invokes the Lambda.
         expected["Resources"].update(SWEEP)
+        # Intended change 6: the AI reviewer may manage its one key parameter and invoke its own function.
+        broker.extend([
+            {"Sid": "ReviewerKey", "Effect": "Allow",
+             "Action": ["ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter"],
+             "Resource": f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/apm/llm-key"},
+            {"Sid": "QueueReview", "Effect": "Allow", "Action": "lambda:InvokeFunction",
+             "Resource": f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:apm"}])
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS))), expected)
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS, stage="prod"))), expected)
 
@@ -214,6 +221,19 @@ class StageIsolation(unittest.TestCase):
             self.assertFalse(iam_match(secrets_stmt["Resource"],
                                        f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/apm/session-secret"))
             self.assertIn(f"stage {stage}", t["Description"])
+
+    def test_reviewer_writes_only_its_own_stage_key_and_invokes_only_itself(self):
+        stages = ["prod"] + NONPROD
+        for stage in stages:
+            t = deploy.template(*PROD_ARGS, stage=stage)
+            stmts = {s["Sid"]: s for s in t["Resources"]["BrokerRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]}
+            key, invoke = stmts["ReviewerKey"]["Resource"], stmts["QueueReview"]["Resource"]
+            for other in stages:
+                o = policy.Names(other)
+                own = other == stage
+                self.assertEqual(iam_match(key, f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter{o.param_prefix}/llm-key"), own)
+                self.assertEqual(iam_match(invoke, f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:{o.function}"), own)
+                self.assertFalse(iam_match(key, f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter{o.param_prefix}/session-secret"))
 
     def test_retention_policies(self):
         def table(stage):

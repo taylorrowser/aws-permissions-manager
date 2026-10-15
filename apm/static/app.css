@@ -1,12 +1,12 @@
-/* Zinc neutrals, 1px hairlines, 8px corners, a 4/8px spacing scale. Colour means one of two things:
-   how much a grant allows (the risk dot and word), or the decision itself (Approve in deep green,
-   which also marks the open row, and Reject). Every text colour meets WCAG AA in light and dark. */
+/* Zinc neutrals, 1px hairlines, 8px corners, a 4/8px spacing scale. Colour means one of three things:
+   how much a grant allows (the risk dot and word), the decision itself (Approve in deep green,
+   which also marks the open row, and Reject), or the AI reviewer's opinion (violet, always labelled). Every text colour meets WCAG AA in light and dark. */
 :root{color-scheme:light dark;--bg:#fff;--side:#fafafa;--sub:#f4f4f5;--fg:#09090b;--muted:#68686f;--line:#e4e4e7;--border:#71717a;
 --ink:#18181b;--ink-fg:#fafafa;--focus:#09090b;--accent:#15803d;--accent-fg:#fff;--selected:#f0fdf4;--reject:#b91c1c;
---read:#047857;--write:#1d4ed8;--broad:#b45309;--full:#b91c1c;--nav-h:56px;--side-w:248px;--list-w:380px}
+--read:#047857;--write:#1d4ed8;--broad:#b45309;--full:#b91c1c;--ai:#6d28d9;--ai-bg:#f5f3ff;--ai-line:#c4b5fd;--nav-h:56px;--side-w:248px;--list-w:380px}
 @media (prefers-color-scheme:dark){:root{--bg:#09090b;--side:#0c0c0e;--sub:#18181b;--fg:#fafafa;--muted:#a1a1aa;--line:#27272a;--border:#71717a;
 --ink:#fafafa;--ink-fg:#09090b;--focus:#d4d4d8;--selected:#0a2614;--reject:#f87171;
---read:#34d399;--write:#60a5fa;--broad:#fbbf24;--full:#f87171}}
+--read:#34d399;--write:#60a5fa;--broad:#fbbf24;--full:#f87171;--ai:#c4b5fd;--ai-bg:#1c1330;--ai-line:#5b21b6}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%;height:100%}
 /* App shell: the body never scrolls, only <main> does (on Requests, its two panes), so iOS can't
@@ -118,6 +118,14 @@ ul.codes{list-style:none;padding:0;margin:4px 0 0;display:flex;flex-wrap:wrap;ga
 details.more{margin:0 0 12px}
 dl.meta{display:grid;grid-template-columns:max-content 1fr;gap:4px 12px;margin:4px 0 8px;font-size:.9rem}
 dl.meta dt{color:var(--muted)}dl.meta dd{margin:0;min-width:0}
+.ai{border:1px solid var(--ai-line);background:var(--ai-bg);border-radius:8px;padding:12px;margin:0 0 12px;font-size:.9rem;overflow-wrap:anywhere}
+.ai p{margin:0 0 6px}.ai p:last-child,.ai ul:last-child{margin-bottom:0}
+.ai-none{color:var(--muted);background:none;border-style:dashed;padding:8px 12px}
+.ai-head{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline}
+.ai-label{color:var(--ai);font-weight:600;font-size:.8rem;text-transform:uppercase;letter-spacing:.04em}
+.ai-sub{color:var(--muted);font-size:.8rem}
+.ai-note{border-left:2px solid var(--ai-line);background:var(--ai-bg);padding:6px 10px;margin:0 0 8px;font-size:.88rem;overflow-wrap:anywhere}
+.ai-note p{margin:0 0 4px}
 .replaces{margin:0 0 12px;font-size:.9rem}
 .replaces p{margin:0 0 4px}
 .replaces ul{margin:0;padding-left:20px}
@@ -198,7 +206,7 @@ box-shadow:0 8px 24px rgba(0,0,0,.18);pointer-events:none;animation:toast 4.5s f
 select{font:inherit;font-size:.9rem;min-height:36px;padding:0 8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg)}
 .extend{display:flex;gap:8px;margin-top:8px}
 .controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}.controls .extend{margin:0}
-input[type=text]{font:inherit;flex:1;min-width:0;min-height:44px;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg)}
+input[type=text],input[type=password]{font:inherit;flex:1;min-width:0;min-height:44px;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg)}
 .secret{font-size:15px;padding:12px;background:var(--sub);border-radius:8px;user-select:all;word-break:break-all}
 .new-key{border-color:var(--border)}
 .steps{margin-top:12px;padding:12px 16px;background:var(--sub);border-radius:8px;font-size:.9rem}
@@ -218,7 +226,7 @@ grid-template-areas:"banner banner" "top main" "nav main";font-size:15px}
 .tabs a[aria-current=page]{background:var(--sub)}
 .icon{width:18px;height:18px}.count{position:static;margin-left:auto}
 .titlebar .stage{display:none}
-button,.button,input[type=text]{min-height:36px}
+button,.button,input[type=text],input[type=password]{min-height:36px}
 .toast{left:auto;right:24px;transform:none;bottom:24px}
 .list-pane{flex:0 0 var(--list-w);border-right:1px solid var(--line);padding-top:0}
 .pane-body{padding:0 24px 24px}
