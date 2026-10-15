@@ -208,6 +208,12 @@ class App:
                 raise ApiError(401, "signed out")
             version, pending = state_version(self.store)
             return json_response({"v": version, "pending": pending})
+        if p == "/decided" and m == "GET":
+            # The next page of the Requests screen's Decided list, loaded as it scrolls into view.
+            if not owner:
+                raise ApiError(401, "signed out")
+            num = lambda k: int(v) if (v := req.query.get(k, "")).isdecimal() and len(v) <= 12 else None  # noqa: E731
+            return json_response(pages.decided_page(self, num("before"), num("since")))
         if m == "GET" and SCREENS.fullmatch(p):
             if not owner:
                 return Response(200, pages.login_page(self, req.query.get("error", ""), p))
@@ -249,12 +255,14 @@ class App:
             r = self.store.get(int(p.rsplit("/", 1)[1]))
             if not r:
                 return Response(404, pages.error_page(self, f"There is no request #{p.rsplit('/', 1)[1]}.", "/"))
-            return Response(200, pages.request_page(self, owner, r, msg, st))
+            return Response(200, pages.inbox(self, owner, st, msg, ("request", r)))
         if p.startswith("/connect/"):
-            return Response(200, pages.connect_page(self, owner, p.rsplit("/", 1)[1], msg))
+            return Response(200, pages.inbox(self, owner, pages.state(self), msg, ("connect", p.rsplit("/", 1)[1])))
+        if p == "/":
+            return Response(200, pages.inbox(self, owner, pages.state(self), msg))
         if p in ("/devices", "/keys"):  # old screens (and old notification links): now under Settings
             return redirect("/settings")
-        view = {"/": pages.requests_page, "/projects": pages.projects_page, "/settings": pages.settings_page}[p]
+        view = {"/projects": pages.projects_page, "/settings": pages.settings_page}[p]
         return Response(200, view(self, owner, msg))
 
     # ----- owner auth (WorkOS AuthKit, PKCE) -----
@@ -332,7 +340,7 @@ class App:
                 if not r or r["status"] != "pending":
                     return "That request is no longer pending."
                 if r["digest"] != form.get("digest"):
-                    return "That request changed after the page loaded. Review it again."
+                    raise Conflict("this request changed after you opened it. Review it again.")
                 if op == "reject":
                     self.store.set_status(r["id"], "rejected", form.get("note", "")[:500], expect="pending")
                     return f"Rejected request #{r['id']}."
@@ -348,7 +356,7 @@ class App:
                     # The write may or may not have reached IAM (e.g. a timeout after IAM applied
                     # it). Keep the approval recorded; Projects shows the mismatch and re-applies.
                     print(f"IAM sync for {project} failed after approving #{r['id']}: {e!r}")
-                    return (f"Approved request #{r['id']}, but updating IAM failed ({type(e).__name__}). "
+                    return (f"Error: approved request #{r['id']}, but updating IAM failed ({type(e).__name__}). "
                             f"Open Projects and tap Re-apply decisions for {project}.")
                 return f"Approved request #{r['id']} for {project}."
         if op == "revoke":
@@ -635,7 +643,10 @@ def state_version(store):
     refresh the page every few seconds for nothing. Pages compute this *before* rendering, so a
     change that lands mid-render makes the next poll differ and refresh, never hide it."""
     requests, connects = store.list(), store.connects()
-    state = [[(r["id"], r["status"], r["digest"], r.get("decided_at")) for r in requests],
+    # Per request: anything a row or the reading pane shows. Fields later features add (a review,
+    # an expiry, per-grant state) are read with .get so they count as soon as they exist.
+    state = [[(r["id"], r["status"], r["digest"], r.get("decided_at"), r.get("note"), bool(r.get("review")),
+               r.get("expires_at"), r.get("grants")) for r in requests],
              [(c["code"], c["status"]) for c in connects],
              [k["pk"] for k in store.keys()],
              [(s["pk"], s.get("last_ok_at"), s.get("last_error_at"), s.get("failures")) for s in store.subscriptions()]]
