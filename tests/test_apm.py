@@ -1376,7 +1376,9 @@ class RemoveTests(unittest.TestCase):
         self.assertEqual((self.app.store.get(1)["status"], self.statements()), ("revoked", {}))
         self.assertEqual(self.remove("Req1")[0], 409)  # no longer held
         self.assertEqual(self.remove("nope")[0], 400)  # malformed: still pushed, without echoing it
-        self.assertEqual(len(self.pushes), 7)
+        bad = self.app(web.Request("POST", "/api/remove", headers={"Authorization": f"Bearer {self.key}"}, body=b"{"))
+        self.assertEqual(bad.status, 400)
+        self.assertEqual(len(self.pushes), 8)
         self.assertEqual(self.pushes[-1]["title"], "laptop couldn't remove access")
 
     def test_a_failed_iam_write_reports_what_was_applied_and_still_pushes(self):

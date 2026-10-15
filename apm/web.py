@@ -778,7 +778,7 @@ class App:
         if p == "/api/requests" and m == "POST":
             return json_response(self.create_request(req.json(), key), 201)
         if p == "/api/remove" and m == "POST":
-            return self.remove(req.json(), key)
+            return self.remove(req, key)
         if p == "/api/requests" and m == "GET":
             rows = self.store.list(status=req.query.get("status"), project=req.query.get("project"))[:50]
             return json_response({"requests": [_public(r) for r in rows]})
@@ -892,14 +892,16 @@ class App:
                             "url": f"/requests/{rid}", "tag": f"req-{rid}"})
         return _public(self.store.get(rid))
 
-    def remove(self, body, key):
+    def remove(self, req, key):
         """An agent drops access it no longer needs: {project, grant: "Req22" | "Req52g3", actions?,
         resources?, reason}. It only shrinks access, so it applies at once (see shrink). The owner is
         pushed every attempt, failures included; History names the key and its reason."""
-        project, sid, reason = str(body.get("project", "")), str(body.get("grant", "")), str(body.get("reason", "")).strip()
-        ref, done, failure, actions, resources = policy.parse_sid(sid), None, "", [], []
+        project = sid = reason = failure = ""
+        ref, done, actions, resources = None, None, [], []
         try:
-            actions, resources = _strs(body.get("actions")), _strs(body.get("resources"))
+            body = req.json()
+            project, sid, reason = str(body.get("project", "")), str(body.get("grant", "")), str(body.get("reason", "")).strip()
+            ref, actions, resources = policy.parse_sid(sid), _strs(body.get("actions")), _strs(body.get("resources"))
             if not policy.PROJECT_RE.match(project):
                 raise ApiError(400, "invalid project name")
             if not ref:
