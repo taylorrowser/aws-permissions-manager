@@ -146,6 +146,12 @@ AUDIT_TAMPERING = [
     "cloudtrail:PutInsightSelectors", "cloudtrail:DeleteEventDataStore", "cloudtrail:UpdateEventDataStore",
     "cloudtrail:StopEventDataStoreIngestion",
 ]
+# Actions that set a resource's own policy: whoever holds one can grant anyone anything on that
+# resource. The dashboard labels them.
+RESOURCE_POLICY_ACTIONS = [
+    "s3:PutBucketPolicy", "sqs:SetQueueAttributes", "sns:SetTopicAttributes", "kms:PutKeyPolicy", "kms:CreateGrant",
+    "lambda:AddPermission", "secretsmanager:PutResourcePolicy", "ecr:SetRepositoryPolicy", "logs:PutResourcePolicy",
+]
 # Exceptions the boundary allows back in.
 IAM_ALLOWED = ["iam:Get*", "iam:List*", "iam:PassRole"]
 
@@ -251,6 +257,11 @@ def agent_role_trust(account, names=None):
     """Only the broker can assume agent roles; agents get the resulting session credentials."""
     return doc({"Effect": "Allow", "Action": "sts:AssumeRole",
                 "Principal": {"AWS": broker_role_arn(account, names)}})
+
+
+def resource_policy_actions(actions):
+    """The resource-policy actions that these actions, wildcards included, cover."""
+    return [p for p in RESOURCE_POLICY_ACTIONS if any(fnmatch.fnmatchcase(p.lower(), a.lower()) for a in actions)]
 
 
 def is_blocked(action):

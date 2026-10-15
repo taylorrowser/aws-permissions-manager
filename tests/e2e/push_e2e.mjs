@@ -53,7 +53,7 @@ try {
   log("test notification displayed:", JSON.stringify(await notification("test").catch((e) => e.message)));
 
   await page.reload();
-  await page.waitForSelector(".chip.this:not([hidden])");
+  await page.waitForSelector(".badge.this:not([hidden])");
   log("device row:", (await page.textContent("[data-device]")).replace(/\s+/g, " ").trim());
 
   // An agent asks for permissions: the notification must not reveal the reason or actions.

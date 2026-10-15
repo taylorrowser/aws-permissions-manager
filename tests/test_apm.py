@@ -524,8 +524,10 @@ class AuditTests(unittest.TestCase):
         self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
         self.assertEqual(self.events()[-1]["targets"], [1])
         page = self.app(web.Request("GET", "/requests/2", cookies=session_cookie(self.app))).body
-        self.assertIn("Approved", page)
-        self.assertNotIn("Revoked", page)  # request 2 kept its grant
+        history = page[page.index("<section class=history>"):]
+        history = history[:history.index("</section>")]
+        self.assertIn("Approved", history)
+        self.assertNotIn("Revoked", history)  # request 2 kept its grant
 
     def test_a_grant_restored_by_another_approval_shows_in_its_history(self):
         real_put = self.iam.put_role_policy
