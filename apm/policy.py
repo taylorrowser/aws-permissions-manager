@@ -154,6 +154,22 @@ RESOURCE_POLICY_ACTIONS = [
 ]
 # Exceptions the boundary allows back in.
 IAM_ALLOWED = ["iam:Get*", "iam:List*", "iam:PassRole"]
+# Actions that make some other role run code or commands: on every resource, they would let an
+# agent act as any function's, service's, project's or instance's role. Refused on "*".
+RUN_AS_ACTIONS = [
+    "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration", "ecs:UpdateService", "ecs:RunTask",
+    "codebuild:StartBuild", "states:UpdateStateMachine", "ssm:SendCommand", "ec2-instance-connect:SendSSHPublicKey",
+]
+# CloudFormation actions that change a stack, including stack refactors. They run as the stack's
+# stored RoleARN (often an admin CDK execution role) without needing iam:PassRole, so they're
+# refused on every stack, on a wildcard region and on any existing stack with a stored role.
+STACK_WRITE_ACTIONS = [
+    "cloudformation:CreateStack", "cloudformation:UpdateStack", "cloudformation:DeleteStack",
+    "cloudformation:CreateChangeSet", "cloudformation:ExecuteChangeSet", "cloudformation:ContinueUpdateRollback",
+    "cloudformation:RollbackStack", "cloudformation:CancelUpdateStack", "cloudformation:CreateStackRefactor",
+    "cloudformation:ExecuteStackRefactor",
+]
+REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-[0-9]$")
 
 
 def role_name(project, names=None):
@@ -248,6 +264,10 @@ def broker_policy(account, names=None):
         {"Sid": "LookUpAgentRoles", "Effect": "Allow",
          "Resource": f"arn:aws:iam::{account}:role/{n.role_prefix}*",
          "Action": ["iam:GetRole", "iam:GetRolePolicy", "iam:ListRolePolicies"]},
+        # Read-only: a stack write is refused if the stack it names has a stored role (refusals()).
+        # DescribeStacks without a stack name also needs ListStacks.
+        {"Sid": "CheckStackRoles", "Effect": "Allow", "Resource": "*",
+         "Action": ["cloudformation:DescribeStacks", "cloudformation:ListStacks"]},
         {"Sid": "NeverRemoveBoundary", "Effect": "Deny", "Resource": "*",
          "Action": ["iam:DeleteRolePermissionsBoundary", "iam:PutRolePermissionsBoundary"]},
     )
@@ -259,9 +279,101 @@ def agent_role_trust(account, names=None):
                 "Principal": {"AWS": broker_role_arn(account, names)}})
 
 
+def _covers(actions, targets):
+    """The target actions that these actions, wildcards included, cover."""
+    return [t for t in targets if any(fnmatch.fnmatchcase(t.lower(), a.lower()) for a in actions)]
+
+
 def resource_policy_actions(actions):
     """The resource-policy actions that these actions, wildcards included, cover."""
-    return [p for p in RESOURCE_POLICY_ACTIONS if any(fnmatch.fnmatchcase(p.lower(), a.lower()) for a in actions)]
+    return _covers(actions, RESOURCE_POLICY_ACTIONS)
+
+
+def _arn(resource):
+    """(service, region, account, resource part) of an ARN pattern, or None if it isn't a complete ARN."""
+    parts = resource.split(":", 5)
+    if len(parts) < 6 or parts[0] != "arn" or not all(parts[1:3]) or not parts[5]:
+        return None
+    return tuple(parts[2:])
+
+
+def _every(resource, service):
+    """Whether a resource covers every resource of a service: "*", or its ARN with a wildcard before
+    any name ("function:*", "function*", "f*"). A name prefix ("function:api-*") scopes it."""
+    if resource == "*":
+        return True
+    arn = _arn(resource)
+    if not arn or not fnmatch.fnmatchcase(service, arn[0]):
+        return False
+    literal = re.split(r"[*?]", arn[3], maxsplit=1)
+    return len(literal) > 1 and re.fullmatch(r"[A-Za-z-]*[:/]?", literal[0]) is not None
+
+
+def _stacks(resource):
+    """(region, account, resource part) patterns of a resource that can match a stack, or None.
+    Any wildcard resource part may match one ("*/web/*" does), so it's checked against the listing."""
+    if resource == "*":
+        return "*", "*", "*"
+    arn = _arn(resource)
+    if not arn or not fnmatch.fnmatchcase("cloudformation", arn[0]):
+        return None
+    region, account, rest = arn[1:]
+    if not rest.startswith("stack/") and "*" not in rest and "?" not in rest:
+        return None
+    return region, account, rest
+
+
+def refusals(actions, resources, account, list_stacks):
+    """Why IAM must not hold a grant, as a list of reasons (empty if none). Checked when it's
+    requested, again at approval and before every credential hand-out:
+
+    - run-as actions on every resource (they run as some other role);
+    - CloudFormation stack writes on every stack, in a wildcard region, or on any existing stack
+      with a stored RoleARN (the write runs as that role). list_stacks(region) returns
+      [(stack name, role ARN or "", stack id ARN)] for the account, read fresh; if it fails, the
+      grant is refused;
+    - policy variables and incomplete ARNs, which IAM expands, so they can't be checked as written.
+    """
+    out = []
+    for r in resources:
+        if "${" in r:
+            out.append(f"{r} uses a policy variable, which can't be checked as written; name the resource")
+        elif r != "*" and _arn(r) is None:
+            out.append(f"{r} isn't a complete ARN (arn:partition:service:region:account:resource)")
+    run_as = [a for a in _covers(actions, RUN_AS_ACTIONS) if any(_every(r, a.split(":")[0]) for r in resources)]
+    if run_as:
+        out.append(f"{', '.join(run_as)} on every resource would run as other roles; name the resources")
+    writes = _covers(actions, STACK_WRITE_ACTIONS)
+    if not writes:
+        return out
+    what = "CloudFormation stack writes" if len(writes) > 1 else writes[0]
+    listed = {}
+    for r in resources:
+        target = _stacks(r)
+        if not target:
+            continue
+        region, account_pattern, pattern = target
+        if r == "*":
+            out.append(f"{what} on every resource would run as any stack's stored role; name the stacks")
+        elif not REGION_RE.match(region):
+            out.append(f"{r} has a wildcard or unknown region; {what} must name one region")
+        elif fnmatch.fnmatchcase(account, account_pattern):
+            if region not in listed:
+                try:
+                    listed[region] = list_stacks(region)
+                except Exception as e:
+                    out.append(f"couldn't list CloudFormation stacks in {region} to check {r} for a stored role "
+                               f"({type(e).__name__}); try again")
+                    listed[region] = None
+                    continue
+            if listed[region] is None:
+                continue
+            # Matched like IAM would: the pattern against the stack's own resource part, stack/<name>/<id>.
+            held = sorted(s for s, role, stack_id in listed[region]
+                          if role and fnmatch.fnmatchcase(stack_id.split(":", 5)[-1], pattern))
+            if held:
+                out.append(f"{what} on {r} would run as the stored role of stack {', '.join(held)}")
+    return out
 
 
 def is_blocked(action):

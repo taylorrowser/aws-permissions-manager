@@ -79,6 +79,11 @@ class ProdCompatibility(unittest.TestCase):
         allow = next(st for st in statements if st["Sid"] == "AllowNonAdminServices")
         allow["NotAction"] = allow["NotAction"][:11] + ["route53domains:*"] + allow["NotAction"][11:]
         statements += PROD_V1_BOUNDARY_DENIES
+        # Intended change 4: the broker may list stacks (read-only), to refuse stack writes that would run
+        # as a stack's stored role.
+        broker = expected["Resources"]["BrokerRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+        broker.insert(4, {"Sid": "CheckStackRoles", "Effect": "Allow", "Resource": "*",
+                          "Action": ["cloudformation:DescribeStacks", "cloudformation:ListStacks"]})
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS))), expected)
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS, stage="prod"))), expected)
 
@@ -143,8 +148,8 @@ class StageIsolation(unittest.TestCase):
             others = [o for o in all_stages if o != n]
             pol = policy.broker_policy(ACCOUNT, n)
             for stmt in pol["Statement"]:
-                if stmt["Effect"] != "Allow":
-                    continue
+                if stmt["Effect"] != "Allow" or not any(x.startswith(("iam:", "sts:")) for x in _actions(stmt, "Action")):
+                    continue  # only IAM and STS actions can touch a role
                 for pattern in resources(stmt):
                     for o in others:
                         if n.is_prod and stmt["Sid"] == "LookUpAgentRoles":

@@ -345,11 +345,17 @@ class App:
                     self.store.set_status(r["id"], "rejected", form.get("note", "")[:500], expect="pending")
                     return f"Rejected request #{r['id']}."
                 self.store.set_status(r["id"], "approved", expect="pending")
+
+                def write():
+                    # Checked again, fresh: a stack may have gained a stored role since the request.
+                    problems = self.refusals(r["actions"], r["resources"])
+                    if problems:
+                        raise BrokerError("refused: " + "; ".join(problems))
+                    return self.broker.sync(project, self.store.approved(project))
                 try:
-                    self.iam_change("approve", project, actor,
-                                    lambda: self.broker.sync(project, self.store.approved(project)), [r["id"]])
+                    self.iam_change("approve", project, actor, write, [r["id"]])
                 except BrokerError:
-                    # Refused before writing anything (e.g. the size limit): safe to undo.
+                    # Refused before writing anything (a refusal, the size limit): safe to undo.
                     self.store.set_status(r["id"], "pending", expect="approved")
                     raise
                 except Exception as e:
@@ -437,6 +443,42 @@ class App:
         finally:
             self._record(event)
         return doc
+
+    def refusals(self, actions, resources, stacks=None):
+        """Why IAM must not hold this grant (policy.refusals), with stacks listed now."""
+        return policy.refusals(actions, resources, self.broker.account, stacks or self._stack_lister())
+
+    def _stack_lister(self):
+        """broker.stacks, read at most once per region for one check, failures included."""
+        seen = {}
+
+        def stacks(region):
+            if region not in seen:
+                try:
+                    seen[region] = self.broker.stacks(region)
+                except Exception as e:
+                    print(json.dumps({"event": "stack_listing_failed", "region": region, "error": str(e)[:300]}))
+                    seen[region] = e
+            if isinstance(seen[region], Exception):
+                raise seen[region]
+            return seen[region]
+        return stacks
+
+    def flagged(self, project, live=None):
+        """{grant id: reasons} for every approved grant and every statement IAM actually holds (which
+        catches a revoke whose IAM write failed) that would be refused now. live: the IAM document,
+        if the caller already read it. A project with any flagged grant gets no credentials."""
+        grants = [(policy.sid(r["id"]), r["actions"], r["resources"]) for r in self.store.approved(project)]
+        doc = self.broker.grants(project) if live is None else live
+        grants += [(s.get("Sid", ""), _list(s.get("Action", [])), _list(s.get("Resource", [])))
+                   for s in (doc or policy.doc())["Statement"]]
+        out, stacks = {}, self._stack_lister()
+        for sid, actions, resources in grants:
+            for reason in self.refusals(actions, resources, stacks):
+                out.setdefault(sid, [])
+                if reason not in out[sid]:
+                    out[sid].append(reason)
+        return out
 
     def _record(self, event):
         """CloudWatch first, so the event survives a table outage; the table copy feeds History."""
@@ -552,6 +594,12 @@ class App:
             if not policy.PROJECT_RE.match(project):
                 raise ApiError(400, "invalid project name")
             session = "apm-" + re.sub(r"[^\w+=,.@-]", "-", key["name"])
+            flagged = self.flagged(project)
+            if flagged:
+                print(json.dumps({"event": "credentials_refused", "project": project, "key": key["name"],
+                                  "grants": sorted(flagged)}))
+                raise ApiError(403, f"no credentials for {project} until the owner revokes these grants: " + "; ".join(
+                    f"{sid} ({', '.join(reasons)})" for sid, reasons in sorted(flagged.items())))
             try:
                 return json_response(self.broker.credentials(project, session))
             except BrokerError as e:
@@ -598,6 +646,9 @@ class App:
             raise ApiError(400, "reason is too long (max 1000 characters)")
         if self.store.pending_count(key["name"]) >= PENDING_LIMIT:
             raise ApiError(429, f"this API key already has {PENDING_LIMIT} pending requests; wait for the owner")
+        problems = self.refusals(actions, resources)
+        if problems:
+            raise ApiError(400, "refused: " + "; ".join(problems))
         rid = self.store.add(project, actions, resources, reason, key["name"])
         n = len(actions)
         self.notify_safely({"title": f"Permission request #{rid}",

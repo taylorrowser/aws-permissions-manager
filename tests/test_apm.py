@@ -79,6 +79,32 @@ class FakeSTS:
                                 "Expiration": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)}}
 
 
+class FakeCloudFormation:
+    """Live stacks per region, listed two per page. Regions in `failing` raise on every listing."""
+
+    def __init__(self):
+        self.stacks, self.failing, self.calls = {}, set(), []
+
+    def add(self, region, name, role_arn=""):
+        stack_id = f"arn:aws:cloudformation:{region}:{ACCOUNT}:stack/{name}/{len(self.calls):08d}-0000-0000-0000-000000000000"
+        self.stacks.setdefault(region, []).append({"StackName": name, "StackId": stack_id,
+                                                   **({"RoleARN": role_arn} if role_arn else {})})
+
+    def client(self, region):
+        fake = self
+
+        class Client:
+            def describe_stacks(self, NextToken=None):
+                fake.calls.append(region)
+                if region in fake.failing:
+                    raise RuntimeError("throttled")
+                start = int(NextToken or 0)
+                stacks = fake.stacks.get(region, [])
+                more = start + 2 < len(stacks)
+                return {"Stacks": stacks[start:start + 2], **({"NextToken": str(start + 2)} if more else {})}
+        return Client()
+
+
 class ConditionFailed(Exception):
     response = {"Error": {"Code": "ConditionalCheckFailedException"}}
 
@@ -135,11 +161,11 @@ class FakeTable:
         return {"Attributes": dict(item)}
 
 
-def make_app(http=None):
+def make_app(http=None, cfn=None):
     settings = web.Settings("apm.test", "client_test", OWNER, "VAPIDPUB", "session-secret-for-tests")
-    iam, sts = FakeIAM(), FakeSTS()
+    iam, sts, cfn = FakeIAM(), FakeSTS(), cfn or FakeCloudFormation()
     store = Store(FakeTable())
-    app = web.App(settings, store, Broker(ACCOUNT, "us-east-1", iam=iam, sts=sts), http=http)
+    app = web.App(settings, store, Broker(ACCOUNT, "us-east-1", iam=iam, sts=sts, cloudformation=cfn.client), http=http)
     return app, iam, sts
 
 
@@ -792,6 +818,127 @@ def serve_locally(app):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+class RefusalTests(unittest.TestCase):
+    """Grants that would run as another role, or can't be checked as written, are refused when
+    requested, again (fresh) at approval, and before every credential hand-out."""
+    STACK = f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:stack/web-*/*"
+
+    def setUp(self):
+        self.cfn = FakeCloudFormation()
+        self.app, self.iam, _ = make_app(cfn=self.cfn)
+        self.key = self.app.store.create_key("laptop")
+
+    api, owner_post = WebTests.api, WebTests.owner_post
+
+    def ask(self, actions, resources):
+        return self.api("POST", "/api/requests", {"project": "myapp", "actions": actions, "resources": resources,
+                                                  "reason": "deploy"})
+
+    def refused(self, actions, resources):
+        return policy.refusals(actions, resources, ACCOUNT, lambda region: self.app.broker.stacks(region))
+
+    def test_static_refusals(self):
+        fn = f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:"
+        for actions, resources in [
+                (["lambda:UpdateFunctionCode"], ["*"]), (["lambda:*"], ["*"]), (["ecs:RunTask"], ["*"]),
+                (["lambda:UpdateFunctionConfiguration"], [fn + "*"]), (["ssm:Send*"], ["*"]),
+                (["lambda:UpdateFunctionCode"], [f"arn:aws:lambda:us-east-1:{ACCOUNT}:function*"]),
+                (["lambda:UpdateFunctionCode"], [fn + "?*"]),
+                (["cloudformation:UpdateStack"], ["*"]), (["cloudformation:*"], ["*"]),
+                (["cloudformation:ExecuteStackRefactor"], ["*"]),
+                (["cloudformation:CreateChangeSet"], [f"arn:aws:cloudformation:*:{ACCOUNT}:stack/web/*"]),
+                (["cloudformation:DeleteStack"], [f"arn:aws:cloudformation:us-*:{ACCOUNT}:stack/web/*"]),
+                (["s3:GetObject"], ["arn:aws:s3:::home/${aws:username}/*"]),
+                (["cloudformation:DescribeStacks"], ["arn:aws:cloudformation"])]:
+            with self.subTest(actions=actions, resources=resources):
+                self.assertTrue(self.refused(actions, resources))
+        for actions, resources in [
+                (["lambda:UpdateFunctionCode"], [fn + "api"]), (["lambda:UpdateFunctionCode"], [fn + "api-*"]),
+                (["lambda:GetFunction"], ["*"]), (["cloudformation:DescribeStacks"], ["*"]),
+                (["s3:PutBucketPolicy"], ["*"]), (["s3:GetObject"], ["arn:aws:s3:::bucket/*"])]:
+            with self.subTest(actions=actions, resources=resources):
+                self.assertEqual(self.refused(actions, resources), [])
+
+    def test_resource_policy_actions_are_labelled_not_refused(self):
+        status, r = self.ask(["s3:PutBucketPolicy"], ["arn:aws:s3:::site"])
+        self.assertEqual(status, 201, r)
+        page = self.app(web.Request("GET", f"/requests/{r['id']}", cookies=session_cookie(self.app))).body
+        self.assertIn("Can grant anyone anything on this resource", page)
+
+    def test_refused_at_request(self):
+        status, r = self.ask(["lambda:UpdateFunctionCode"], ["*"])
+        self.assertEqual(status, 400)
+        self.assertIn("lambda:UpdateFunctionCode on every resource", r["error"])
+        for i in range(3):
+            self.cfn.add("us-east-1", f"other-{i}")
+        self.cfn.add("us-east-1", "web-prod", f"arn:aws:iam::{ACCOUNT}:role/cdk-exec")  # on the second page
+        status, r = self.ask(["cloudformation:UpdateStack"], [self.STACK])
+        self.assertEqual(status, 400)
+        self.assertIn("stored role of stack web-prod", r["error"])
+        for odd in ("*/web-prod/*", "stack*/web-prod/*"):  # wildcard resource types still match stack/web-prod/<id>
+            status, r = self.ask(["cloudformation:UpdateStack"], [f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:{odd}"])
+            self.assertEqual(status, 400)
+            self.assertIn("stored role of stack web-prod", r["error"])
+        self.assertEqual(self.ask(["cloudformation:UpdateStack"],
+                                  [f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:stack/other-*/*"])[0], 201)
+        self.assertEqual(len(self.app.store.list()), 1)
+
+    def test_a_failed_stack_listing_fails_closed(self):
+        self.cfn.failing.add("us-east-1")
+        status, r = self.ask(["cloudformation:UpdateStack"], [self.STACK])
+        self.assertEqual(status, 400)
+        self.assertIn("couldn't list CloudFormation stacks in us-east-1", r["error"])
+
+    def test_refused_at_approval_with_a_fresh_listing(self):
+        status, body = self.ask(["cloudformation:UpdateStack"], [self.STACK])
+        self.assertEqual(status, 201, body)
+        self.cfn.add("us-east-1", "web-prod", f"arn:aws:iam::{ACCOUNT}:role/cdk-exec")  # gained a role since
+        r = self.app.store.get(body["id"])
+        resp = self.owner_post({"op": "approve", "id": r["id"], "digest": r["digest"]})
+        self.assertIn("refused", resp.headers["Location"])
+        self.assertEqual(self.app.store.get(r["id"])["status"], "pending")
+        self.assertNotIn(("apm-myapp", "apm-grants"), self.iam.policies)
+        ev = self.app.store.events()[-1]
+        self.assertEqual((ev["op"], ev["outcome"], ev["request_ids"]), ("approve", "refused", [r["id"]]))
+        self.assertIn("stored role of stack web-prod", ev["error"])
+
+    def test_flagged_grants_get_no_credentials(self):
+        status, body = self.ask(["cloudformation:UpdateStack"], [self.STACK])
+        r = self.app.store.get(body["id"])
+        self.owner_post({"op": "approve", "id": r["id"], "digest": r["digest"]})
+        self.assertEqual(self.api("POST", "/api/credentials", {"project": "myapp"})[0], 200)
+        calls = len(self.cfn.calls)
+        self.cfn.add("us-east-1", "web-prod", f"arn:aws:iam::{ACCOUNT}:role/cdk-exec")
+        status, err = self.api("POST", "/api/credentials", {"project": "myapp"})
+        self.assertEqual(status, 403)
+        self.assertIn(f"Req{r['id']}", err["error"])
+        self.assertGreater(len(self.cfn.calls), calls)  # listed again, not cached
+        self.iam.policies.pop(("apm-myapp", "apm-grants"))  # e.g. the approval's IAM write failed
+        page = self.app(web.Request("GET", "/projects", cookies=session_cookie(self.app))).body
+        self.assertIn("Credentials blocked", page)
+        self.assertIn(f'name="sid" value="Req{r["id"]}"', page)  # still listed, so it can be revoked
+        self.cfn.stacks.clear()
+        self.cfn.failing.add("us-east-1")  # a failed listing blocks credentials too
+        self.assertEqual(self.api("POST", "/api/credentials", {"project": "myapp"})[0], 403)
+
+    def test_a_statement_iam_still_holds_is_flagged(self):
+        # e.g. a revoke whose IAM write failed: the request is revoked but IAM still grants it.
+        status, body = self.ask(["s3:GetObject"], ["*"])
+        r = self.app.store.get(body["id"])
+        self.owner_post({"op": "approve", "id": r["id"], "digest": r["digest"]})
+        self.iam.policies["apm-myapp", "apm-grants"]["Statement"].append(
+            {"Sid": "Req99", "Effect": "Allow", "Action": "ecs:RunTask", "Resource": "*"})
+        status, err = self.api("POST", "/api/credentials", {"project": "myapp"})
+        self.assertEqual(status, 403)
+        self.assertIn("Req99", err["error"])
+        self.assertNotIn(f"Req{r['id']}", err["error"])
+
+    def test_broker_may_list_stacks(self):
+        allows = [s for s in policy.broker_policy(ACCOUNT)["Statement"] if s["Effect"] == "Allow"]
+        self.assertIn({"Sid": "CheckStackRoles", "Effect": "Allow", "Resource": "*",
+                       "Action": ["cloudformation:DescribeStacks", "cloudformation:ListStacks"]}, allows)
 
 
 class ClientTests(unittest.TestCase):
