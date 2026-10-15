@@ -449,6 +449,13 @@ class App:
                     return (f"Error: couldn't extend {sid}: updating IAM failed ({type(e).__name__}), so it may still "
                             f"end at the old time. Open Projects and tap Re-apply decisions for {project}.")
             return f"Extended {sid} on {project} {'for ' + policy.DURATIONS[hours].lower() if hours else 'permanently'}."
+        if op == "narrow":
+            project, sid = form["project"], form["sid"]
+            actions, resources = [x for x in [form.get("action", "")] if x], [x for x in [form.get("resource", "")] if x]
+            if len(actions + resources) != 1:
+                raise ValueError("name one action or one resource to remove")
+            done = self.shrink(project, sid, actions, resources, "narrow", actor)
+            return f"Error: {done['error']}" if done["error"] else done["message"]
         if op == "sync_project":
             project = form["project"]
             with self.store.lease(project):
@@ -473,6 +480,60 @@ class App:
             return "Removed the device from notifications."
         return "Unknown action."
 
+    def shrink(self, project, sid, actions, resources, op, actor, why="", agent_key=""):
+        """Drop exactly these actions and resources from one live grant of the project, or the whole
+        grant if neither is given; a grant left with no actions or no resources ends as revoked. It only
+        takes access away, so it needs no approval: the owner's narrow and an agent's remove. Recorded
+        first, then IAM is rewritten, as in a revoke. Raises Conflict if the project doesn't hold sid,
+        ValueError if a name doesn't match exactly. Returns {"request", "message", "ended", "error"}:
+        error says what was already applied if the IAM write failed."""
+        with self.store.lease(project):
+            ref = policy.parse_sid(sid)
+            r = self.store.get(ref[0], consistent=True) if ref else None
+            live = policy.live_grants(r) if r and r["project"] == project and r["status"] == "approved" else []
+            several = bool(r and r.get("grants"))
+            targets = live if several and ref[1] is None else [g for g in live if g["sid"] == sid]
+            if not targets:
+                raise Conflict(f"{sid} isn't a grant {project} holds now; see `apm projects`")
+            if (actions or resources) and len(targets) > 1:
+                raise ValueError(f"{sid} has {len(targets)} grants ({', '.join(g['sid'] for g in targets)}); "
+                                 "name the one to remove from")
+            g = targets[0]
+            unknown = [x for x in actions if x not in g["actions"]] + [x for x in resources if x not in g["resources"]]
+            if unknown:
+                raise ValueError(f"{g['sid']} has no {', '.join(unknown)}. Use the exact names `apm projects` shows: "
+                                 f"{', '.join(g['actions'] + g['resources'])}")
+            keep_a = [x for x in g["actions"] if x not in actions]
+            keep_r = [x for x in g["resources"] if x not in resources]
+            what = ", ".join(actions + resources)
+            ended = not (actions or resources) or not keep_a or not keep_r
+            if not (actions or resources):
+                message = f"Removed {sid} from {project}."
+                detail = sid if op == "remove" else ""
+            else:
+                message = f"Removed {what} from {g['sid']} on {project}" + (", which ended it." if ended else ".")
+                detail = f"removed {what}" + (f" from {g['sid']}" if op == "remove" or several else "") + (", ending it" if ended else "")
+            if why:
+                detail += f". Reason: {why}"
+            note = f"removed by {actor}" + (f": {why}" if why else "")
+            if ended:
+                self._save(_ended(r, [t["n"] for t in targets] if several else None, "revoked"), note)
+            elif several:
+                grants = [{**x, "actions": keep_a, "resources": keep_r} if x["n"] == g["n"] else x for x in r["grants"]]
+                self.store.set_scope(r["id"], sorted({a for x in grants for a in x["actions"]}),
+                                     sorted({a for x in grants for a in x["resources"]}), grants)
+            else:
+                self.store.set_scope(r["id"], keep_a, keep_r)
+            out = {"request": r["id"], "message": message, "ended": ended, "error": ""}
+            try:
+                self.iam_change(op, project, actor, lambda: self.broker.sync(project, self.store.approved(project)),
+                                [r["id"]], detail, [agent_key] if agent_key else [])
+            except Exception as e:
+                print(f"IAM sync for {project} failed while removing from {sid}: {e!r}")
+                out["error"] = (f"recorded the removal ({message[:-1]}), but updating IAM failed ({type(e).__name__}), "
+                                f"so it may still be active until the owner re-applies decisions for {project}")
+            return out
+
     def approval(self, r, hours, approved, now=None):
         """What approving pending request r, each grant lasting hours[n] (0: permanent), does to its
         project, given the project's approved requests: (the changes (see _ended) that revoke the grants
@@ -489,16 +550,17 @@ class App:
         after = [changes[old["id"]][1] if old["id"] in changes else old for old in approved]
         return list(changes.values()), new, policy.grants_document(after + [new])
 
-    def iam_change(self, op, project, actor, write, targets=(), detail=""):
+    def iam_change(self, op, project, actor, write, targets=(), detail="", agent_keys=()):
         """Run `write`, one IAM rewrite of the project's role that returns the policy document it
         wrote (None if it wrote none), and record exactly one audit event for it, whatever happens:
         outcome `applied`, `refused` (refused before writing) or `failed` (the write errored, so its
         effect is unknown). `targets` are the requests the change is for. Re-raises the error. Call
-        it under the project's lease."""
+        it under the project's lease. agent_keys: keys that made the change themselves, named along
+        with the requests' keys."""
         targets = sorted({int(i) for i in targets})
         event = {"op": op, "outcome": "applied", "error": "", "project": project, "account": self.broker.account,
                  "role_arn": policy.role_arn(self.broker.account, project), "targets": targets,
-                 "request_ids": targets, "agent_keys": [], "actor": actor, "at": int(time.time()),
+                 "request_ids": targets, "agent_keys": list(agent_keys), "actor": actor, "at": int(time.time()),
                  "previous_grants": [], "grants": [], "policy_sha256": ""}
         if detail:
             event["detail"] = detail
@@ -617,7 +679,7 @@ class App:
     def _record(self, event):
         """CloudWatch first, so the event survives a table outage; the table copy feeds History."""
         try:
-            keys = {r.get("requester") for r in map(self.store.get, event["request_ids"]) if r}
+            keys = {r.get("requester") for r in map(self.store.get, event["request_ids"]) if r} | set(event["agent_keys"])
             event["agent_keys"] = sorted(k for k in keys if k)
         except Exception as e:
             print(json.dumps({"event": "audit_keys_failed", "error": str(e)[:300]}))
@@ -715,6 +777,8 @@ class App:
             return json_response({"projects": self.projects(req.query.get("search", ""))})
         if p == "/api/requests" and m == "POST":
             return json_response(self.create_request(req.json(), key), 201)
+        if p == "/api/remove" and m == "POST":
+            return self.remove(req.json(), key)
         if p == "/api/requests" and m == "GET":
             rows = self.store.list(status=req.query.get("status"), project=req.query.get("project"))[:50]
             return json_response({"requests": [_public(r) for r in rows]})
@@ -827,6 +891,44 @@ class App:
         self.notify_safely({"title": f"Permission request #{rid}", "body": f"{project}: {what} to review",
                             "url": f"/requests/{rid}", "tag": f"req-{rid}"})
         return _public(self.store.get(rid))
+
+    def remove(self, body, key):
+        """An agent drops access it no longer needs: {project, grant: "Req22" | "Req52g3", actions?,
+        resources?, reason}. It only shrinks access, so it applies at once (see shrink). The owner is
+        pushed every attempt, failures included; History names the key and its reason."""
+        project, sid, reason = str(body.get("project", "")), str(body.get("grant", "")), str(body.get("reason", "")).strip()
+        actions, resources = _strs(body.get("actions")), _strs(body.get("resources"))
+        if not policy.PROJECT_RE.match(project):
+            raise ApiError(400, "invalid project name")
+        if not policy.SID_RE.match(sid):
+            raise ApiError(400, "grant must name one grant as `apm projects` shows it, e.g. Req22 or Req52g3")
+        if not reason or len(reason) > 1000:
+            raise ApiError(400, "a reason is required (max 1000 characters)")
+        ref, done, failure = policy.parse_sid(sid), None, ""
+        try:
+            done = self.shrink(project, sid, actions, resources, "remove", key["name"], reason, key["name"])
+            failure = done["error"]
+        except (Conflict, ValueError) as e:
+            failure = str(e)
+            raise ApiError(409 if isinstance(e, Conflict) else 400, failure)
+        except Exception as e:
+            failure = type(e).__name__
+            raise
+        finally:  # no actions, ARNs or reasons: notifications land on lock screens
+            how = "narrowed" if actions or resources else "removed"
+            if not failure:
+                title, line = f"{key['name']} {how} {sid}", f"{project}: done, no approval needed"
+            elif done:
+                title, line = f"{key['name']} {how} {sid}", f"{project}: but updating IAM failed. Open Projects and re-apply."
+            else:
+                title, line = f"{key['name']} couldn't remove {sid}", f"{project}: nothing was changed"
+            push = {"title": title, "body": line, "url": f"/requests/{ref[0]}" if done else "/projects",
+                    "tag": f"remove-{ref[0]}-{time.time_ns()}"}
+            self.notify_safely(push)
+        if failure:
+            return json_response({"error": failure, "request": done["request"]}, 502)
+        return json_response({"project": project, "grant": sid, "request": done["request"], "ended": done["ended"],
+                              "message": done["message"]})
 
     def projects(self, search=""):
         terms = [t.lower() for t in search.split() if t]

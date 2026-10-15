@@ -231,3 +231,6 @@ main:not(.inbox){padding-top:0}
 @media (prefers-reduced-motion:no-preference){button,.button{transition:filter .15s}button:active{filter:brightness(.92)}}
 @media (prefers-reduced-motion:reduce){.toast{animation-duration:6s}}
 button,.button,.badge{overflow-wrap:normal;white-space:nowrap}
+ul.removable{flex-direction:column;gap:2px}
+ul.removable li{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
+ul.removable code{overflow-wrap:anywhere}

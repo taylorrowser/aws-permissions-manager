@@ -169,6 +169,23 @@ class Store:
                 raise Conflict(f"request #{request_id} is no longer approved")
             raise
 
+    def set_scope(self, request_id, actions, resources, grants=None):
+        """Narrow an approved request: its actions and resources, and for one with several grants,
+        the grants they're the union of. Raises Conflict if it's no longer approved."""
+        update, names = "SET #a = :a, #r = :r", {"#s": "status", "#a": "actions", "#r": "resources"}
+        values = {":a": actions, ":r": resources, ":expect": "approved"}
+        if grants is not None:
+            update += ", #g = :g"
+            names["#g"], values[":g"] = "grants", grants
+        try:
+            self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression=update,
+                               ConditionExpression="#s = :expect", ExpressionAttributeNames=names,
+                               ExpressionAttributeValues=values)
+        except Exception as e:
+            if getattr(e, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                raise Conflict(f"request #{request_id} is no longer approved")
+            raise
+
     # ---------- audit events: one per IAM change (see App.iam_change) ----------
 
     def add_event(self, event):
