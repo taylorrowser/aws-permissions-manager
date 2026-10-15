@@ -25,7 +25,7 @@ agent ── aws --profile apm-<project> ── credential_process ────�
   - list CloudFormation stacks (`DescribeStacks`, `ListStacks`), to refuse stack writes that would run as a stack's stored role.
 
   It can't remove a boundary or touch any other IAM resource, and no long-lived broker key exists anywhere.
-- **Agents hold only an API key.** It lets them list projects, request permissions and get credentials. Approving needs your WorkOS sign-in. Any key can use any approved project; you tell each agent which one to use.
+- **Agents hold only an API key.** It lets them list projects, request permissions, get credentials and remove access they no longer need (which applies at once and notifies you, since it only shrinks access). Approving needs your WorkOS sign-in. Any key can use any approved project; you tell each agent which one to use.
 - **Credentials never reach the model.** `get_aws_credentials` writes an AWS profile whose `credential_process` fetches 1-hour credentials on demand. The agent sees only the profile name.
 - **IAM enforces, DynamoDB records decisions.** The dashboard reads grants live from IAM. Each approve or revoke is recorded in DynamoDB first, then the role's policy is rewritten from that project's approved requests, read strongly consistent. Only the broker Lambda and account admins can write the table, and the boundary denies agents any access to it. Even a tampered table can only grant what the boundary allows.
 
@@ -72,7 +72,7 @@ aws ssm put-parameter --name /apm/workos-api-key --type SecureString --value "$(
 2. Install it. On iPhone or iPad, tap Share and then Add to Home Screen, then open it from the Home Screen. iOS only allows web push for Home Screen apps (iOS 16.4 or later). On Android or desktop Chrome or Edge, use **Install app** on the Settings screen or the browser's install option.
 3. On the **Settings** screen, tap **Turn on notifications**. A test notification is sent straight away. **Send a test** repeats it at any time.
 
-The app has three screens: **Requests** (the home screen: agents asking to connect, then pending requests, each leading with the project, the reason and a risk label — Read-only, Scoped, Broad or Full access — and opening in place to show the exact actions, resources and the Approve and Reject buttons), **Projects** (each project opens to its live IAM grants, with Revoke and Delete) and **Settings** (notifications and devices, agent keys, account and sign out). Tapping a notification opens that request at `/requests/<id>` (or `/connect/<code>`). If you're signed out, you go back to it after signing in.
+The app has three screens: **Requests** (the home screen: agents asking to connect, then pending requests, each leading with the project, the reason and a risk label — Read-only, Scoped, Broad or Full access — and opening in place to show the exact actions, resources and the Approve and Reject buttons), **Projects** (each project opens to its live IAM grants, with Remove next to each action and ARN, Revoke and Delete) and **Settings** (notifications and devices, agent keys, account and sign out). Tapping a notification opens that request at `/requests/<id>` (or `/connect/<code>`). If you're signed out, you go back to it after signing in.
 
 **What notifications contain.** Only the project name, the request number and how many actions it asks for, so nothing sensitive shows on a lock screen. The reason, actions and resources appear only in the signed-in app. Nothing can be approved from a notification.
 

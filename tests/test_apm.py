@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -1305,6 +1305,120 @@ class SizeAndReplacesTests(unittest.TestCase):
         self.assertEqual(self.statements(), {})
 
 
+class RemoveTests(unittest.TestCase):
+    """Access only shrinks without approval: an agent's remove and the owner's narrow. Each records
+    one event and the agent's remove always pushes the owner, failures included."""
+    BUCKET = ["arn:aws:s3:::exports", "arn:aws:s3:::exports/*"]
+    TABLE = [f"arn:aws:dynamodb:us-east-1:{ACCOUNT}:table/orders"]
+
+    def setUp(self):
+        self.app, self.iam, _ = make_app()
+        self.key = self.app.store.create_key("laptop")
+        self.pushes = []
+        self.app.notify = lambda message, **kw: self.pushes.append(message) or {}
+
+    api = WebTests.api
+
+    def grant(self, **body):
+        status, r = self.api("POST", "/api/requests", {"project": "myapp", "reason": "backfill", **body})
+        self.assertEqual(status, 201, r)
+        r = self.app.store.get(r["id"])
+        self.app.decide({"op": "approve", "id": str(r["id"]), "digest": r["digest"]}, "owner")
+        self.pushes.clear()
+        return r["id"]
+
+    def remove(self, grant, **body):
+        return self.api("POST", "/api/remove", {"project": "myapp", "grant": grant, "reason": "export done", **body})
+
+    def statements(self):
+        doc = self.iam.policies.get(("apm-myapp", "apm-grants"))
+        return {s["Sid"]: (s["Action"], s["Resource"]) for s in doc["Statement"]} if doc else {}
+
+    def test_partial_removal_applies_at_once_and_names_the_key_and_reason(self):
+        self.grant(actions=["s3:GetObject", "s3:PutObject"], resources=self.BUCKET)
+        status, out = self.remove("Req1", actions=["s3:PutObject"], resources=["arn:aws:s3:::exports"])
+        self.assertEqual(status, 200, out)
+        self.assertEqual((out["ended"], out["message"]),
+                         (False, "Removed s3:PutObject, arn:aws:s3:::exports from Req1 on myapp."))
+        self.assertEqual(self.statements(), {"Req1": (["s3:GetObject"], ["arn:aws:s3:::exports/*"])})
+        self.assertEqual(self.app.store.get(1)["status"], "approved")
+        ev = self.app.store.events()[-1]
+        self.assertEqual((ev["op"], ev["outcome"], ev["actor"], ev["agent_keys"]), ("remove", "applied", "laptop", ["laptop"]))
+        self.assertIn("Reason: export done", ev["detail"])
+        self.assertEqual([p["title"] for p in self.pushes], ["laptop narrowed Req1"])
+        self.assertNotIn("s3:", json.dumps(self.pushes))  # nothing sensitive on a lock screen
+        page = self.app(web.Request("GET", "/requests/1", cookies=session_cookie(self.app))).body
+        self.assertIn("Removed by the agent: removed s3:PutObject, arn:aws:s3:::exports from Req1. Reason: export done", page)
+        # Names must match exactly, and nothing changes when they don't.
+        status, out = self.remove("Req1", actions=["s3:getobject"])
+        self.assertEqual(status, 400)
+        self.assertIn("Use the exact names", out["error"])
+        self.assertEqual(self.statements()["Req1"][0], ["s3:GetObject"])
+        self.assertEqual(self.pushes[-1]["title"], "laptop couldn't remove Req1")
+        # Dropping the last action ends the grant.
+        status, out = self.remove("Req1", actions=["s3:GetObject"])
+        self.assertEqual((status, out["ended"], self.app.store.get(1)["status"], self.statements()), (200, True, "revoked", {}))
+
+    def test_removing_a_whole_grant_and_asking_which_grant(self):
+        self.grant(grants=[{"actions": ["s3:GetObject"], "resources": self.BUCKET},
+                           {"actions": ["dynamodb:PutItem", "dynamodb:GetItem"], "resources": self.TABLE}])
+        status, out = self.remove("Req1", actions=["dynamodb:PutItem"])
+        self.assertEqual(status, 400)
+        self.assertIn("Req1 is a request with several grants; name the one to remove from: Req1g1, Req1g2", out["error"])
+        self.assertEqual(self.remove("Req1g2", actions=["dynamodb:PutItem"])[0], 200)
+        r = self.app.store.get(1)
+        self.assertEqual((r["grants"][1]["actions"], r["actions"]), (["dynamodb:GetItem"], ["dynamodb:GetItem", "s3:GetObject"]))
+        status, out = self.remove("Req1g1")
+        self.assertEqual((status, out["message"]), (200, "Removed Req1g1 from myapp."))
+        self.assertEqual(list(self.statements()), ["Req1g2"])
+        self.assertEqual([g["ended"] for g in self.app.store.get(1)["grants"]], ["revoked", ""])
+        self.assertIn("name the one", self.remove("Req1", actions=["dynamodb:GetItem"])[1]["error"])  # even with one left
+        self.assertEqual(self.remove("Req1")[0], 200)  # the base Sid with nothing named: all that's left
+        self.assertEqual((self.app.store.get(1)["status"], self.statements()), ("revoked", {}))
+        self.assertEqual(self.remove("Req1")[0], 409)  # no longer held
+        self.assertEqual(self.remove("nope")[0], 400)  # malformed: still pushed, without echoing it
+        bad = self.app(web.Request("POST", "/api/remove", headers={"Authorization": f"Bearer {self.key}"}, body=b"{"))
+        self.assertEqual(bad.status, 400)
+        self.assertEqual(len(self.pushes), 8)
+        self.assertEqual(self.pushes[-1]["title"], "laptop couldn't remove access")
+
+    def test_a_failed_iam_write_reports_what_was_applied_and_still_pushes(self):
+        self.grant(actions=["s3:GetObject", "s3:PutObject"], resources=self.BUCKET)
+        self.iam.put_role_policy = mock.Mock(side_effect=TimeoutError("read timed out"))
+        status, out = self.remove("Req1", actions=["s3:PutObject"])
+        self.assertEqual(status, 502)
+        self.assertIn("recorded the removal (Removed s3:PutObject from Req1 on myapp), but updating IAM failed", out["error"])
+        self.assertEqual(self.app.store.get(1)["actions"], ["s3:GetObject"])
+        self.assertEqual(self.app.store.events()[-1]["outcome"], "failed")
+        self.assertEqual(self.pushes[-1]["body"], "myapp: but updating IAM failed. Open Projects and re-apply.")
+        self.assertFalse(self.app.broker.in_sync("myapp", self.app.store.approved("myapp")))  # Re-apply is offered
+        del self.iam.put_role_policy
+        self.app.decide({"op": "sync_project", "project": "myapp"})
+        self.assertEqual(self.statements(), {"Req1": (["s3:GetObject"], self.BUCKET)})
+
+    def test_the_owner_narrows_one_action_or_resource_on_projects(self):
+        self.grant(actions=["s3:GetObject", "s3:PutObject"], resources=self.BUCKET)
+        cookies = session_cookie(self.app)
+        page = self.app(web.Request("GET", "/projects", cookies=cookies)).body
+        self.assertEqual(page.count('name="op" value="narrow"'), 4)
+
+        def narrow(**field):
+            body = urlencode({"op": "narrow", "project": "myapp", "sid": "Req1", "back": "/projects", **field}).encode()
+            resp = self.app(web.Request("POST", "/action", headers={"Origin": ORIGIN}, cookies=cookies, body=body))
+            return parse_qs(urlparse(resp.headers["Location"]).query)["msg"][0]
+        self.assertEqual(narrow(resource="arn:aws:s3:::exports"), "Removed arn:aws:s3:::exports from Req1 on myapp.")
+        self.assertEqual(self.statements(), {"Req1": (["s3:GetObject", "s3:PutObject"], ["arn:aws:s3:::exports/*"])})
+        ev = self.app.store.events()[-1]
+        self.assertEqual((ev["op"], ev["actor"], ev["detail"]), ("narrow", OWNER, "removed arn:aws:s3:::exports"))
+        page = self.app(web.Request("GET", "/requests/1", cookies=cookies)).body
+        self.assertIn("Narrowed: removed arn:aws:s3:::exports", page)
+        self.assertIn("Error:", narrow(action="s3:DeleteObject"))
+        self.assertEqual(narrow(resource="arn:aws:s3:::exports/*"),
+                         "Removed arn:aws:s3:::exports/* from Req1 on myapp, which ended it.")
+        self.assertEqual((self.app.store.get(1)["status"], self.statements()), ("revoked", {}))
+        self.assertEqual(self.pushes, [])  # the owner did it
+
+
 class ClientTests(unittest.TestCase):
     """The plugin's stdlib client, run with the system Python like Claude Code/Codex would."""
 
@@ -1341,7 +1455,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(init["result"]["protocolVersion"], "2025-06-18")
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
         names = [t["name"] for t in rpc(2, "tools/list")["result"]["tools"]]
-        self.assertEqual(names, ["connect", "list_projects", "get_aws_credentials", "request_permissions", "check_request", "list_requests"])
+        self.assertEqual(names, ["connect", "list_projects", "get_aws_credentials", "request_permissions", "remove_permissions", "check_request", "list_requests"])
 
         def tool(i, name, **args):
             return rpc(i, "tools/call", {"name": name, "arguments": args})["result"]
@@ -1380,6 +1494,8 @@ class ClientTests(unittest.TestCase):
                                           capture_output=True, text=True, check=True).stdout)
         self.assertEqual(creds["Version"], 1)
         self.assertEqual(oct((self.tmp / "apm" / "cache" / "myapp.json").stat().st_mode & 0o777), "0o600")
+        removed = tool(14, "remove_permissions", project="myapp", grant="Req1", reason="listing done")
+        self.assertEqual(removed["content"][0]["text"], "Removed Req1 from myapp.")
 
     def test_connect_from_mcp_without_a_key(self):
         env = {**self.env, "APM_NO_BROWSER": "1"}
@@ -1531,6 +1647,11 @@ class ClientTests(unittest.TestCase):
                                       "--reason", "x").stderr)
         self.assertIn("not both", run("request", "--project", "web", "--grant", "s3:GetObject", "-r", "arn:aws:s3:::b",
                                       "--reason", "x").stderr)
+        self.approve_all()
+        r = run("remove", "--project", "web", "--grant", "Req2g1", "-a", "s3:ListBucket", "--reason", "done")
+        self.assertEqual(r.stdout.strip(), "Removed s3:ListBucket from Req2g1 on web.", r.stderr)
+        self.assertIn("exact names", run("remove", "--project", "web", "--grant", "Req2g1", "-a", "s3:listbucket",
+                                         "--reason", "done").stderr)
 
 
 class AwsConfigEditTests(unittest.TestCase):

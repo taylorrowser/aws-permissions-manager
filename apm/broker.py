@@ -113,10 +113,11 @@ class Broker:
                     raise
 
     def in_sync(self, project, approved):
-        """Whether IAM currently grants exactly the approved requests, each until when it was
-        approved (or extended) to (for the dashboard)."""
+        """Whether IAM currently grants exactly the approved requests: the same actions and resources
+        (a narrowed grant), each until when it was approved (or extended) to (for the dashboard)."""
         def ends(d):
-            return sorted((s.get("Sid", ""), policy.expiry(s)) for s in d["Statement"])
+            return sorted((s.get("Sid", ""), sorted(_strings(s.get("Action", []))), sorted(_strings(s.get("Resource", []))),
+                           policy.expiry(s)) for s in d["Statement"])
         return ends(self.grants(project) or policy.doc()) == ends(policy.grants_document(approved))
 
     def _all_policy_names(self, role):
@@ -155,3 +156,6 @@ class Broker:
             Description=f"apm agent role for project {project}",
             Tags=[{"Key": "managed-by", "Value": "apm"}, {"Key": "project", "Value": project}])
 
+
+def _strings(v):
+    return v if isinstance(v, list) else [v]

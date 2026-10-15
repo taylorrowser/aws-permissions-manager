@@ -609,7 +609,8 @@ def connect_pane(c, code, error=""):
 # What each IAM change is called in a request's History: (done, attempted).
 EVENT_LABELS = {"approve": ("Approved", "Approval"), "revoke": ("Revoked", "Revoke"),
                 "sync_project": ("Re-applied", "Re-apply"), "remove_project": ("Project deleted", "Project deletion"),
-                "expire": ("Expired", "Expiry"), "extend": ("Extended", "Extension")}
+                "expire": ("Expired", "Expiry"), "extend": ("Extended", "Extension"),
+                "narrow": ("Narrowed", "Narrowing"), "remove": ("Removed by the agent", "Agent's removal")}
 
 
 def history(rid, events):
@@ -646,7 +647,12 @@ def _grant(project, s, store, reasons=()):
     req = store.get(ref[0]) if ref else None
     g = next((g for g in policy.live_grants(req) if g["sid"] == sid), None) if req and req["status"] == "approved" else None
     actions, resources = _list(s.get("Action", [])), _list(s.get("Resource", []))
-    on = ("<span>all resources</span>" if _everything(resources) else f'<ul class=codes>{_codes(resources)}</ul>')
+    if g:  # each action and ARN of a grant the store backs can be removed on its own
+        on = _removable(project, sid, "resource", resources)
+        listed = _removable(project, sid, "action", actions)
+    else:
+        on = ("<span>all resources</span>" if _everything(resources) else f'<ul class=codes>{_codes(resources)}</ul>')
+        listed = f'<ul class=codes>{_codes(actions)}</ul>'
     which = f" grant {g['n']}" if g and req.get("grants") else ""
     why = (f'<p class=muted>{e(req["reason"])} <a href="/requests/{req["id"]}">#{req["id"]}{which}</a></p>' if req
            else f'<p class=muted>Grant <code>{e(sid)}</code></p>')
@@ -657,10 +663,23 @@ def _grant(project, s, store, reasons=()):
     if ends:  # a countdown, and Extend: a new duration from now, or permanent
         why += f'<p class=muted>{_ends(ends)}</p>'
         extend = _extend(project, sid, "/projects")
-    return (f'<li><div><p class=line>{blocked}{_risk_chip(actions, resources)}</p><ul class=codes>{_codes(actions)}</ul>'
+    return (f'<li><div><p class=line>{blocked}{_risk_chip(actions, resources)}</p>{listed}'
             f'<p class=on>on {on}</p>{why}{notes}{extend}</div>'
             + _form({"op": "revoke", "project": project, "sid": sid}, "Revoke early" if ends else "Revoke", "danger small",
                     f"Revoke this grant from {project}? Agents lose it within minutes.", "/projects") + "</li>")
+
+
+def _removable(project, sid, field, items):
+    """A grant's actions (or ARNs), each with Remove: the owner narrows the grant. Removing the last
+    one ends the grant, so the confirm says so."""
+    out = []
+    for x in items:
+        last = len(items) == 1
+        confirm = (f"Remove {x}? It's the only {field} left, so this revokes {sid}." if last
+                   else f"Remove {x} from {sid}? Agents lose it within minutes.")
+        out.append(f'<li><code>{e(x)}</code>' + _form({"op": "narrow", "project": project, "sid": sid, field: x},
+                                                       "Remove", "quiet small", confirm, "/projects") + "</li>")
+    return f'<ul class="codes removable" aria-label="{field.capitalize()}s">{"".join(out)}</ul>'
 
 
 def projects_page(app, owner, msg=""):

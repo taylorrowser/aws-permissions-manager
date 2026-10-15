@@ -6,6 +6,7 @@
     apm request --project P -a ACTION [-r ARN] --reason WHY [--for 3h] [--wait]
     apm request --project P --grant 'a1,a2=arn1,arn2' [--grant ...] --reason WHY   several grants, one request
     apm request ... --replaces Req22 [--replaces Req52g3]   grants the new request supersedes
+    apm remove --project P --grant Req22 [-a ACTION] [-r ARN] --reason WHY   drop access you no longer need
     apm status [ID] | apm wait ID
     apm use PROJECT                set up AWS profile apm-PROJECT (credentials stay out of view)
     apm credentials PROJECT        AWS credential_process helper (used by the profile)
@@ -32,7 +33,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 DEFAULT_URL = "https://apm.taylorrowser.com"
 HOME = Path(os.environ.get("APM_HOME", Path.home() / ".apm"))
 CLIENT_FILE = HOME / "client.json"
@@ -202,6 +203,13 @@ def parse_grant(text):
     if not actions:
         raise ApmError(f"--grant {text!r} names no actions; use 'action1,action2=arn1,arn2'")
     return {"actions": actions, "resources": [r.strip() for r in res.split(",") if r.strip()] or ["*"]}
+
+
+def remove(project, grant, actions, resources, reason):
+    """Drop the named actions or resources from one grant (Req22, Req52g3, as `apm projects` shows
+    them), or the whole grant if neither is given. It takes effect at once: no approval needed."""
+    return call("POST", "/api/remove", {"project": project, "grant": grant, "actions": list(actions or []),
+                                        "resources": list(resources or []), "reason": reason})
 
 
 def get_request(rid):
@@ -381,6 +389,12 @@ def main(argv=None):
     s.add_argument("--replaces", action="append", default=[], metavar="GRANT",
                    help="a grant this request supersedes, as `apm projects` names it (Req22, Req52g3); repeatable")
     s.add_argument("--wait", action="store_true", help="block until the owner decides (up to 30 min)")
+    s = sub.add_parser("remove", help="drop access a project no longer needs (no approval needed)")
+    s.add_argument("--project", required=True)
+    s.add_argument("--grant", required=True, help="the grant, exactly as `apm projects` names it (Req22, Req52g3)")
+    s.add_argument("--action", "-a", action="append", default=[], help="an action to drop, repeatable")
+    s.add_argument("--resource", "-r", action="append", default=[], help="a resource ARN to drop, repeatable")
+    s.add_argument("--reason", required=True, help="why it's no longer needed, shown to the owner")
     s = sub.add_parser("status", help="show requests")
     s.add_argument("id", nargs="?", type=int)
     s.add_argument("--project")
@@ -442,6 +456,10 @@ def cmd_request(a):
     if a.wait:
         return _finish(wait(r["id"], 1800))
     print(f"Check with `apm status {r['id']}` or block with `apm wait {r['id']}`.")
+
+
+def cmd_remove(a):
+    print(remove(a.project, a.grant, a.action, a.resource, a.reason)["message"])
 
 
 def cmd_status(a):
@@ -540,6 +558,17 @@ TOOLS = [
                       "description": "Grants of this project that the request supersedes, as list_projects names "
                                      "them (e.g. Req22, Req52g3). Approving it revokes them, so the role's policy "
                                      "stays under IAM's size limit."}}}},
+    {"name": "remove_permissions",
+     "description": "Drop access a project no longer needs. Takes effect at once, without approval, because it "
+                    "only shrinks access; the owner is notified. Name one grant exactly as list_projects shows it, "
+                    "then the exact actions or resources to drop from it, or neither to remove the whole grant. A "
+                    "grant left with no actions or no resources ends.",
+     "inputSchema": {"type": "object", "required": ["project", "grant", "reason"], "properties": {
+         "project": {"type": "string"},
+         "grant": {"type": "string", "description": "e.g. Req22 or Req52g3"},
+         "actions": {"type": "array", "items": {"type": "string"}, "description": "Actions to drop, exactly as listed"},
+         "resources": {"type": "array", "items": {"type": "string"}, "description": "Resource ARNs to drop, exactly as listed"},
+         "reason": {"type": "string", "description": "Why it's no longer needed, shown to the owner"}}}},
     {"name": "check_request",
      "description": "Get the status of a permission request (pending, approved, rejected, revoked, expired). Set "
                     "wait_seconds (max 120) to wait for the owner's decision; call again if still pending.",
@@ -639,6 +668,9 @@ class McpServer:
         r = request(project, list(actions or []), list(resources or []), reason, duration, grants, replaces)
         return (f"Request #{r['id']} sent to the owner. Call check_request with request_id={r['id']} and "
                 "wait_seconds=120 to wait for the decision.")
+
+    def tool_remove_permissions(self, project, grant, reason, actions=None, resources=None):
+        return remove(project, grant, actions, resources, reason)["message"]
 
     def tool_check_request(self, request_id, wait_seconds=0):
         r = wait(request_id, max(0, min(int(wait_seconds), 120)))
