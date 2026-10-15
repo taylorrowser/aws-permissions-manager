@@ -515,8 +515,27 @@ class AuditTests(unittest.TestCase):
         self.assertEqual((reapply["op"], reapply["request_ids"], reapply["grants"]), ("sync_project", [1], []))
         page = self.app(web.Request("GET", "/requests/1", cookies=session_cookie(self.app))).body
         self.assertIn("History", page)
-        for label in ("Approved", "Revoke failed", "Re-applied"):
+        for label in ("Approved", "Revoke failed", "Grant removed (re-apply)"):
             self.assertIn(label, page)
+
+    def test_history_shows_only_changes_for_the_request_or_that_removed_its_grant(self):
+        self.approve(self.add())
+        self.approve(self.add())
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
+        self.assertEqual(self.events()[-1]["targets"], [1])
+        page = self.app(web.Request("GET", "/requests/2", cookies=session_cookie(self.app))).body
+        self.assertIn("Approved", page)
+        self.assertNotIn("Revoked", page)  # request 2 kept its grant
+
+    def test_a_failed_live_read_refuses_the_change_before_writing(self):
+        self.approve(self.add())
+        self.iam.get_role_policy = mock.Mock(side_effect=TimeoutError("read timed out"))
+        msg = self.app.action({"op": "sync_project", "project": "myapp", "back": "/projects"}, "owner")
+        self.assertIn("nothing+was+changed", msg.headers["Location"])
+        del self.iam.get_role_policy
+        self.assertEqual([s["Sid"] for s in self.app.broker.grants("myapp")["Statement"]], ["Req1"])
+        last = self.events()[-1]
+        self.assertEqual((last["op"], last["outcome"]), ("sync_project", "refused"))
 
     def test_cloudwatch_first_and_a_failed_table_write_does_not_fail_the_change(self):
         real_put = self.app.store.t.put_item

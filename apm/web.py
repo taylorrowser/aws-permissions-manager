@@ -394,23 +394,29 @@ class App:
             return "Removed the device from notifications."
         return "Unknown action."
 
-    def iam_change(self, op, project, actor, write, request_ids=(), detail=""):
+    def iam_change(self, op, project, actor, write, targets=(), detail=""):
         """Run `write`, one IAM rewrite of the project's role that returns the policy document it
         wrote (None if it wrote none), and record exactly one audit event for it, whatever happens:
-        outcome `applied`, `refused` (BrokerError: refused before writing) or `failed` (the write
-        errored, so its effect is unknown). Re-raises the error. Call it under the project's lease."""
-        ids = {int(i) for i in request_ids}
-        try:  # what IAM grants right now, so a grant cleared by this write traces back to its request
-            live = (self.broker.grants(project) or policy.doc())["Statement"]
-            ids |= {int(s["Sid"][3:]) for s in live if s.get("Sid", "").startswith("Req") and s["Sid"][3:].isdigit()}
-        except Exception as e:
-            print(json.dumps({"event": "audit_live_read_failed", "project": project, "error": str(e)[:300]}))
+        outcome `applied`, `refused` (refused before writing) or `failed` (the write errored, so its
+        effect is unknown). `targets` are the requests the change is for. Re-raises the error. Call
+        it under the project's lease."""
+        targets = sorted({int(i) for i in targets})
         event = {"op": op, "outcome": "applied", "error": "", "project": project, "account": self.broker.account,
-                 "role_arn": policy.role_arn(self.broker.account, project), "request_ids": sorted(ids),
-                 "agent_keys": [], "actor": actor, "at": int(time.time()), "grants": [], "policy_sha256": ""}
+                 "role_arn": policy.role_arn(self.broker.account, project), "targets": targets,
+                 "request_ids": targets, "agent_keys": [], "actor": actor, "at": int(time.time()),
+                 "grants": [], "policy_sha256": ""}
         if detail:
             event["detail"] = detail
         try:
+            # What IAM grants right now, so a grant this write clears traces back to its request.
+            # Without it the event couldn't say what was removed, so nothing is written.
+            try:
+                live = (self.broker.grants(project) or policy.doc())["Statement"]
+            except Exception as e:
+                raise BrokerError(f"couldn't read {project}'s current grants ({type(e).__name__}); "
+                                  "nothing was changed, try again") from e
+            event["request_ids"] = sorted(set(targets) | {
+                int(s["Sid"][3:]) for s in live if s.get("Sid", "").startswith("Req") and s["Sid"][3:].isdigit()})
             doc = write()
             if doc:
                 event["grants"] = [s.get("Sid", "") for s in doc["Statement"]]
