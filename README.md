@@ -118,7 +118,9 @@ Agents then follow the bundled `aws-access` skill:
 
 Tell an agent which project to use in the prompt or in the repo's `CLAUDE.md`/`AGENTS.md`, e.g. "Use AWS project `myapp`."
 
-The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `apm wait`, `apm use`. Claude Code puts the plugin's `bin/apm` on the agent's PATH.
+The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `apm wait`, `apm use`, `apm usage`. Claude Code puts the plugin's `bin/apm` on the agent's PATH.
+
+**Usage audit:** a project's details on the Projects screen link to when each grant was last used, from IAM Access Advisor. Grants nobody has used for 30 days (and granted at least 30 days ago) are marked unused, so you can revoke them. AWS reports usage up to about 4 hours late. Agents see the same report with the `project_usage` tool or `apm usage <project>`. It's read-only and never changes IAM.
 
 **When something goes wrong** (bad deploy, damaged data, a leaked key, session or device), see [docs/operations.md](docs/operations.md): deploy, rollback, table restore and secret rotation. [docs/v1-acceptance.md](docs/v1-acceptance.md) is the end-to-end check run before the V1 release, and [docs/acceptance.md](docs/acceptance.md) the check to re-run after the dashboard redesign.
 

@@ -12,6 +12,7 @@ import argparse
 import json
 import sys
 import threading
+from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -79,6 +80,15 @@ def seed(app):
         rid = s.add("reports", ["athena:StartQueryExecution", "athena:GetQueryResults"], ["*"],
                     f"Run the weekly usage report ({i + 1}).", "macbook")
         decide(rid, "reject" if i % 3 else "approve")
+    old = s.add("website", ["sqs:SendMessage"], ["*"], "Queue rebuilds from the CMS webhook.", "macbook")
+    decide(old)
+    s.t.items[f"req#{old}"]["decided_at"] -= 45 * 86400  # old enough to show as unused on /usage
+    now = datetime.now(timezone.utc)
+    app.broker.iam.services = [{"ServiceNamespace": "s3", "LastAuthenticated": now - timedelta(hours=6),
+                                "TrackedActionsLastAccessed": [
+                                    {"ActionName": "GetObject", "LastAccessedTime": now - timedelta(days=3)},
+                                    {"ActionName": "PutObject", "LastAccessedTime": now - timedelta(hours=6)},
+                                    {"ActionName": "DeleteObject"}]}]
     s.add("website", ["cloudfront:CreateInvalidation"], ["*"],
           "Invalidate the CDN after deploying so visitors see the new pages.", "macbook", suggested_hours=3)
     # Time-limited: Projects shows its countdown, Extend and Revoke early.

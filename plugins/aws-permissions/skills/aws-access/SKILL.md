@@ -34,8 +34,8 @@ If the tools say this machine isn't connected, call `connect`. It opens the owne
 
 When the user asks you to tidy a project's access, or a task that needed temporary access is done:
 
-1. See what the project holds with `list_projects`. If a `project_usage` tool (or `apm usage`) is available, call it too, to see which grants were actually used.
-2. Decide per grant from its reason and the task: is anything still going to need it?
+1. See what the project holds with `list_projects`, then call `project_usage` (or `apm usage <project>`) to see when each grant was last used. If it says AWS is still preparing the report, call it again in a minute.
+2. Decide per grant from its reason, the task and its usage: is anything still going to need it? A grant marked `unused` hasn't been used for 30 days. Usage shows up to about 4 hours late, and `per_action: false` means AWS only reported the service's last use, so a recent use there may have come from another grant.
 3. Remove only what you're sure of, with `remove_permissions` and a reason, and tell the user what you removed.
 4. Ask the user first before removing grants used by a pipeline or for production.
 5. If the whole project is unused, don't empty it grant by grant: recommend that the owner deletes the project in the dashboard.

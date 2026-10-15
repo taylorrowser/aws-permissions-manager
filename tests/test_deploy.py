@@ -104,6 +104,12 @@ class ProdCompatibility(unittest.TestCase):
              "Resource": f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/apm/llm-key"},
             {"Sid": "QueueReview", "Effect": "Allow", "Action": "lambda:InvokeFunction",
              "Resource": f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:apm"}])
+        # Intended change 7 (usage audit): the broker may read Access Advisor reports on agent roles.
+        at = next(i for i, st in enumerate(broker) if st["Sid"] == "VendAgentCredentials") + 1
+        broker[at:at] = [
+            {"Sid": "AuditAgentRoleUsage", "Effect": "Allow", "Action": "iam:GenerateServiceLastAccessedDetails",
+             "Resource": f"arn:aws:iam::{ACCOUNT}:role/agents/*"},
+            {"Sid": "ReadUsageReports", "Effect": "Allow", "Action": "iam:GetServiceLastAccessedDetails", "Resource": "*"}]
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS))), expected)
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS, stage="prod"))), expected)
 
@@ -176,6 +182,8 @@ class StageIsolation(unittest.TestCase):
                     for o in others:
                         if n.is_prod and stmt["Sid"] == "LookUpAgentRoles":
                             continue  # prod's pre-existing read-only lookup pattern role/apm-*; see docs
+                        if stmt["Sid"] == "ReadUsageReports":
+                            continue  # reads finished Access Advisor jobs; AWS allows no resource but *
                         for project in TRICKY_PROJECTS:
                             for arn in (policy.role_arn(ACCOUNT, project, o),
                                         f"arn:aws:iam::{ACCOUNT}:role/{policy.role_name(project, o)}"):

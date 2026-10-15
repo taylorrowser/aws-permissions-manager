@@ -719,7 +719,7 @@ class ProjectsScreenTests(unittest.TestCase):
         self.assertIn("<span class=badge>built in</span> <code>SharedRead</code>", page)
         self.assertNotIn('value="narrow"', page)
         self.assertNotIn('value="revoke"', page)
-        self.assertNotIn("/usage?project=", page)  # no usage audit in this deployment
+        self.assertIn('href="/usage?project=app"', page)  # the usage audit, from Project details
 
     def test_a_flagged_grant_iam_never_got_keeps_its_time_limit_and_row(self):
         app, iam, _ = make_app()

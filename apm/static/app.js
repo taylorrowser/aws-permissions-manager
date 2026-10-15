@@ -395,7 +395,7 @@ if (typeof document !== "undefined") {
     secret: Boolean(document.querySelector(".secret")),
   });
   const pager = createPager({ load, apply: (html, how) => apply(html, how), idle: () => canRefresh(state()) });
-  const refresh = () => (signedIn ? pager.refresh(location.pathname) : Promise.resolve(false));
+  const refresh = () => (signedIn ? pager.refresh(location.pathname + location.search) : Promise.resolve(false));
 
   let polling = false;
   async function poll() {

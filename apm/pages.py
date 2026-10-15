@@ -2,7 +2,7 @@
 confirm dialogs, local times, offline handling, install help and push notification sign-up.
 
 Screens: Requests (/, /requests/<id>, /connect/<code>: a list and a reading pane), Projects
-(/projects) and Settings (/settings: notifications, agent keys, account). Every list leads with
+(/projects, /usage) and Settings (/settings: notifications, agent keys, account). Every list leads with
 what matters on a phone: project, reason and how risky the request is."""
 import calendar
 import hashlib
@@ -11,7 +11,7 @@ import json
 import re
 import time
 
-from . import policy
+from . import policy, usage
 
 e = html.escape
 
@@ -810,8 +810,7 @@ def _details(app, project, synced, flagged):
                    f'revoke {_and(sorted(flagged))}: they would be refused if requested now.</p>')
     out.append(f'<dl class=meta><dt>Role</dt><dd><code>{e(policy.role_name(project))}</code></dd>'
                f'<dt>Account</dt><dd>{e(app.broker.account)}</dd><dt>Profile</dt><dd><code>apm-{e(project)}</code></dd></dl>')
-    if callable(getattr(app, "usage", None)):  # the usage audit, where this deployment has it
-        out.append(f'<p><a href="/usage?project={e(project)}">When was each grant last used?</a></p>')
+    out.append(f'<p><a href="/usage?project={e(project)}">When was each grant last used?</a></p>')
     out.append('<div class=controls>'
                + _form({"op": "sync_project", "project": project}, "Re-apply decisions", "primary" if not synced else "small",
                        "", "/projects")
@@ -855,6 +854,43 @@ def projects_page(app, owner, msg=""):
     if projects:
         out.append("</div>")
     return layout(app, owner, "projects", "Projects", "".join(out), st, msg)
+
+
+def _last_used(ts):
+    return f"Last used {_time(ts)}" if ts else "Not used"
+
+
+def _usage_action(a):
+    where = "" if a["per_action"] else " (service-level: any action of this service)"
+    matched = f'<br><span class=muted>Matched: {e(", ".join(a["matched"]))}</span>' if a.get("matched") else ""
+    return (f'<li><span><code>{e(a["action"])}</code><br>'
+            f'<span class=muted>{_last_used(a["last_used"])}'
+            f'{where}</span>{matched}</span></li>')
+
+
+def usage_page(app, owner, project, report, st):
+    """When each grant of a project was last used, from IAM Access Advisor (read-only)."""
+    out = [f'<p class=note>{e(report["note"])} Grants unused for {usage.UNUSED_DAYS} days are marked.</p>']
+    if "error" in report:
+        out.append(f'<p class="flash error" role=alert>AWS couldn\'t report usage: {e(report["error"])}</p>')
+    elif report.get("preparing"):
+        out.append('<div class=empty><p><b>AWS is still preparing the report.</b></p>'
+                   f'<p class=muted>This takes up to a minute. <a href="/usage?project={e(project)}">Reload</a></p></div>')
+    elif not report["grants"]:
+        out.append("<p class=muted>No grants yet.</p>")
+    for g in report.get("grants", []):
+        unused = '<span class="badge unused">Unused</span>' if g["unused"] else ""
+        n = (policy.parse_sid(g["grant"]) or (0, None))[1]
+        why = (f'{e(g["reason"])} <a href="/requests/{g["request"]}">#{g["request"]}{f" grant {n}" if n else ""}</a>'
+               if g["request"] else f'Grant <code>{e(g["grant"])}</code>')
+        granted = (f", granted {_time(g['granted_at'])}" if g["granted_at"] else "") + \
+            (f", ends {_time(g['expires_at'])}" if g["expires_at"] else "")
+        out.append(f'<article class=card id="usage-{e(g["grant"])}"><p class=line>'
+                   f'{_risk_chip([a["action"] for a in g["actions"]], g["resources"])}{unused}'
+                   f'<span class=muted>{_last_used(g["last_used"])}</span></p>'
+                   f'<ul class=list>{"".join(_usage_action(a) for a in g["actions"])}</ul>'
+                   f'<p class=muted>{why}{granted}</p></article>')
+    return layout(app, owner, "projects", f"Usage of {project}", "".join(out), st, back=("/projects", "Projects"))
 
 
 # ---------- settings: notifications, keys, account ----------
