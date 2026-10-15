@@ -1363,7 +1363,7 @@ class RemoveTests(unittest.TestCase):
                            {"actions": ["dynamodb:PutItem", "dynamodb:GetItem"], "resources": self.TABLE}])
         status, out = self.remove("Req1", actions=["dynamodb:PutItem"])
         self.assertEqual(status, 400)
-        self.assertIn("Req1 has 2 grants (Req1g1, Req1g2); name the one", out["error"])
+        self.assertIn("Req1 is a request with several grants; name the one to remove from: Req1g1, Req1g2", out["error"])
         self.assertEqual(self.remove("Req1g2", actions=["dynamodb:PutItem"])[0], 200)
         r = self.app.store.get(1)
         self.assertEqual((r["grants"][1]["actions"], r["actions"]), (["dynamodb:GetItem"], ["dynamodb:GetItem", "s3:GetObject"]))
@@ -1371,10 +1371,13 @@ class RemoveTests(unittest.TestCase):
         self.assertEqual((status, out["message"]), (200, "Removed Req1g1 from myapp."))
         self.assertEqual(list(self.statements()), ["Req1g2"])
         self.assertEqual([g["ended"] for g in self.app.store.get(1)["grants"]], ["revoked", ""])
+        self.assertIn("name the one", self.remove("Req1", actions=["dynamodb:GetItem"])[1]["error"])  # even with one left
         self.assertEqual(self.remove("Req1")[0], 200)  # the base Sid with nothing named: all that's left
         self.assertEqual((self.app.store.get(1)["status"], self.statements()), ("revoked", {}))
         self.assertEqual(self.remove("Req1")[0], 409)  # no longer held
-        self.assertEqual(len(self.pushes), 5)
+        self.assertEqual(self.remove("nope")[0], 400)  # malformed: still pushed, without echoing it
+        self.assertEqual(len(self.pushes), 7)
+        self.assertEqual(self.pushes[-1]["title"], "laptop couldn't remove access")
 
     def test_a_failed_iam_write_reports_what_was_applied_and_still_pushes(self):
         self.grant(actions=["s3:GetObject", "s3:PutObject"], resources=self.BUCKET)
@@ -1385,6 +1388,10 @@ class RemoveTests(unittest.TestCase):
         self.assertEqual(self.app.store.get(1)["actions"], ["s3:GetObject"])
         self.assertEqual(self.app.store.events()[-1]["outcome"], "failed")
         self.assertEqual(self.pushes[-1]["body"], "myapp: but updating IAM failed. Open Projects and re-apply.")
+        self.assertFalse(self.app.broker.in_sync("myapp", self.app.store.approved("myapp")))  # Re-apply is offered
+        del self.iam.put_role_policy
+        self.app.decide({"op": "sync_project", "project": "myapp"})
+        self.assertEqual(self.statements(), {"Req1": (["s3:GetObject"], self.BUCKET)})
 
     def test_the_owner_narrows_one_action_or_resource_on_projects(self):
         self.grant(actions=["s3:GetObject", "s3:PutObject"], resources=self.BUCKET)

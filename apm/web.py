@@ -495,9 +495,9 @@ class App:
             targets = live if several and ref[1] is None else [g for g in live if g["sid"] == sid]
             if not targets:
                 raise Conflict(f"{sid} isn't a grant {project} holds now; see `apm projects`")
-            if (actions or resources) and len(targets) > 1:
-                raise ValueError(f"{sid} has {len(targets)} grants ({', '.join(g['sid'] for g in targets)}); "
-                                 "name the one to remove from")
+            if (actions or resources) and several and ref[1] is None:
+                raise ValueError(f"{sid} is a request with several grants; name the one to remove from: "
+                                 + ", ".join(g["sid"] for g in targets))
             g = targets[0]
             unknown = [x for x in actions if x not in g["actions"]] + [x for x in resources if x not in g["resources"]]
             if unknown:
@@ -897,17 +897,20 @@ class App:
         resources?, reason}. It only shrinks access, so it applies at once (see shrink). The owner is
         pushed every attempt, failures included; History names the key and its reason."""
         project, sid, reason = str(body.get("project", "")), str(body.get("grant", "")), str(body.get("reason", "")).strip()
-        actions, resources = _strs(body.get("actions")), _strs(body.get("resources"))
-        if not policy.PROJECT_RE.match(project):
-            raise ApiError(400, "invalid project name")
-        if not policy.SID_RE.match(sid):
-            raise ApiError(400, "grant must name one grant as `apm projects` shows it, e.g. Req22 or Req52g3")
-        if not reason or len(reason) > 1000:
-            raise ApiError(400, "a reason is required (max 1000 characters)")
-        ref, done, failure = policy.parse_sid(sid), None, ""
+        ref, done, failure, actions, resources = policy.parse_sid(sid), None, "", [], []
         try:
+            actions, resources = _strs(body.get("actions")), _strs(body.get("resources"))
+            if not policy.PROJECT_RE.match(project):
+                raise ApiError(400, "invalid project name")
+            if not ref:
+                raise ApiError(400, "grant must name one grant as `apm projects` shows it, e.g. Req22 or Req52g3")
+            if not reason or len(reason) > 1000:
+                raise ApiError(400, "a reason is required (max 1000 characters)")
             done = self.shrink(project, sid, actions, resources, "remove", key["name"], reason, key["name"])
             failure = done["error"]
+        except ApiError as e:
+            failure = str(e)
+            raise
         except (Conflict, ValueError) as e:
             failure = str(e)
             raise ApiError(409 if isinstance(e, Conflict) else 400, failure)
@@ -920,10 +923,12 @@ class App:
                 title, line = f"{key['name']} {how} {sid}", f"{project}: done, no approval needed"
             elif done:
                 title, line = f"{key['name']} {how} {sid}", f"{project}: but updating IAM failed. Open Projects and re-apply."
-            else:
+            elif ref and policy.PROJECT_RE.match(project):
                 title, line = f"{key['name']} couldn't remove {sid}", f"{project}: nothing was changed"
+            else:  # don't echo malformed input onto a lock screen
+                title, line = f"{key['name']} couldn't remove access", "Nothing was changed"
             push = {"title": title, "body": line, "url": f"/requests/{ref[0]}" if done else "/projects",
-                    "tag": f"remove-{ref[0]}-{time.time_ns()}"}
+                    "tag": f"remove-{time.time_ns()}"}
             self.notify_safely(push)
         if failure:
             return json_response({"error": failure, "request": done["request"]}, 502)
