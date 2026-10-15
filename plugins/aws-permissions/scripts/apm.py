@@ -34,7 +34,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 DEFAULT_URL = "https://apm.taylorrowser.com"
 HOME = Path(os.environ.get("APM_HOME", Path.home() / ".apm"))
 CLIENT_FILE = HOME / "client.json"
@@ -568,7 +568,9 @@ TOOLS = [
      "description": "Ask the owner to grant IAM permissions to a project; they approve or reject on their phone. "
                     "Request exactly what failed (from the AccessDenied message), with specific resource ARNs where "
                     "possible. A new project name creates that project on approval. IAM, STS AssumeRole, "
-                    "Organizations, account, SSO and billing actions can never be granted. Give either actions "
+                    "Organizations, account, SSO and billing actions can never be granted. Run-as actions such as "
+                    "lambda:UpdateFunctionCode on every resource, and CloudFormation stack writes on every stack, a "
+                    "wildcard region or a stack with a stored service role, are refused: name the resources. Give either actions "
                     "(and resources) or grants, one per resource set, to ask for everything one task needs at once. "
                     "Afterwards call check_request with wait_seconds to wait for the decision.",
      "inputSchema": {"type": "object", "required": ["project", "reason"], "properties": {
@@ -618,7 +620,7 @@ TOOLS = [
      "description": "List recent permission requests, optionally for one project or status.",
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "string"},
-         "status": {"type": "string", "enum": ["pending", "approved", "rejected", "revoked"]}}}},
+         "status": {"type": "string", "enum": ["pending", "approved", "rejected", "revoked", "expired"]}}}},
 ]
 PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
 
