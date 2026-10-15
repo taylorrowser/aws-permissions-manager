@@ -212,8 +212,8 @@ class App:
             # The next page of the Requests screen's Decided list, loaded as it scrolls into view.
             if not owner:
                 raise ApiError(401, "signed out")
-            before = req.query.get("before", "")
-            return json_response(pages.decided_page(self, int(before) if before.isdecimal() and len(before) <= 12 else None))
+            num = lambda k: int(v) if (v := req.query.get(k, "")).isdecimal() and len(v) <= 12 else None  # noqa: E731
+            return json_response(pages.decided_page(self, num("before"), num("since")))
         if m == "GET" and SCREENS.fullmatch(p):
             if not owner:
                 return Response(200, pages.login_page(self, req.query.get("error", ""), p))

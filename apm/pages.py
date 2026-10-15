@@ -290,20 +290,22 @@ def _connect_row(c, selected):
 
 
 DECIDED_PAGE = 10
+DECIDED_RELOAD = 500  # most rows one reload of an already-loaded range returns
 STATUS_WORDS = {"approved": "Approved", "rejected": "Rejected", "revoked": "Revoked"}
 
 
-def decided_rows(requests, before=None, selected=""):
-    """One page of decided requests, newest first, below request id `before`: (rows, next before)."""
+def decided_rows(requests, before=None, selected="", since=None):
+    """One page of decided requests, newest first, below request id `before`: (rows, next before).
+    With `since`, every decided request from that id up instead (a range the page reloads)."""
     done = [r for r in requests if r["status"] != "pending" and (before is None or r["id"] < before)]
-    page = done[:DECIDED_PAGE]
+    page = [r for r in done if r["id"] >= since][:DECIDED_RELOAD] if since is not None else done[:DECIDED_PAGE]
     rows = []
     for r in page:
         current = ' aria-current="true"' if selected == f"req-{r['id']}" else ""
         rows.append(f'<li><a class=item href="/requests/{r["id"]}" id="req-{r["id"]}"{current}><span class=item-top>'
                     f'<b>{e(r["project"])}</b><span class=state>{e(STATUS_WORDS.get(r["status"], r["status"]))}</span></span>'
                     f'<span class=reason>{e(r["reason"])}</span></a></li>')
-    return "".join(rows), (page[-1]["id"] if len(done) > DECIDED_PAGE else None)
+    return "".join(rows), (page[-1]["id"] if page and len(done) > len(page) else None)
 
 
 def _more(before):
@@ -311,9 +313,10 @@ def _more(before):
             if before else "")
 
 
-def decided_page(app, before):
-    """GET /decided?before=<id>: the next page of the Decided list, for the page script."""
-    rows, nxt = decided_rows(app.store.list(), before)
+def decided_page(app, before, since=None):
+    """GET /decided?before=<id>[&since=<id>]: the next page of the Decided list, or a range already
+    loaded, for the page script."""
+    rows, nxt = decided_rows(app.store.list(), before, since=since)
     return {"html": rows + _more(nxt), "before": nxt}
 
 
@@ -347,7 +350,8 @@ def _where(arn):
     service, region, account, rest = parts[2], parts[3], parts[4], parts[5]
     if service == "s3":
         bucket, _, path = rest.partition("/")
-        kind, name, extra = "bucket", bucket, f" ({path})" if path and path != "*" else ""
+        kind, name = "bucket", bucket
+        extra = "" if not path or path == "*" else f" (every object matching {path})" if _wild(path) else f" ({path})"
     else:
         m = re.match(r"([A-Za-z][A-Za-z0-9-]*)[/:](.*)$", rest)
         kind, name, extra = (m.group(1), m.group(2), "") if m else (BARE_NAMES.get(service, "resource"), rest, "")
@@ -399,7 +403,7 @@ def plain(actions, resources):
     else:
         phrases = list(dict.fromkeys(p for _, p in places))  # bucket b and b/* read as one bucket
         if len(phrases) > 3:
-            wide = [p for p in phrases if re.search(r"\bevery\b", p)]  # every bucket, in every region, ...
+            wide = [p for p in phrases if re.search(r"\bevery\b|[*?]", p)]  # every bucket, in every region, every object
             phrases = [f"{len(phrases)} resources" + (", including " + _and(wide) if wide else "")]
         listing = _and(phrases)
     if len(clauses) == 1 and clauses[0][0] != "Do anything in":

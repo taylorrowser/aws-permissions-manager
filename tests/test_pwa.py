@@ -166,7 +166,7 @@ class ScreenTests(Base):
             (["dynamodb:PutItem", "dynamodb:UpdateItem"], ["arn:aws:dynamodb:us-east-1:1:table/orders"], "Write DynamoDB table orders"),
             (["ecs:UpdateService"], ["arn:aws:ecs:us-east-1:1:service/api"], "Update ECS service api"),
             (["lambda:InvokeFunction"], ["arn:aws:lambda:us-east-1:1:function:resize"], "Invoke Lambda function resize"),
-            (["s3:DeleteObject"], ["arn:aws:s3:::b/tmp/*"], "Write S3 bucket b (tmp/*)"),  # not "Delete S3 bucket b"
+            (["s3:DeleteObject"], ["arn:aws:s3:::b/tmp/*"], "Write S3 bucket b (every object matching tmp/*)"),  # not "Delete S3 bucket b"
             (["sqs:SendMessage"], ["arn:aws:sqs:us-east-1:1:jobs"], "Write SQS queue jobs"),
             (["dynamodb:*"], ["*"], "Do anything in DynamoDB, on every resource"),
             (["*"], ["*"], "Do anything in AWS, on every resource"),
@@ -185,6 +185,9 @@ class ScreenTests(Base):
              "Read S3 on 5 resources, including every bucket matching x-*"),
             (["dynamodb:GetItem"], [f"arn:aws:dynamodb:us-east-1:1:table/{t}" for t in "abc"] + ["arn:aws:dynamodb:*:*:table/d"],
              "Read DynamoDB on 4 resources, including table d in every region and account"),
+            (["s3:GetObject"], [f"arn:aws:s3:::b/{c}*" for c in "abcd"],
+             "Read S3 on 4 resources, including bucket b (every object matching a*), bucket b (every object matching b*), "
+             "bucket b (every object matching c*) and bucket b (every object matching d*)"),
             (["iam:PassRole"], ["arn:aws:iam::1:role/agents/apm-web"], "Pass IAM role agents/apm-web"),
         ]
         for actions, resources, want in cases:
@@ -239,6 +242,12 @@ class ScreenTests(Base):
         self.assertEqual((re.findall(r'id="req-(\d+)"', last["html"]), last["before"]), (["3", "2", "1"], None))
         self.assertNotIn("class=more", last["html"])
         self.assertEqual(self.get("/decided", owner=False).status, 401)
+        # A range the page already loaded comes back whole, as it is now, so a redraw can't leave it stale.
+        self.app.store.set_status(9, "revoked", expect="rejected")
+        reload = json.loads(self.get("/decided", query={"before": "14", "since": "6"}).body)
+        self.assertEqual(re.findall(r'id="req-(\d+)"', reload["html"]), [str(i) for i in range(13, 5, -1)])
+        self.assertIn('id="req-9"><span class=item-top><b>web</b><span class=state>Revoked', reload["html"])
+        self.assertEqual(reload["before"], 6)
 
     def test_a_request_is_its_own_page_on_phones_and_the_pane_on_wide_screens(self):
         rid = self.agent_request(actions=["s3:GetObject"], reason="read the exports")

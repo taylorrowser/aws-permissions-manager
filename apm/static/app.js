@@ -97,6 +97,7 @@ function createPager({ load, apply, idle }) {
   let latest = 0, busy = false, opening = 0;
   return {
     get busy() { return busy; },
+    get loading() { return opening !== 0; }, // a row is on its way into the pane
     claim() { latest++; },
     async open(url) {
       if (busy) return false;
@@ -306,6 +307,9 @@ if (typeof document !== "undefined") {
       if (carried.length) { // the old list already reached further; its sentinel (or its end) wins
         freshMore?.remove();
         if (oldMore) list.append(oldMore);
+        // Shown at once, then reloaded: rows below the first page may have changed (a revoke, or
+        // an older request decided since).
+        reloadDecided(Math.min(...carried.map(id)));
       }
     }
     const main = doc.querySelector("main");
@@ -325,6 +329,31 @@ if (typeof document !== "undefined") {
     const error = document.querySelector("#flash-slot .flash");
     if (error) error.focus({ preventScroll: true });
     else if (focused && $(focused)) $(focused).focus({ preventScroll: true });
+  }
+
+  // Replace the Decided rows below the first page, from `oldest` up to (not including) the fresh
+  // first page's last row, with what the server says now. A later redraw supersedes this one.
+  let decidedReload = 0;
+  async function reloadDecided(oldest) {
+    const mine = ++decidedReload;
+    try {
+      const list = $("decided-list");
+      const firstPage = [...list.querySelectorAll(":scope > li:not(.more)")].slice(0, 10);
+      const before = Number(firstPage[firstPage.length - 1]?.querySelector("a")?.id.slice(4));
+      if (!before) return;
+      const resp = await fetch(`/decided?before=${before}&since=${oldest}`, { credentials: "same-origin" });
+      if (!resp.ok || mine !== decidedReload) return;
+      const { html } = await resp.json();
+      const current = $("decided-list");
+      if (mine !== decidedReload || !current) return;
+      const t = document.createElement("template");
+      t.innerHTML = html;
+      const keep = [...current.querySelectorAll(":scope > li:not(.more)")].slice(0, 10);
+      current.replaceChildren(...keep, ...t.content.children);
+      hydrate(current);
+      markSelected();
+      watchOlder();
+    } catch (_) { /* rows stay as they were; the next refresh tries again */ }
   }
 
   async function load(url) {
@@ -369,10 +398,13 @@ if (typeof document !== "undefined") {
   // ----- Requests: the reading pane, Decided paging and the keyboard -----
   // On wide screens a row opens in the pane without a page load; the URL still follows it. On
   // phones a request is its own page, so links work as links.
+  // The URL moves once the row has loaded, so a failed load leaves URL and pane together and the
+  // row can be opened again.
   async function openPane(path) {
     if (path === location.pathname || pager.busy || $("confirm")?.open) return;
-    history.pushState(null, "", path);
-    try { await pager.open(path); } catch (_) { flash("Couldn't reach the server. Check your connection and try again."); }
+    try {
+      if (await pager.open(path)) history.pushState(null, "", path);
+    } catch (_) { flash("Couldn't reach the server. Check your connection and try again."); }
   }
   document.addEventListener("click", (event) => {
     const a = event.target.closest("a.item");
@@ -389,14 +421,14 @@ if (typeof document !== "undefined") {
   });
 
   // Decided loads 10 rows at a time as its end scrolls into view (or Older is tapped).
-  let loadingOlder = false;
+  let loadingOlder = false, olderFailed = false;
   async function loadOlder() {
     const more = document.querySelector("#decided-list > .more");
     if (!more || loadingOlder || !$("decided")?.open) return;
     loadingOlder = true;
     try {
       const resp = await fetch(`/decided?before=${encodeURIComponent(more.dataset.before)}`, { credentials: "same-origin" });
-      if (!resp.ok) return;
+      if (!resp.ok) { olderFailed = true; return; }
       const { html } = await resp.json();
       const list = $("decided-list"), sentinel = list?.querySelector(":scope > .more");
       if (!sentinel || sentinel.dataset.before !== more.dataset.before) return; // a refresh moved on meanwhile
@@ -410,7 +442,10 @@ if (typeof document !== "undefined") {
       if (next) sentinel.replaceWith(next); else sentinel.remove();
       hydrate(list);
       markSelected();
-    } catch (_) { /* the next scroll tries again */ } finally {
+      olderFailed = false;
+    } catch (_) {
+      olderFailed = true; // Older stays as a button; scrolling doesn't retry in a loop
+    } finally {
       loadingOlder = false;
       watchOlder();
     }
@@ -421,10 +456,14 @@ if (typeof document !== "undefined") {
     if (!olderObserver) return;
     olderObserver.disconnect();
     const more = document.querySelector("#decided-list > .more");
-    if (more) olderObserver.observe(more);
+    if (more && !olderFailed) olderObserver.observe(more);
   }
   watchOlder();
-  document.addEventListener("click", (event) => { if (event.target.closest("#decided-list > .more button")) loadOlder(); });
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest("#decided-list > .more button")) return;
+    olderFailed = false;
+    loadOlder();
+  });
   document.addEventListener("toggle", (event) => { if (event.target.id === "decided") watchOlder(); }, true);
 
   document.addEventListener("keydown", (event) => {
@@ -433,7 +472,8 @@ if (typeof document !== "undefined") {
     if (!command) return;
     if (command === "approve" || command === "reject") {
       const button = document.querySelector(`.pane-actions button.${command}`);
-      if (!button || button.disabled || pager.busy) return;
+      // Not while another row is loading: the pane on screen isn't the one selected.
+      if (!button || button.disabled || pager.busy || pager.loading) return;
       event.preventDefault();
       button.click(); // the form's own submit: confirm, one at a time, digest
       return;

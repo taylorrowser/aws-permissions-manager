@@ -225,3 +225,17 @@ test("Back and Forward keep the pane on the URL: a pending confirm is cancelled,
   assert.equal(app.onHistory({ dialogOpen: true, busy: false }), "cancel-then-open");
   assert.equal(app.onHistory({ dialogOpen: false, busy: true }), "reload");
 });
+
+test("while a row is loading the pager says so, so a and r can't decide the request still on screen", async () => {
+  const { pager, loads } = harness();
+  assert.equal(pager.loading, false);
+  const open = pager.open("/requests/2");
+  assert.equal(pager.loading, true);
+  loads[0].resolve();
+  await open;
+  assert.equal(pager.loading, false);
+  const failed = pager.open("/requests/3");
+  loads[1].resolve(null); // the load failed: open() is false, so the URL never moves to it
+  assert.equal(await failed, false);
+  assert.equal(pager.loading, false);
+});
