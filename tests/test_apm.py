@@ -158,7 +158,7 @@ class FakeTable:
                     item[field] = item.get(field, 0) + ExpressionAttributeValues[value]
                 else:
                     field, value = [x.strip() for x in part.split("=")]
-                    item[names.get(field, field)] = ExpressionAttributeValues[value]
+                    item[names.get(field, field)] = json.loads(json.dumps(ExpressionAttributeValues[value]))
         return {"Attributes": dict(item)}
 
 
@@ -1034,6 +1034,144 @@ class RefusalTests(unittest.TestCase):
                        "Action": ["cloudformation:DescribeStacks", "cloudformation:ListStacks"]}, allows)
 
 
+class MultiGrantTests(unittest.TestCase):
+    """Several grants in one request: each its own statement, duration, revoke and extend; the
+    request ends with its last grant. The flat form keeps working as before."""
+    BUCKET = ["arn:aws:s3:::exports", "arn:aws:s3:::exports/*"]
+    TABLE = [f"arn:aws:dynamodb:us-east-1:{ACCOUNT}:table/orders"]
+
+    def setUp(self):
+        self.cfn = FakeCloudFormation()
+        self.app, self.iam, _ = make_app(cfn=self.cfn)
+        self.key = self.app.store.create_key("laptop")
+
+    api, owner_post = WebTests.api, WebTests.owner_post
+
+    def ask(self, grants=None, **body):
+        if grants is not None:
+            body["grants"] = grants
+        return self.api("POST", "/api/requests", {"project": "myapp", "reason": "backfill", **body})
+
+    def two(self):
+        status, r = self.ask([{"actions": ["s3:GetObject", "s3:ListBucket"], "resources": self.BUCKET,
+                               "suggested_hours": 3},
+                              {"actions": ["dynamodb:PutItem"], "resources": self.TABLE}])
+        self.assertEqual(status, 201, r)
+        return r
+
+    def approve(self, rid, **hours):
+        r = self.app.store.get(rid)
+        return self.app.decide({"op": "approve", "id": str(rid), "digest": r["digest"], **hours}, "owner")
+
+    def statements(self):
+        doc = self.iam.policies.get(("apm-myapp", "apm-grants"))
+        return {s["Sid"]: s for s in doc["Statement"]} if doc else {}
+
+    def test_the_flat_form_is_unchanged_and_one_grant_keeps_its_sid(self):
+        status, r = self.ask(actions=["s3:GetObject"], resources=self.BUCKET, suggested_hours=3)
+        self.assertEqual(status, 201, r)
+        self.assertNotIn("grants", r)
+        self.assertEqual((r["actions"], r["resources"], r["suggested_hours"]), (["s3:GetObject"], self.BUCKET, 3))
+        status, one = self.ask([{"actions": ["s3:GetObject"], "resources": self.BUCKET}])  # grants with one entry
+        self.assertEqual((status, "grants" in one, one["actions"]), (201, False, ["s3:GetObject"]))
+        self.approve(r["id"], **{"hours-1": "1"})
+        self.approve(one["id"])
+        self.assertEqual(list(self.statements()), ["Req1", "Req2"])
+
+    def test_bad_grants_are_refused(self):
+        g = {"actions": ["s3:GetObject"], "resources": ["*"]}
+        for body, error in [({"grants": [g], "actions": ["s3:GetObject"]}, "not both"),
+                            ({"grants": [g], "suggested_hours": 3}, "not both"),
+                            ({"grants": []}, "1-9"), ({"grants": [g] * 10}, "1-9"), ({"grants": ["s3:GetObject"]}, "1-9"),
+                            ({"grants": [g, {"actions": ["iam:CreateUser"]}]}, "grant 2: iam:CreateUser"),
+                            ({"grants": [g, {**g, "suggested_hours": 2}]}, "grant 2: suggested_hours"),
+                            ({"grants": [g, {"actions": ["ecs:RunTask"], "resources": ["*"]}]}, "refused: grant 2: ecs:RunTask")]:
+            with self.subTest(body=body):
+                status, r = self.ask(**body)
+                self.assertEqual(status, 400)
+                self.assertIn(error, r["error"])
+        self.assertEqual(self.app.store.list(), [])
+
+    def test_each_grant_is_approved_with_its_own_duration(self):
+        r = self.two()
+        self.assertEqual((r["actions"], r["resources"]),  # the union, for listing
+                         (["dynamodb:PutItem", "s3:GetObject", "s3:ListBucket"], sorted(self.BUCKET + self.TABLE)))
+        self.assertEqual([(g["sid"], g["suggested_hours"], g["ended"]) for g in r["grants"]],
+                         [("Req1g1", 3, ""), ("Req1g2", None, "")])
+        page = self.app(web.Request("GET", "/requests/1", cookies=session_cookie(self.app))).body
+        self.assertIn('<option value="3" selected>3 hours (suggested)</option>', page)
+        self.assertIn('<select name="hours-2" form="approve-1"', page)
+        self.assertEqual([m for m in re.findall(r'risk-(\w+)', page)], ["write", "read", "write"])  # row, grant 1, grant 2
+        self.assertEqual(self.approve(1, **{"hours-1": "1", "hours-2": "0"}),
+                         "Approved request #1 for myapp: grant 1 for 1 hour, grant 2 permanently.")
+        st = self.statements()
+        self.assertEqual(list(st), ["Req1g1", "Req1g2"])
+        self.assertEqual(st["Req1g1"]["Resource"], self.BUCKET)
+        self.assertIn("Condition", st["Req1g1"])
+        self.assertNotIn("Condition", st["Req1g2"])
+        self.assertTrue(self.app.broker.in_sync("myapp", self.app.store.approved("myapp")))
+        self.assertEqual(self.api("GET", "/api/projects")[1]["projects"][0]["grants"][1]["reason"], "backfill")
+
+    def test_each_grant_is_revoked_on_its_own_and_the_request_ends_with_its_last(self):
+        self.two()
+        self.approve(1)
+        page = self.app(web.Request("GET", "/requests/1", cookies=session_cookie(self.app))).body
+        self.assertEqual(page.count('name="op" value="revoke"'), 2)  # on the card, per grant
+        self.assertEqual(page.count('name="op" value="extend"'), 2)
+        self.assertEqual(self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1g1"}, "owner"),
+                         "Revoked Req1g1 from myapp.")
+        r = self.app.store.get(1)
+        self.assertEqual((r["status"], [g["ended"] for g in r["grants"]]), ("approved", ["revoked", ""]))
+        self.assertEqual(list(self.statements()), ["Req1g2"])
+        ev = self.app.store.events()[-1]
+        self.assertEqual((ev["op"], ev["request_ids"], ev["detail"], ev["grants"]), ("revoke", [1], "grant 1 of #1", ["Req1g2"]))
+        page = self.app(web.Request("GET", "/requests/1", cookies=session_cookie(self.app))).body
+        self.assertEqual(page.count('name="op" value="revoke"'), 1)
+        self.assertNotIn("Req1g1", page)  # Details shows only what IAM holds
+        self.assertIn("Revoked: grant 1 of #1", page)
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1g2"}, "owner")
+        self.assertEqual((self.app.store.get(1)["status"], self.statements()), ("revoked", {}))
+
+    def test_the_sweep_and_extend_work_per_grant(self):
+        self.two()
+        self.approve(1, **{"hours-1": "1", "hours-2": "3"})
+        self.assertEqual(self.app.decide({"op": "extend", "project": "myapp", "sid": "Req1g2", "hours": "24"}, "owner"),
+                         "Extended Req1g2 on myapp for 1 day.")
+        self.assertRegex(self.app.store.events()[-1]["detail"], r"^grant 2 of #1 until \d{4}-")
+        later = time.time() + 2 * 3600
+        self.assertEqual(self.app.sweep(later), {"expired": {"myapp": [1]}})
+        r = self.app.store.get(1)
+        self.assertEqual((r["status"], [g["ended"] for g in r["grants"]]), ("approved", ["expired", ""]))
+        self.assertEqual(list(self.statements()), ["Req1g2"])
+        self.assertEqual(self.app.store.events()[-1]["detail"], "grant 1 of #1")
+        self.assertEqual(self.app.sweep(later), {"expired": {}})  # idempotent
+        self.assertEqual(self.app.sweep(time.time() + 25 * 3600), {"expired": {"myapp": [1]}})
+        self.assertEqual((self.app.store.get(1)["status"], self.statements()), ("expired", {}))
+        with self.assertRaises(Exception):
+            self.app.decide({"op": "extend", "project": "myapp", "sid": "Req1g2", "hours": "0"}, "owner")
+
+    def test_refusals_apply_per_grant_at_approval_and_credential_time(self):
+        stack = f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:stack/web-*/*"
+        status, r = self.ask([{"actions": ["s3:GetObject"], "resources": self.BUCKET},
+                              {"actions": ["cloudformation:UpdateStack"], "resources": [stack]}])
+        self.assertEqual(status, 201, r)
+        self.cfn.add("us-east-1", "web-prod", f"arn:aws:iam::{ACCOUNT}:role/cdk-exec")
+        from apm.broker import BrokerError
+        with self.assertRaisesRegex(BrokerError, "grant 2: cloudformation:UpdateStack"):
+            self.approve(1, **{"hours-1": "1"})
+        r = self.app.store.get(1)
+        self.assertEqual((r["status"], [g["expires_at"] for g in r["grants"]]), ("pending", [0, 0]))
+        self.cfn.stacks.clear()
+        self.approve(1)
+        self.cfn.add("us-east-1", "web-prod", f"arn:aws:iam::{ACCOUNT}:role/cdk-exec")
+        status, err = self.api("POST", "/api/credentials", {"project": "myapp"})
+        self.assertEqual(status, 403)
+        self.assertIn("Req1g2", err["error"])
+        self.assertNotIn("Req1g1", err["error"])
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1g2"}, "owner")
+        self.assertEqual(self.api("POST", "/api/credentials", {"project": "myapp"})[0], 200)
+
+
 class ClientTests(unittest.TestCase):
     """The plugin's stdlib client, run with the system Python like Claude Code/Codex would."""
 
@@ -1092,6 +1230,13 @@ class ClientTests(unittest.TestCase):
         self.assertIn("[profile apm-myapp]", config)
         self.assertIn("credentials myapp", config)
         self.assertEqual(rpc(11, "nope")["error"]["code"], -32601)
+        sent = tool(12, "request_permissions", project="myapp", reason="sync", grants=[
+            {"actions": ["s3:GetObject"], "resources": ["arn:aws:s3:::b/*"], "duration": "3h"},
+            {"actions": ["sqs:SendMessage"], "resources": ["arn:aws:sqs:us-east-1:1:q"]}])
+        self.assertIn("Request #2", sent["content"][0]["text"])
+        checked = json.loads(tool(13, "check_request", request_id=2)["content"][0]["text"])
+        self.assertEqual([g["grant"] for g in checked["grants"]], ["Req2g1", "Req2g2"])
+        self.assertEqual(self.app.store.get(2)["grants"][0]["suggested_hours"], 3)
 
         # The AWS CLI would run this credential_process command from the profile.
         stable = self.tmp / "apm" / "bin" / "apm.py"
@@ -1237,6 +1382,15 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(run("wait", "1", "--timeout", "5").returncode, 0)
         self.assertIn("web", run("projects").stdout)
         self.assertEqual(run("projects", "--search", "nothing").stdout.strip(), "No matching projects.")
+        r = run("request", "--project", "web", "--grant", "s3:GetObject,s3:ListBucket=arn:aws:s3:::b,arn:aws:s3:::b/*",
+                "--grant", "sqs:SendMessage=arn:aws:sqs:us-east-1:1:q", "--reason", "sync", "--for", "1h")
+        self.assertIn("Request #2", r.stdout, r.stderr)
+        self.assertEqual([(g["actions"], g["resources"], g["suggested_hours"]) for g in self.app.store.get(2)["grants"]],
+                         [(["s3:GetObject", "s3:ListBucket"], ["arn:aws:s3:::b", "arn:aws:s3:::b/*"], 1),
+                          (["sqs:SendMessage"], ["arn:aws:sqs:us-east-1:1:q"], 1)])
+        self.assertIn("Req2g2: sqs:SendMessage on arn:aws:sqs:us-east-1:1:q", run("status", "2").stdout)
+        self.assertIn("not both", run("request", "--project", "web", "--grant", "s3:GetObject", "-a", "s3:GetObject",
+                                      "--reason", "x").stderr)
 
 
 class AwsConfigEditTests(unittest.TestCase):

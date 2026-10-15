@@ -186,6 +186,7 @@ box-shadow:0 8px 24px rgba(0,0,0,.18);pointer-events:none;animation:toast 4.5s f
 .create{margin:0 0 8px}
 select{font:inherit;font-size:.9rem;min-height:36px;padding:0 8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg)}
 .extend{display:flex;gap:8px;margin-top:8px}
+.controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}.controls .extend{margin:0}
 input[type=text]{font:inherit;flex:1;min-width:0;min-height:44px;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg)}
 .secret{font-size:15px;padding:12px;background:var(--sub);border-radius:8px;user-select:all;word-break:break-all}
 .new-key{border-color:var(--border)}

@@ -414,8 +414,38 @@ def validate_request(project, actions, resources, reason):
     return project, actions, resources, reason
 
 
-def sid(request_id):
-    return f"Req{request_id}"
+MAX_GRANTS = 9  # per request
+SID_RE = re.compile(r"^Req([0-9]+)(?:g([1-9]))?$")
+
+
+def sid(request_id, n=None):
+    """Req<id> for a request's only grant, Req<id>g<n> for grant n of several."""
+    return f"Req{request_id}" + (f"g{n}" if n else "")
+
+
+def parse_sid(statement_sid):
+    """(request id, grant n or None) of a Req<id>[g<n>] Sid, or None for any other Sid."""
+    m = SID_RE.match(statement_sid or "")
+    return (int(m.group(1)), int(m.group(2)) if m.group(2) else None) if m else None
+
+
+def grants_of(r):
+    """The grants a request asks for, each {"n", "sid", "actions", "resources", "suggested_hours" (None
+    if the agent didn't suggest a duration), "expires_at" (0: never), "ended" ("", "revoked" or
+    "expired")}. A request with one grant keeps it in its own fields and its status says whether it
+    ended; a request with several stores them in "grants", each with its own end."""
+    if r.get("grants"):
+        return [{"n": g["n"], "sid": sid(r["id"], g["n"]), "actions": g["actions"], "resources": g["resources"],
+                 "suggested_hours": g.get("suggested_hours"), "expires_at": g.get("expires_at", 0),
+                 "ended": g.get("ended", "")} for g in r["grants"]]
+    ended = r["status"] if r.get("status") in ("revoked", "expired") else ""
+    return [{"n": 1, "sid": sid(r["id"]), "actions": r["actions"], "resources": r["resources"],
+             "suggested_hours": r.get("suggested_hours"), "expires_at": r.get("expires_at", 0), "ended": ended}]
+
+
+def live_grants(r):
+    """The grants of a request that haven't ended: for an approved one, what IAM should hold."""
+    return [g for g in grants_of(r) if not g["ended"]]
 
 
 # How long a grant lasts, in hours, as the owner picks it before Approve. 0 is permanent.
@@ -436,15 +466,16 @@ def iso(ts):
 
 
 def grants_document(requests):
-    """The project role's whole grants policy, built from its approved requests."""
-    return doc(*[statement(r["id"], r["actions"], r["resources"], r.get("expires_at", 0))
-                 for r in sorted(requests, key=lambda r: r["id"])])
+    """The project role's whole grants policy, built from its approved requests: one statement per
+    grant that hasn't ended."""
+    return doc(*[statement(g["sid"], g["actions"], g["resources"], g["expires_at"])
+                 for r in sorted(requests, key=lambda r: r["id"]) for g in live_grants(r)])
 
 
-def statement(request_id, actions, resources, expires_at=0):
+def statement(statement_sid, actions, resources, expires_at=0):
     """One grant. A time-limited one carries its end in a condition, so IAM ends it by itself, also
     for credentials already handed out; the sweep removes it from the policy afterwards."""
-    stmt = {"Sid": sid(request_id), "Effect": "Allow", "Action": actions, "Resource": resources}
+    stmt = {"Sid": statement_sid, "Effect": "Allow", "Action": actions, "Resource": resources}
     if expires_at:
         stmt["Condition"] = {"DateLessThan": {"aws:CurrentTime": iso(expires_at)}}
     return stmt
