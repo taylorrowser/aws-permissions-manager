@@ -186,6 +186,12 @@ class Store:
                 raise Conflict(f"request #{request_id} is no longer approved")
             raise
 
+    def set_review(self, request_id, review):
+        """Store the AI reviewer's opinion of a request (see review.sanitise)."""
+        self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression="SET #v = :v",
+                           ConditionExpression="attribute_exists(pk)", ExpressionAttributeNames={"#v": "review"},
+                           ExpressionAttributeValues={":v": review})
+
     # ---------- audit events: one per IAM change (see App.iam_change) ----------
 
     def add_event(self, event):

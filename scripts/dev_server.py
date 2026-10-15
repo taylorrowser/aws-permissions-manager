@@ -5,11 +5,13 @@
 Open http://localhost:8765/dev/login to sign in as the fake owner. Seeds pending requests of every
 risk (some with several grants), enough decided ones to page, a project, an API key and a connect
 request unless --empty. Push works for real if the browser supports it: the server generates
-throwaway VAPID keys at start-up.
+throwaway VAPID keys at start-up. The AI reviewer is stubbed: a canned model answers a second after
+each new request once a key is saved under Settings (seeded with one unless --empty).
 """
 import argparse
 import json
 import sys
+import threading
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,7 +23,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 from apm import policy, push, web  # noqa: E402
 from apm.broker import Broker  # noqa: E402
 from apm.store import Store  # noqa: E402
-from test_apm import FakeCloudFormation, FakeIAM, FakeSTS, FakeTable  # noqa: E402
+from test_apm import FakeCloudFormation, FakeIAM, FakeSTS, FakeTable, fake_reviewer  # noqa: E402
 
 OWNER = "owner@example.com"
 
@@ -35,7 +37,29 @@ def make_app(port, stage):
     app = web.App(settings, Store(FakeTable()), Broker("111122223333", "us-east-1", iam=FakeIAM(), sts=FakeSTS(),
                                                         cloudformation=cfn.client))
     app.cfn = cfn
+    app.reviewer = fake_reviewer(canned_review)
+    # Queueing runs the review a second later, as the async self-invoke would.
+    app.reviewer.lam.invoke = lambda FunctionName, InvocationType, Payload: threading.Timer(
+        1, app.review, [json.loads(Payload)["apm_review"]]).start()
     return app
+
+
+def canned_review(user):
+    """A stand-in model: narrow anything broad, note each grant of a request with several."""
+    data = json.loads(user.removeprefix("<request>\n").removesuffix("\n</request>"))
+    notes = [{"grant": g["grant"], "note": "Scoped to named resources." if g["risk"] in ("Read-only", "Scoped write")
+              else "Every resource: ask for the log groups it writes to."} for g in data.get("grants", [])]
+    if data["risk"] in ("Broad", "Full access") and not notes:
+        if data["actions"] != ["dynamodb:*"]:
+            return json.dumps({"verdict": "narrow", "reason": "Far more than the reason needs. Ask for the actions "
+                               "and resources the task uses."})
+        return json.dumps({"verdict": "narrow", "reason": "dynamodb:* on every resource is far more than the reason "
+                           "needs. Creating and describing the import tables would do.",
+                           "suggested_actions": ["dynamodb:CreateTable", "dynamodb:DescribeTable"],
+                           "suggested_resources": ["arn:aws:dynamodb:us-east-1:111122223333:table/import-*"]})
+    return json.dumps({"verdict": "ok", "reason": "Fits the stated purpose and is limited to the resources it names."
+                       if not notes else "Two grants are scoped; the logs grant is wider than it needs.",
+                       "grant_notes": notes})
 
 
 def seed(app):
@@ -105,6 +129,11 @@ def seed(app):
                  "Update the web stack's parameters.", "macbook"))
     app.cfn.add("us-east-1", "web-prod", "arn:aws:iam::111122223333:role/cdk-exec")
     s.add_connect("codex-cloud", "ab" * 32, "apm_abcdef", "203.0.113.7 apm-client/1.0")
+    # AI reviews of most pending requests; website's were asked before the key was saved.
+    app.reviewer.save_key("sk-dev-" + "0" * 40)
+    for r in s.list(status="pending"):
+        if r["project"] != "website":
+            app.review(r["id"])
 
 
 def handler_for(app):

@@ -21,7 +21,7 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 
-from . import pages, policy
+from . import pages, policy, review
 from .broker import Broker, BrokerError
 from .store import CONNECT_SECONDS, PENDING_LIMIT, Conflict, Store, subscription_id
 
@@ -174,9 +174,10 @@ def cookie(name, value, max_age):
 # ---------- the app ----------
 
 class App:
-    def __init__(self, settings, store, broker, http=None):
+    def __init__(self, settings, store, broker, http=None, reviewer=None):
         self.s, self.store, self.broker = settings, store, broker
         self.http = http or _http_json
+        self.reviewer = reviewer  # the optional AI reviewer (review.Reviewer)
 
     def __call__(self, req):
         try:
@@ -314,6 +315,8 @@ class App:
                 c = self.store.decide_connect(form.get("code", ""), op == "approve_connect")
                 verb = "Connected" if op == "approve_connect" else "Rejected"
                 return redirect("/?msg=" + _q(f"{verb} agent {c['name']!r}."))
+            if op in ("save_llm_key", "remove_llm_key"):
+                return redirect("/settings?msg=" + _q(self.llm_key(op, form.get("llm_key", ""))))
             if op == "create_key":
                 name = re.sub(r"[^A-Za-z0-9 ._@-]", "", form.get("name", "")).strip()[:40] or "agent"
                 secret = self.store.create_key(name)
@@ -488,6 +491,25 @@ class App:
             self.store.remove_device(form.get("pk", ""))
             return "Removed the device from notifications."
         return "Unknown action."
+
+    def llm_key(self, op, value):
+        """Save or remove the AI reviewer's key. The value is never logged, echoed or shown again."""
+        if not self.reviewer:
+            return "Error: this deployment has no AI reviewer."
+        if op == "remove_llm_key":
+            self.reviewer.remove_key()
+            return ("Removed the AI reviewer's key. New requests get no AI review. To add a key again, wait about "
+                    "30 seconds: SSM refuses to recreate a parameter it has just deleted.")
+        value = value.strip()
+        if not 20 <= len(value) <= 500 or not value.isascii() or not value.isprintable() or " " in value:
+            return "Error: that doesn't look like an API key. Paste the whole key, with nothing around it."
+        try:
+            self.reviewer.save_key(value)
+        except Exception as e:
+            print(json.dumps({"event": "llm_key_save_failed", "error": type(e).__name__}))
+            return (f"Error: SSM didn't save the key ({type(e).__name__}). If you removed a key just now, wait about "
+                    "30 seconds and try again.")
+        return "Saved the AI reviewer's key. New requests get an AI review."
 
     def shrink(self, project, sid, actions, resources, op, actor, why="", agent_key=""):
         """Drop exactly these actions and resources from one live grant of the project, or the whole
@@ -899,7 +921,44 @@ class App:
             what = _plural(len(g["actions"]), "action")
         self.notify_safely({"title": f"Permission request #{rid}", "body": f"{project}: {what} to review",
                             "url": f"/requests/{rid}", "tag": f"req-{rid}"})
+        self.queue_review(rid)
         return _public(self.store.get(rid))
+
+    # ----- the AI reviewer (optional, advisory; see review.py) -----
+
+    def queue_review(self, rid):
+        """Ask for an AI review of a new request in the background. The request is already saved,
+        so a failure here only means it has no review."""
+        if not self.reviewer:
+            return
+        try:
+            self.reviewer.queue(rid)
+        except Exception as e:
+            print(json.dumps({"event": "review_queue_failed", "request": rid, "error": f"{type(e).__name__}: {e}"[:300]}))
+
+    def review(self, rid):
+        """{"apm_review": <id>}: review one pending request, if a key is set, and store the result.
+        An answer that can't be parsed is logged and dropped: the request shows "No AI review"."""
+        r = self.store.get(rid, consistent=True)  # written just before this invocation was queued
+        if not self.reviewer or not r or r["status"] != "pending" or r.get("review"):
+            return {"reviewed": False}
+        key = self.reviewer.key()
+        if not key:
+            return {"reviewed": False}
+        data = review.model_input(r, self.store.approved(r["project"]),
+                                  lambda grants: pages.LABELS[pages.worst_risk(grants)])
+        try:
+            answer = self.reviewer.ask(key, review.prompt(data))
+        except Exception as e:
+            print(json.dumps({"event": "review_failed", "request": rid, "error": f"{type(e).__name__}: {e}"[:300]}))
+            return {"reviewed": False}
+        found = review.sanitise(answer, len(policy.grants_of(r)))
+        if not found:
+            print(json.dumps({"event": "review_unparseable", "request": rid}))
+            return {"reviewed": False}
+        self.store.set_review(rid, review.stamp(found, self.reviewer.model))
+        print(json.dumps({"event": "review", "request": rid, "verdict": found["verdict"]}))
+        return {"reviewed": True}
 
     def remove(self, req, key):
         """An agent drops access it no longer needs: {project, grant: "Req22" | "Req52g3", actions?,
@@ -1102,7 +1161,8 @@ _app = None
 
 
 def handler(event, context):
-    """API Gateway requests, and {"apm_sweep": true} from the EventBridge schedule."""
+    """API Gateway requests, {"apm_sweep": true} from the EventBridge schedule and {"apm_review": <id>}
+    from the Lambda itself (App.queue_review)."""
     global _app
     if _app is None:
         import boto3
@@ -1110,7 +1170,11 @@ def handler(event, context):
         region = os.environ.get("AWS_REGION", "us-east-1")
         table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
         store = Store(table)
-        _app = App(Settings.from_env(), store, Broker(account, region))
+        reviewer = review.lambda_reviewer(context.function_name, os.environ.get("PARAM_PREFIX", "/apm"))
+        _app = App(Settings.from_env(), store, Broker(account, region), reviewer=reviewer)
     if event.get("apm_sweep") is True:
         return _app.sweep()
+    if "apm_review" in event:
+        rid = event["apm_review"]
+        return _app.review(rid) if type(rid) is int and rid > 0 else {"reviewed": False}
     return _app(Request.from_lambda(event)).lambda_result()

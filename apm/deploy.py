@@ -63,6 +63,13 @@ def template(account, region, domain, zone_id, owner_emails, workos_client_id, v
          "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Scan"]},
         {"Sid": "Secrets", "Effect": "Allow", "Action": "ssm:GetParameter",
          "Resource": f"arn:aws:ssm:{region}:{account}:parameter{n.param_prefix}/*"},
+        # The AI reviewer: the owner's key, saved and removed from Settings, and queueing a review by
+        # invoking this same function. Only this stage's own parameter and function.
+        {"Sid": "ReviewerKey", "Effect": "Allow",
+         "Action": ["ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter"],
+         "Resource": f"arn:aws:ssm:{region}:{account}:parameter{n.param_prefix}/llm-key"},
+        {"Sid": "QueueReview", "Effect": "Allow", "Action": "lambda:InvokeFunction",
+         "Resource": f"arn:aws:lambda:{region}:{account}:function:{n.function}"},
     ]
     # Previews are disposable: their table goes with the stack. prod and dev keep theirs.
     keep = "Delete" if n.is_preview else "Retain"
