@@ -399,7 +399,7 @@ def plain(actions, resources):
     else:
         phrases = list(dict.fromkeys(p for _, p in places))  # bucket b and b/* read as one bucket
         if len(phrases) > 3:
-            wide = [p for p in phrases if p.startswith("every")]
+            wide = [p for p in phrases if re.search(r"\bevery\b", p)]  # every bucket, in every region, ...
             phrases = [f"{len(phrases)} resources" + (", including " + _and(wide) if wide else "")]
         listing = _and(phrases)
     if len(clauses) == 1 and clauses[0][0] != "Do anything in":

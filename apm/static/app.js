@@ -149,6 +149,13 @@ function digestToSubmit({ background, sameRequest, seen, fresh }) {
   return background && sameRequest && seen ? seen : fresh;
 }
 
+// Back or Forward while the Requests screen is open. The pane must follow the URL, so a pending
+// confirm (for the request being left) is cancelled first; mid-submit the page simply reloads.
+function onHistory({ dialogOpen, busy }) {
+  if (busy) return "reload";
+  return dialogOpen ? "cancel-then-open" : "open";
+}
+
 // Decided rows to carry over when a refresh redraws the list: rows loaded past the fresh first
 // page stay (ids are newest first); rows the fresh page has are taken from it.
 function keepDecided(freshIds, oldIds) {
@@ -173,7 +180,7 @@ function step(ids, current, dir) {
 
 if (typeof module !== "undefined") {
   module.exports = { isIOS, pushState, deniedHelp, keyBytes, sameKey, legacyTarget, relativeTime, rotateIfKeyChanged,
-    canRefresh, createPager, isInboxPath, afterSubmit, digestToSubmit, keepDecided, keyCommand, step };
+    canRefresh, createPager, isInboxPath, afterSubmit, onHistory, digestToSubmit, keepDecided, keyCommand, step };
 }
 
 // ---------- page behaviour ----------
@@ -374,7 +381,11 @@ if (typeof document !== "undefined") {
     openPane(a.getAttribute("href"));
   });
   addEventListener("popstate", () => {
-    if (page === "requests" && isInboxPath(location.pathname)) pager.open(location.pathname).catch(() => location.reload());
+    if (page !== "requests" || !isInboxPath(location.pathname)) return;
+    const how = onHistory({ dialogOpen: Boolean($("confirm")?.open), busy: pager.busy });
+    if (how === "reload") { location.reload(); return; }
+    if (how === "cancel-then-open") $("confirm").close(); // the confirm was for the request being left
+    pager.open(location.pathname).catch(() => location.reload());
   });
 
   // Decided loads 10 rows at a time as its end scrolls into view (or Older is tapped).

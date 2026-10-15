@@ -183,6 +183,8 @@ class ScreenTests(Base):
              "Read S3 and write DynamoDB on bucket b and table t"),
             (["s3:GetObject"], [f"arn:aws:s3:::b{i}" for i in range(4)] + ["arn:aws:s3:::x-*"],
              "Read S3 on 5 resources, including every bucket matching x-*"),
+            (["dynamodb:GetItem"], [f"arn:aws:dynamodb:us-east-1:1:table/{t}" for t in "abc"] + ["arn:aws:dynamodb:*:*:table/d"],
+             "Read DynamoDB on 4 resources, including table d in every region and account"),
             (["iam:PassRole"], ["arn:aws:iam::1:role/agents/apm-web"], "Pass IAM role agents/apm-web"),
         ]
         for actions, resources, want in cases:

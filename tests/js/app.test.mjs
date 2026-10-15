@@ -219,3 +219,9 @@ test("a confirm drops a row still loading, so it can't replace the pane behind t
   assert.equal(await open, false);
   assert.deepEqual(applied, []);
 });
+
+test("Back and Forward keep the pane on the URL: a pending confirm is cancelled, a submit reloads", () => {
+  assert.equal(app.onHistory({ dialogOpen: false, busy: false }), "open");
+  assert.equal(app.onHistory({ dialogOpen: true, busy: false }), "cancel-then-open");
+  assert.equal(app.onHistory({ dialogOpen: false, busy: true }), "reload");
+});
