@@ -571,11 +571,16 @@ def projects_page(app, owner, msg=""):
         if flagged:
             out.append('<div class=warn role=alert><p><b>Agents get no credentials for this project</b> until you '
                        f'revoke {_and(sorted(flagged))}: they would be refused if requested now.</p></div>')
-        if not statements:
+        # A flagged approval IAM never received (its write failed) still blocks credentials: list it
+        # too, so it can be revoked.
+        held = {s.get("Sid", "") for s in statements}
+        shown = statements + [policy.statement(r["id"], r["actions"], r["resources"]) for r in store.approved(project)
+                              if policy.sid(r["id"]) in flagged and policy.sid(r["id"]) not in held]
+        if not shown:
             out.append("<p class=muted>No grants yet.</p>")
         else:
             out.append("<ul class=grants>" + "".join(_grant(project, s, store, flagged.get(s.get("Sid", ""), ()))
-                                                    for s in statements) + "</ul>")
+                                                    for s in shown) + "</ul>")
         out.append(f'<p class=muted>Role <code>{e(policy.role_name(project))}</code></p>'
                    '<details class=danger-zone><summary>Delete project…</summary>'
                    '<p class=muted>Removes the role and every grant. Agents lose access within an hour.</p>'

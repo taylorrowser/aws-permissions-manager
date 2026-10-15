@@ -298,11 +298,15 @@ def _arn(resource):
 
 
 def _every(resource, service):
-    """Whether a resource covers every resource of a service: "*", or its ARN with a wildcard name."""
+    """Whether a resource covers every resource of a service: "*", or its ARN with a wildcard before
+    any name ("function:*", "function*", "f*"). A name prefix ("function:api-*") scopes it."""
     if resource == "*":
         return True
     arn = _arn(resource)
-    return bool(arn) and fnmatch.fnmatchcase(service, arn[0]) and re.fullmatch(r"([A-Za-z-]+[:/])?\*", arn[3]) is not None
+    if not arn or not fnmatch.fnmatchcase(service, arn[0]):
+        return False
+    literal = re.split(r"[*?]", arn[3], maxsplit=1)
+    return len(literal) > 1 and re.fullmatch(r"[A-Za-z-]*[:/]?", literal[0]) is not None
 
 
 def _stacks(resource):

@@ -844,6 +844,7 @@ class RefusalTests(unittest.TestCase):
         for actions, resources in [
                 (["lambda:UpdateFunctionCode"], ["*"]), (["lambda:*"], ["*"]), (["ecs:RunTask"], ["*"]),
                 (["lambda:UpdateFunctionConfiguration"], [fn + "*"]), (["ssm:Send*"], ["*"]),
+                (["lambda:UpdateFunctionCode"], [f"arn:aws:lambda:us-east-1:{ACCOUNT}:function*"]),
                 (["cloudformation:UpdateStack"], ["*"]), (["cloudformation:*"], ["*"]),
                 (["cloudformation:ExecuteStackRefactor"], ["*"]),
                 (["cloudformation:CreateChangeSet"], [f"arn:aws:cloudformation:*:{ACCOUNT}:stack/web/*"]),
@@ -875,9 +876,10 @@ class RefusalTests(unittest.TestCase):
         status, r = self.ask(["cloudformation:UpdateStack"], [self.STACK])
         self.assertEqual(status, 400)
         self.assertIn("stored role of stack web-prod", r["error"])
-        status, r = self.ask(["cloudformation:UpdateStack"], [f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:*/web-prod/*"])
-        self.assertEqual(status, 400)  # a wildcard resource type still matches stack/web-prod/<id>
-        self.assertIn("stored role of stack web-prod", r["error"])
+        for odd in ("*/web-prod/*", "stack*/web-prod/*"):  # wildcard resource types still match stack/web-prod/<id>
+            status, r = self.ask(["cloudformation:UpdateStack"], [f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:{odd}"])
+            self.assertEqual(status, 400)
+            self.assertIn("stored role of stack web-prod", r["error"])
         self.assertEqual(self.ask(["cloudformation:UpdateStack"],
                                   [f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:stack/other-*/*"])[0], 201)
         self.assertEqual(len(self.app.store.list()), 1)
@@ -912,8 +914,10 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertIn(f"Req{r['id']}", err["error"])
         self.assertGreater(len(self.cfn.calls), calls)  # listed again, not cached
+        self.iam.policies.pop(("apm-myapp", "apm-grants"))  # e.g. the approval's IAM write failed
         page = self.app(web.Request("GET", "/projects", cookies=session_cookie(self.app))).body
         self.assertIn("Credentials blocked", page)
+        self.assertIn(f'name="sid" value="Req{r["id"]}"', page)  # still listed, so it can be revoked
         self.cfn.stacks.clear()
         self.cfn.failing.add("us-east-1")  # a failed listing blocks credentials too
         self.assertEqual(self.api("POST", "/api/credentials", {"project": "myapp"})[0], 403)
