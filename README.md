@@ -22,7 +22,7 @@ agent ── aws --profile apm-<project> ── credential_process ────�
   - edit those roles' inline policies, and delete those roles;
   - assume them to vend credentials;
   - read and write its DynamoDB table;
-  - list CloudFormation stacks (`DescribeStacks`), to refuse stack writes that would run as a stack's stored role.
+  - list CloudFormation stacks (`DescribeStacks`, `ListStacks`), to refuse stack writes that would run as a stack's stored role.
 
   It can't remove a boundary or touch any other IAM resource, and no long-lived broker key exists anywhere.
 - **Agents hold only an API key.** It lets them list projects, request permissions and get credentials. Approving needs your WorkOS sign-in. Any key can use any approved project; you tell each agent which one to use.

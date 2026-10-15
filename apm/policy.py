@@ -265,7 +265,9 @@ def broker_policy(account, names=None):
          "Resource": f"arn:aws:iam::{account}:role/{n.role_prefix}*",
          "Action": ["iam:GetRole", "iam:GetRolePolicy", "iam:ListRolePolicies"]},
         # Read-only: a stack write is refused if the stack it names has a stored role (refusals()).
-        {"Sid": "CheckStackRoles", "Effect": "Allow", "Action": "cloudformation:DescribeStacks", "Resource": "*"},
+        # DescribeStacks without a stack name also needs ListStacks.
+        {"Sid": "CheckStackRoles", "Effect": "Allow", "Resource": "*",
+         "Action": ["cloudformation:DescribeStacks", "cloudformation:ListStacks"]},
         {"Sid": "NeverRemoveBoundary", "Effect": "Deny", "Resource": "*",
          "Action": ["iam:DeleteRolePermissionsBoundary", "iam:PutRolePermissionsBoundary"]},
     )

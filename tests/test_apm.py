@@ -932,8 +932,8 @@ class RefusalTests(unittest.TestCase):
 
     def test_broker_may_list_stacks(self):
         allows = [s for s in policy.broker_policy(ACCOUNT)["Statement"] if s["Effect"] == "Allow"]
-        self.assertIn({"Sid": "CheckStackRoles", "Effect": "Allow", "Action": "cloudformation:DescribeStacks",
-                       "Resource": "*"}, allows)
+        self.assertIn({"Sid": "CheckStackRoles", "Effect": "Allow", "Resource": "*",
+                       "Action": ["cloudformation:DescribeStacks", "cloudformation:ListStacks"]}, allows)
 
 
 class ClientTests(unittest.TestCase):
