@@ -223,12 +223,8 @@ def error_page(app, text, back="/"):
 # the page script swaps the pane in place; on phones the list (/) and a request (/requests/<id>)
 # are separate pages. Both URLs render the same two panes; data-view says which one a phone shows.
 
-def grants_of(r):
-    """The grants a request asks for, each {"n", "actions", "resources", "suggested_hours" (None if
-    the agent didn't suggest a duration), "expires_at" (0: never)}. Everything on the card is per
-    grant: requests carry one today, and a request with several returns one entry per grant here."""
-    return [{"n": 1, "actions": r["actions"], "resources": r["resources"],
-             "suggested_hours": r.get("suggested_hours"), "expires_at": r.get("expires_at", 0)}]
+# The grants a request asks for (see policy.grants_of). Everything on the card is per grant.
+grants_of = policy.grants_of
 
 
 def worst_risk(grants):
@@ -456,22 +452,39 @@ def _durations(name, selected, suggested=None, form="", ident=""):
     return f'<select name="{e(name)}"{attrs}>{opts}</select>'
 
 
-def _grant_card(g, form=""):
+def _grant_card(g, form="", project="", back="/"):
     """One grant: the plain line and its risk, what it means, then the exact actions and ARNs. form:
-    the Approve form's id while the request is pending, which the grant's duration picker joins."""
+    the Approve form's id while the request is pending, which the grant's duration picker joins.
+    project: set once the request is approved, to give a grant still in force its own Extend and Revoke."""
     actions, resources = g["actions"], g["resources"]
     notes = _scope_notes(actions, resources)
     if form:
         suggested, name = g["suggested_hours"], "hours-%d" % g["n"]
         lasts = f'<label class=lasts>For {_durations(name, suggested or 0, suggested, form, f"{form}-{name}")}</label>'
+    elif g["ended"] == "revoked":
+        lasts = '<p class=lasts>Revoked</p>'
     elif g["expires_at"]:
         lasts = f'<p class=lasts>{_ends(g["expires_at"])}</p>'
     else:
         lasts = ""
+    if project and not g["ended"]:
+        lasts += f'<div class=controls>{_extend(project, g["sid"], back)}' + _form(
+            {"op": "revoke", "project": project, "sid": g["sid"]}, "Revoke early" if g["expires_at"] else "Revoke",
+            "danger small", f"Revoke this grant from {project}? Agents lose it within minutes.", back) + "</div>"
     return (f'<section class=grant><p class=grant-head><span class=plain>{e(plain(actions, resources))}</span>'
             f'{_level_label(risk(actions, resources)[0])}</p>'
             + ('<ul class=notes>' + "".join(f"<li>{n}</li>" for n in notes) + "</ul>" if notes else "")
             + f'<ul class=codes>{_codes(actions)}</ul><ul class=codes>{_codes(resources)}</ul>{lasts}</section>')
+
+
+def _extend(project, sid, back):
+    """Extend a grant: a new duration from now, or permanent."""
+    return ('<form method="post" action="/action" class=extend>'
+            + "".join(f'<input type="hidden" name="{k}" value="{e(v)}">'
+                      for k, v in (("op", "extend"), ("project", project), ("sid", sid), ("back", back)))
+            + f'<label class=sr-only for="extend-{e(sid)}">New duration from now</label>'
+            + _durations("hours", 1, ident=f"extend-{sid}")
+            + '<button class=small>Extend</button></form>')
 
 
 def request_pane(app, r, projects, error=""):
@@ -490,14 +503,17 @@ def request_pane(app, r, projects, error=""):
                    + (f'. {e(r["note"])}' if r.get("note") else "")
                    + ('. See it in <a href="/projects">Projects</a>.' if r["status"] == "approved" else "") + "</p>")
         out.append(f'<div id=flash-slot>{_flash(error)}</div>')
-    out += [_grant_card(g, f"approve-{rid}" if pending else "") for g in grants]
+    approved = project if r["status"] == "approved" else ""
+    out += [_grant_card(g, f"approve-{rid}" if pending else "", approved, f"/requests/{rid}") for g in grants]
     if project not in projects and pending:
         out.append(f'<p class=note>Creates the project and its role <code>{e(policy.role_name(project))}</code>.</p>')
-    stmt = policy.statement(rid, r["actions"], r["resources"], r.get("expires_at", 0))
+    shown = policy.live_grants(r) if approved else grants  # what IAM holds, once approved
+    stmts = [policy.statement(g["sid"], g["actions"], g["resources"], g["expires_at"]) for g in shown]
     out.append(f'<details class=more id="details-{rid}"><summary>Details</summary><dl class=meta>'
                f'<dt>From</dt><dd>{e(r.get("requester") or "unknown")}</dd><dt>Asked</dt><dd>{_time(r["created_at"])}</dd>'
                f'<dt>Role</dt><dd><code>{e(policy.role_name(project))}</code></dd></dl>'
-               f'<pre>{e(json.dumps(stmt, indent=2))}</pre>{"" if failed else history(rid, events)}</details>')
+               f'<pre>{e(json.dumps(stmts[0] if len(stmts) == 1 else stmts, indent=2))}</pre>'
+               f'{"" if failed else history(rid, events)}</details>')
     if failed:  # an IAM change for this request failed: say so up front
         out.append(history(rid, events))
     out.append("</div>")
@@ -542,17 +558,21 @@ EVENT_LABELS = {"approve": ("Approved", "Approval"), "revoke": ("Revoked", "Revo
 def history(rid, events):
     """The IAM changes made for this request, plus any change for another request that added or
     removed this one's grant (for example a re-apply after a failed revoke). See App.iam_change."""
-    rows, sid = [], policy.sid(rid)
+    rows = []
+
+    def mine(sids):  # this request's grants among some Sids: Req<rid>, or Req<rid>g<n> for one of several
+        return {x for x in sids if (policy.parse_sid(x) or (None,))[0] == rid}
     for ev in events:
         done, tried = EVENT_LABELS.get(ev["op"], (ev["op"], ev["op"]))
         if rid in ev.get("targets", []):
             what = done if ev["outcome"] == "applied" else f'{tried} {ev["outcome"]}'
             if ev.get("detail"):
                 what += f': {ev["detail"]}'
-        elif ev["outcome"] != "applied" or (sid in ev.get("previous_grants", [])) == (sid in ev.get("grants", [])):
-            continue  # another request's change that left this grant as it was
+        elif ev["outcome"] != "applied" or mine(ev.get("previous_grants", [])) == mine(ev.get("grants", [])):
+            continue  # another request's change that left this request's grants as they were
         else:
-            what = f'Grant {"added" if sid in ev["grants"] else "removed"} ({tried.lower()})'
+            added = mine(ev["grants"]) - mine(ev.get("previous_grants", []))
+            what = f'Grant {"added" if added else "removed"} ({tried.lower()})'
         error = f'<br><span class=muted>{e(ev["error"])}</span>' if ev.get("error") else ""
         rows.append(f'<li><span><b>{e(what)}</b> <span class=muted>by {e(ev.get("actor") or "unknown")}</span>{error}</span>'
                     f'<span class=muted>{_time(ev["at"])}</span></li>')
@@ -565,23 +585,21 @@ def history(rid, events):
 
 def _grant(project, s, store, reasons=()):
     sid = s.get("Sid", "")
-    req = store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
+    ref = policy.parse_sid(sid)
+    req = store.get(ref[0]) if ref else None
+    g = next((g for g in policy.live_grants(req) if g["sid"] == sid), None) if req and req["status"] == "approved" else None
     actions, resources = _list(s.get("Action", [])), _list(s.get("Resource", []))
     on = ("<span>all resources</span>" if _everything(resources) else f'<ul class=codes>{_codes(resources)}</ul>')
-    why = (f'<p class=muted>{e(req["reason"])} <a href="/requests/{req["id"]}">#{req["id"]}</a></p>' if req
+    which = f" grant {g['n']}" if g and req.get("grants") else ""
+    why = (f'<p class=muted>{e(req["reason"])} <a href="/requests/{req["id"]}">#{req["id"]}{which}</a></p>' if req
            else f'<p class=muted>Grant <code>{e(sid)}</code></p>')
     blocked = ('<span class=badge>Blocked</span>' if reasons else "")
     notes = ('<ul class=notes>' + "".join(f"<li>{e(x)}</li>" for x in reasons) + "</ul>" if reasons else "")
-    ends = req.get("expires_at", 0) if req and req["status"] == "approved" else 0
+    ends = g["expires_at"] if g else 0
     extend = ""
     if ends:  # a countdown, and Extend: a new duration from now, or permanent
         why += f'<p class=muted>{_ends(ends)}</p>'
-        extend = ('<form method="post" action="/action" class=extend>'
-                  + "".join(f'<input type="hidden" name="{k}" value="{e(v)}">'
-                            for k, v in (("op", "extend"), ("project", project), ("sid", sid), ("back", "/projects")))
-                  + f'<label class=sr-only for="extend-{e(sid)}">New duration from now</label>'
-                  + _durations("hours", 1, ident=f"extend-{sid}")
-                  + '<button class=small>Extend</button></form>')
+        extend = _extend(project, sid, "/projects")
     return (f'<li><div><p class=line>{blocked}{_risk_chip(actions, resources)}</p><ul class=codes>{_codes(actions)}</ul>'
             f'<p class=on>on {on}</p>{why}{notes}{extend}</div>'
             + _form({"op": "revoke", "project": project, "sid": sid}, "Revoke early" if ends else "Revoke", "danger small",
@@ -619,8 +637,8 @@ def projects_page(app, owner, msg=""):
         # A flagged approval IAM never received (its write failed) still blocks credentials: list it
         # too, so it can be revoked.
         held = {s.get("Sid", "") for s in statements}
-        shown = statements + [policy.statement(r["id"], r["actions"], r["resources"]) for r in store.approved(project)
-                              if policy.sid(r["id"]) in flagged and policy.sid(r["id"]) not in held]
+        shown = statements + [policy.statement(g["sid"], g["actions"], g["resources"]) for r in store.approved(project)
+                              for g in policy.live_grants(r) if g["sid"] in flagged and g["sid"] not in held]
         if not shown:
             out.append("<p class=muted>No grants yet.</p>")
         else:

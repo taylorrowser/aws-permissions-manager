@@ -79,15 +79,25 @@ class Store:
 
     # ---------- requests ----------
 
-    def add(self, project, actions, resources, reason, requester="", suggested_hours=None):
+    def add(self, project, actions, resources, reason, requester="", suggested_hours=None, grants=None):
+        """grants: for a request with several grants (2-9), [{"actions", "resources", "suggested_hours"
+        (optional)}]. Each is stored with its number n, its end and whether it ended; the request's
+        own actions and resources are then their union, for listing."""
+        extra = {"suggested_hours": suggested_hours} if suggested_hours is not None else {}
+        if grants:
+            extra = {"grants": [{"n": n, "actions": g["actions"], "resources": g["resources"], "expires_at": 0,
+                                 "ended": "", **({"suggested_hours": g["suggested_hours"]}
+                                                 if g.get("suggested_hours") is not None else {})}
+                                for n, g in enumerate(grants, 1)]}
+            actions = sorted({a for g in grants for a in g["actions"]})
+            resources = sorted({x for g in grants for x in g["resources"]})
         rid = int(self.t.update_item(
             Key={"pk": "counter#request"}, UpdateExpression="ADD n :one",
             ExpressionAttributeValues={":one": 1}, ReturnValues="UPDATED_NEW")["Attributes"]["n"])
         self.t.put_item(Item={
             "pk": f"req#{rid}", "kind": "req", "id": rid, "project": project, "actions": actions,
             "resources": resources, "reason": reason, "requester": requester, "status": "pending",
-            "note": "", "created_at": int(time.time()), "decided_at": 0, "expires_at": 0,
-            **({"suggested_hours": suggested_hours} if suggested_hours is not None else {})})
+            "note": "", "created_at": int(time.time()), "decided_at": 0, "expires_at": 0, **extra})
         return rid
 
     def get(self, request_id, consistent=False):
@@ -110,19 +120,24 @@ class Store:
     def pending_count(self, requester):
         return sum(1 for r in self._scan("req") if r["status"] == "pending" and r["requester"] == requester)
 
-    def set_status(self, request_id, status, note="", expect=None, expires_at=None):
-        """expires_at: when an approval ends (0 never), set with it. None leaves it as it is."""
+    def set_status(self, request_id, status, note="", expect=None, expires_at=None, grants=None):
+        """expires_at: when an approval ends (0 never), set with it. grants: a request's several grants,
+        each with its own end, set with it. None leaves either as it is."""
         kw = {}
         if expect:
             kw = {"ConditionExpression": "#s = :expect", "ExpressionAttributeValues": {":expect": expect}}
         kw.setdefault("ExpressionAttributeValues", {}).update({":s": status, ":n": note, ":t": int(time.time())})
-        update = "SET #s = :s, note = :n, decided_at = :t"
+        update, names = "SET #s = :s, note = :n, decided_at = :t", {"#s": "status"}
         if expires_at is not None:
             update += ", expires_at = :x"
             kw["ExpressionAttributeValues"][":x"] = int(expires_at)
+        if grants is not None:
+            update += ", #g = :g"  # by name: DynamoDB reserves many words
+            kw["ExpressionAttributeValues"][":g"] = grants
+            names["#g"] = "grants"
         try:
             self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression=update,
-                               ExpressionAttributeNames={"#s": "status"}, **kw)
+                               ExpressionAttributeNames=names, **kw)
         except Exception as e:
             if getattr(e, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 raise Conflict(f"request #{request_id} is no longer {expect}")
@@ -134,6 +149,18 @@ class Store:
             self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression="SET expires_at = :x",
                                ConditionExpression="#s = :expect", ExpressionAttributeNames={"#s": "status"},
                                ExpressionAttributeValues={":x": int(expires_at), ":expect": "approved"})
+        except Exception as e:
+            if getattr(e, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                raise Conflict(f"request #{request_id} is no longer approved")
+            raise
+
+    def set_grants(self, request_id, grants):
+        """Change an approved request's several grants (an end, or one ended) while it stays approved.
+        Raises Conflict if it's no longer approved. When the last grant ends, use set_status."""
+        try:
+            self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression="SET #g = :g",
+                               ConditionExpression="#s = :expect", ExpressionAttributeNames={"#s": "status", "#g": "grants"},
+                               ExpressionAttributeValues={":g": grants, ":expect": "approved"})
         except Exception as e:
             if getattr(e, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 raise Conflict(f"request #{request_id} is no longer approved")
@@ -292,5 +319,8 @@ def _view(r):
 
 def digest(r):
     """Fingerprint of what the owner sees, so a request edited after the page loaded can't be approved."""
-    body = json.dumps([r["id"], r["project"], r["actions"], r["resources"], r["reason"]])
+    parts = [r["id"], r["project"], r["actions"], r["resources"], r["reason"]]
+    if r.get("grants"):  # which grant asks for what
+        parts.append([[g["n"], g["actions"], g["resources"]] for g in r["grants"]])
+    body = json.dumps(parts)
     return hashlib.sha256(body.encode()).hexdigest()

@@ -345,13 +345,19 @@ class App:
                 if op == "reject":
                     self.store.set_status(r["id"], "rejected", form.get("note", "")[:500], expect="pending")
                     return f"Rejected request #{r['id']}."
-                hours = policy.duration(form.get("hours-1", "0"))  # one grant per request: grant 1
-                expires_at = int(time.time()) + hours * 3600 if hours else 0
-                self.store.set_status(r["id"], "approved", expect="pending", expires_at=expires_at)
+                grants, now = policy.grants_of(r), int(time.time())
+                hours = {g["n"]: policy.duration(form.get(f"hours-{g['n']}", "0")) for g in grants}  # one picker each
+                ends = {n: now + h * 3600 if h else 0 for n, h in hours.items()}
+                if r.get("grants"):
+                    self.store.set_status(r["id"], "approved", expect="pending",
+                                          grants=[{**g, "expires_at": ends[g["n"]]} for g in r["grants"]])
+                else:
+                    self.store.set_status(r["id"], "approved", expect="pending", expires_at=ends[1])
 
                 def write():
                     # Checked again, fresh: a stack may have gained a stored role since the request.
-                    problems = self.refusals(r["actions"], r["resources"])
+                    stacks = self._stack_lister()
+                    problems = [_named(r, g, p) for g in grants for p in self.refusals(g["actions"], g["resources"], stacks)]
                     if problems:
                         raise BrokerError("refused: " + "; ".join(problems))
                     return self.broker.sync(project, self.store.approved(project))
@@ -359,7 +365,7 @@ class App:
                     self.iam_change("approve", project, actor, write, [r["id"]])
                 except BrokerError:
                     # Refused before writing anything (a refusal, the size limit): safe to undo.
-                    self.store.set_status(r["id"], "pending", expect="approved", expires_at=0)
+                    self.store.set_status(r["id"], "pending", expect="approved", expires_at=0, grants=r.get("grants"))
                     raise
                 except Exception as e:
                     # The write may or may not have reached IAM (e.g. a timeout after IAM applied
@@ -367,21 +373,27 @@ class App:
                     print(f"IAM sync for {project} failed after approving #{r['id']}: {e!r}")
                     return (f"Error: approved request #{r['id']}, but updating IAM failed ({type(e).__name__}). "
                             f"Open Projects and tap Re-apply decisions for {project}.")
-                return f"Approved request #{r['id']} for {project}" + (f" for {policy.DURATIONS[hours]}." if hours else ".")
+                if len(grants) > 1:
+                    return f"Approved request #{r['id']} for {project}: " + ", ".join(
+                        f"grant {n} {'for ' + policy.DURATIONS[h].lower() if h else 'permanently'}" for n, h in hours.items()) + "."
+                return f"Approved request #{r['id']} for {project}" + (f" for {policy.DURATIONS[hours[1]]}." if hours[1] else ".")
         if op == "revoke":
             project, sid = form["project"], form["sid"]
-            ids = []  # the event names the request only if it belongs to this project
+            ids, detail = [], ""  # the event names the request only if it belongs to this project
             with self.store.lease(project):
-                if sid.startswith("Req") and sid[3:].isdigit():
-                    r = self.store.get(int(sid[3:]), consistent=True)
-                    if r and r["project"] == project:
-                        ids = [r["id"]]
-                        if r["status"] == "approved":
-                            self.store.set_status(r["id"], "revoked", expect="approved")
+                ref = policy.parse_sid(sid)
+                r = self.store.get(ref[0], consistent=True) if ref else None
+                if r and r["project"] == project:
+                    ids = [r["id"]]
+                    # Req<id> on a request with several grants revokes all of them.
+                    n = ref[1] if r.get("grants") else None
+                    if r["status"] == "approved" and (n is None or any(g["n"] == n for g in policy.live_grants(r))):
+                        self._save(_ended(r, None if n is None else [n], "revoked"))
+                        detail = _grant_names(r, [n]) if n else ""
                 # Rewriting from the approved requests drops this grant (and anything else not approved).
                 try:
                     self.iam_change("revoke", project, actor,
-                                    lambda: self.broker.sync(project, self.store.approved(project)), ids)
+                                    lambda: self.broker.sync(project, self.store.approved(project)), ids, detail)
                 except Exception as e:
                     print(f"IAM sync for {project} failed while revoking {sid}: {e!r}")
                     return (f"Error: recorded the revoke of {sid}, but updating IAM failed ({type(e).__name__}). "
@@ -391,20 +403,29 @@ class App:
             project, sid = form["project"], form["sid"]
             hours = policy.duration(form.get("hours", ""))
             with self.store.lease(project):
-                r = self.store.get(int(sid[3:]), consistent=True) if sid.startswith("Req") and sid[3:].isdigit() else None
-                if not r or r["project"] != project or r["status"] != "approved":
+                ref = policy.parse_sid(sid)
+                r = self.store.get(ref[0], consistent=True) if ref else None
+                g = next((g for g in policy.live_grants(r) if g["sid"] == sid), None) if r and r["project"] == project and r["status"] == "approved" else None
+                if not g:
                     raise Conflict(f"{sid} is no longer granted to {project}")
-                problems = self.refusals(r["actions"], r["resources"])
+                problems = self.refusals(g["actions"], g["resources"])
                 if problems:
                     raise BrokerError("refused: " + "; ".join(problems))
-                before, expires_at = r.get("expires_at", 0), int(time.time()) + hours * 3600 if hours else 0
+                expires_at = int(time.time()) + hours * 3600 if hours else 0
                 until = f"until {policy.iso(expires_at)}" if hours else "permanently"
-                self.store.set_expiry(r["id"], expires_at)
+
+                def set_end(end):
+                    if r.get("grants"):
+                        self.store.set_grants(r["id"], [{**x, "expires_at": end} if x["n"] == g["n"] else x for x in r["grants"]])
+                    else:
+                        self.store.set_expiry(r["id"], end)
+                set_end(expires_at)
+                detail = f"{_grant_names(r, [g['n']])} {until}" if r.get("grants") else until
                 try:
                     self.iam_change("extend", project, actor, lambda: self.broker.sync(project, self.store.approved(project)),
-                                    [r["id"]], detail=until)
+                                    [r["id"]], detail=detail)
                 except BrokerError:
-                    self.store.set_expiry(r["id"], before)  # refused before writing: IAM still has the old end
+                    set_end(g["expires_at"])  # refused before writing: IAM still has the old end
                     raise
                 except Exception as e:
                     print(f"IAM sync for {project} failed while extending {sid}: {e!r}")
@@ -423,7 +444,7 @@ class App:
             with self.store.lease(project):
                 approved = self.store.approved(project)
                 for r in approved:
-                    self.store.set_status(r["id"], "revoked", "project removed", expect="approved")
+                    self._save(_ended(r, None, "revoked"), "project removed")
                 self.iam_change("remove_project", project, actor, lambda: self.broker.remove_project(project),
                                 [r["id"] for r in approved])
             return f"Removed project {project} and its role."
@@ -477,25 +498,38 @@ class App:
         without them first, then mark them expired. If IAM fails the table is left alone and the
         next sweep retries. Safe to repeat: a project with nothing expired isn't touched."""
         now = int(now or time.time())
-        due = sorted({r["project"] for r in self.store.list(status="approved") if 0 < r.get("expires_at", 0) <= now})
+        def due(r):
+            return [g["n"] for g in policy.live_grants(r) if 0 < g["expires_at"] <= now]
+        projects = sorted({r["project"] for r in self.store.list(status="approved") if due(r)})
         done = {}
-        for project in due:
+        for project in projects:
             try:
                 with self.store.lease(project):
                     approved = self.store.approved(project)
-                    ended = [r for r in approved if 0 < r.get("expires_at", 0) <= now]
-                    if not ended:
+                    ending = {r["id"]: due(r) for r in approved if due(r)}
+                    if not ending:
                         continue
-                    keep = [r for r in approved if r not in ended]
-                    self.iam_change("expire", project, EXPIRY_ACTOR, lambda: self.broker.sync(project, keep),
-                                    [r["id"] for r in ended])
-                    for r in ended:
-                        self.store.set_status(r["id"], "expired", expect="approved")
-                    done[project] = [r["id"] for r in ended]
+                    after = [_ended(r, ending[r["id"]], "expired") if r["id"] in ending else (None, r) for r in approved]
+                    detail = ", ".join(_grant_names(r, ending[r["id"]]) for r in approved
+                                       if r["id"] in ending and r.get("grants"))
+                    self.iam_change("expire", project, EXPIRY_ACTOR,
+                                    lambda: self.broker.sync(project, [new for _, new in after]), list(ending), detail)
+                    for change in after:
+                        if change[0] is not None:
+                            self._save(change)
+                    done[project] = sorted(ending)
             except Exception as e:
                 print(json.dumps({"event": "sweep_failed", "project": project, "error": f"{type(e).__name__}: {e}"[:300]}))
         print(json.dumps({"event": "sweep", "expired": done}))
         return {"expired": done}
+
+    def _save(self, change, note=""):
+        """Record what _ended worked out: the request's grants, and its status if its last one ended."""
+        (status, grants), r = change
+        if status == "approved":
+            self.store.set_grants(r["id"], grants)
+        else:
+            self.store.set_status(r["id"], status, note, expect="approved", grants=grants)
 
     def refusals(self, actions, resources, stacks=None):
         """Why IAM must not hold this grant (policy.refusals), with stacks listed now."""
@@ -521,7 +555,7 @@ class App:
         """{grant id: reasons} for every approved grant and every statement IAM actually holds (which
         catches a revoke whose IAM write failed) that would be refused now. live: the IAM document,
         if the caller already read it. A project with any flagged grant gets no credentials."""
-        grants = [(policy.sid(r["id"]), r["actions"], r["resources"]) for r in self.store.approved(project)]
+        grants = [(g["sid"], g["actions"], g["resources"]) for r in self.store.approved(project) for g in policy.live_grants(r)]
         doc = self.broker.grants(project) if live is None else live
         grants += [(s.get("Sid", ""), _list(s.get("Action", [])), _list(s.get("Resource", [])))
                    for s in (doc or policy.doc())["Statement"]]
@@ -689,30 +723,51 @@ class App:
         raise ApiError(404, "unknown endpoint")
 
     def create_request(self, body, key):
-        try:
-            project, actions, resources, reason = policy.validate_request(
-                str(body.get("project", "")), _strs(body.get("actions")), _strs(body.get("resources")),
-                str(body.get("reason", "")))
-        except ValueError as e:
-            raise ApiError(400, str(e))
+        """One request, one reason: either the flat actions/resources/suggested_hours, or grants: [{actions,
+        resources, suggested_hours}] with 1-9 entries, one per resource set. Not both."""
+        flat = [k for k in ("actions", "resources", "suggested_hours") if body.get(k) is not None]
+        if body.get("grants") is not None:
+            asked = body["grants"]
+            if flat:
+                raise ApiError(400, f"send either grants or {'/'.join(flat)}, not both")
+            if not isinstance(asked, list) or not 1 <= len(asked) <= policy.MAX_GRANTS or \
+                    not all(isinstance(g, dict) for g in asked):
+                raise ApiError(400, f"grants must be a list of 1-{policy.MAX_GRANTS} objects with actions and resources")
+        else:
+            asked = [body]
+        project, reason, grants = str(body.get("project", "")), str(body.get("reason", "")), []
+        for i, g in enumerate(asked, 1):
+            where = f"grant {i}: " if len(asked) > 1 else ""
+            try:
+                project, actions, resources, reason = policy.validate_request(
+                    project, _strs(g.get("actions")), _strs(g.get("resources")), reason)
+            except ValueError as e:
+                raise ApiError(400, where + str(e))
+            suggested = g.get("suggested_hours")
+            if suggested is not None:
+                try:
+                    suggested = policy.duration(suggested)
+                except ValueError as e:
+                    raise ApiError(400, f"{where}suggested_hours: {e}")
+            grants.append({"actions": actions, "resources": resources, "suggested_hours": suggested})
         if len(reason) > 1000:
             raise ApiError(400, "reason is too long (max 1000 characters)")
-        suggested = body.get("suggested_hours")
-        if suggested is not None:
-            try:
-                suggested = policy.duration(suggested)
-            except ValueError as e:
-                raise ApiError(400, f"suggested_hours: {e}")
         if self.store.pending_count(key["name"]) >= PENDING_LIMIT:
             raise ApiError(429, f"this API key already has {PENDING_LIMIT} pending requests; wait for the owner")
-        problems = self.refusals(actions, resources)
+        stacks = self._stack_lister()
+        problems = [(f"grant {i}: " if len(grants) > 1 else "") + p
+                    for i, g in enumerate(grants, 1) for p in self.refusals(g["actions"], g["resources"], stacks)]
         if problems:
             raise ApiError(400, "refused: " + "; ".join(problems))
-        rid = self.store.add(project, actions, resources, reason, key["name"], suggested)
-        n = len(actions)
-        self.notify_safely({"title": f"Permission request #{rid}",
-                     "body": f"{project}: {n} action{'s' if n != 1 else ''} to review",
-                     "url": f"/requests/{rid}", "tag": f"req-{rid}"})
+        if len(grants) > 1:
+            rid = self.store.add(project, [], [], reason, key["name"], grants=grants)
+            what = _plural(len(grants), "grant")
+        else:
+            g = grants[0]
+            rid = self.store.add(project, g["actions"], g["resources"], reason, key["name"], g["suggested_hours"])
+            what = _plural(len(g["actions"]), "action")
+        self.notify_safely({"title": f"Permission request #{rid}", "body": f"{project}: {what} to review",
+                            "url": f"/requests/{rid}", "tag": f"req-{rid}"})
         return _public(self.store.get(rid))
 
     def projects(self, search=""):
@@ -725,7 +780,8 @@ class App:
             statements = []
             for s in grants["Statement"]:
                 sid = s.get("Sid", "")
-                req = self.store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
+                ref = policy.parse_sid(sid)
+                req = self.store.get(ref[0]) if ref else None
                 statements.append({"grant": sid, "actions": _list(s.get("Action", [])),
                                    "resources": _list(s.get("Resource", [])),
                                    "reason": req["reason"] if req else "", "expires": policy.expiry(s)})
@@ -765,13 +821,44 @@ def state_version(store):
 
 
 def _request_ids(sids):
-    return {int(s[3:]) for s in sids if s.startswith("Req") and s[3:].isdigit()}
+    return {ref[0] for ref in map(policy.parse_sid, sids) if ref}
 
 
 def _public(r):
     keep = ("id", "project", "actions", "resources", "reason", "status", "note", "requester", "created_at", "decided_at",
             "suggested_hours", "expires_at")
-    return {k: r.get(k) for k in keep}
+    out = {k: r.get(k) for k in keep}
+    if r.get("grants"):  # several grants: actions and resources above are their union
+        out["grants"] = [{k: g[k] for k in ("n", "sid", "actions", "resources", "suggested_hours", "expires_at", "ended")}
+                         for g in policy.grants_of(r)]
+    return out
+
+
+def _ended(r, ns, how):
+    """((status, grants), r after it): request r with its grants numbered ns (None: all) ended `how`
+    (revoked or expired). A request ends with its last grant: expired if they all expired, else
+    revoked. grants is None for a request with one grant, whose status alone says it ended."""
+    if not r.get("grants"):
+        return (how, None), {**r, "status": how}
+    grants = [{**g, "ended": how} if not g.get("ended") and (ns is None or g["n"] in ns) else g for g in r["grants"]]
+    if any(not g.get("ended") for g in grants):
+        status = "approved"
+    else:
+        status = "expired" if all(g["ended"] == "expired" for g in grants) else "revoked"
+    return (status, grants), {**r, "status": status, "grants": grants}
+
+
+def _grant_names(r, ns):
+    """How an audit event names grants of a request with several: "grant 2 of #5"."""
+    return f"{'grant' if len(ns) == 1 else 'grants'} {', '.join(map(str, ns))} of #{r['id']}"
+
+
+def _named(r, g, problem):
+    return f"grant {g['n']}: {problem}" if r.get("grants") else problem
+
+
+def _plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
 
 def _strs(v):

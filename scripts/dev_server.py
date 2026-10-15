@@ -3,8 +3,9 @@
     .venv/bin/python scripts/dev_server.py [--port 8765] [--empty]
 
 Open http://localhost:8765/dev/login to sign in as the fake owner. Seeds pending requests of every
-risk, enough decided ones to page, a project, an API key and a connect request unless --empty. Push
-works for real if the browser supports it: the server generates throwaway VAPID keys at start-up.
+risk (some with several grants), enough decided ones to page, a project, an API key and a connect
+request unless --empty. Push works for real if the browser supports it: the server generates
+throwaway VAPID keys at start-up.
 """
 import argparse
 import json
@@ -56,6 +57,25 @@ def seed(app):
     # Time-limited: Projects shows its countdown, Extend and Revoke early.
     decide(s.add("website", ["logs:FilterLogEvents"], ["arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/site*"],
                  "Read the site function's logs while debugging a failed deploy.", "macbook"), hours=3)
+    # Several grants in one request: one pending, one approved with a grant revoked and one time-limited.
+    exports = [{"actions": ["s3:GetObject", "s3:ListBucket"],
+                "resources": ["arn:aws:s3:::order-exports", "arn:aws:s3:::order-exports/*"], "suggested_hours": 24},
+               {"actions": ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+                "resources": ["arn:aws:dynamodb:us-east-1:111122223333:table/orders"]},
+               {"actions": ["sqs:SendMessage"], "resources": ["arn:aws:sqs:us-east-1:111122223333:order-events"],
+                "suggested_hours": 3}]
+    rid = s.add("orders", [], [], "Backfill last month's orders from the export bucket and announce each one.",
+                "macbook", grants=exports)
+    app.decide({"op": "approve", "id": str(rid), "digest": s.get(rid)["digest"], "hours-1": "24", "hours-2": "0",
+                "hours-3": "3"})
+    app.decide({"op": "revoke", "project": "orders", "sid": f"Req{rid}g3"})
+    s.add("data-pipeline", [], [], "Load the nightly import into the warehouse table and archive the input files.",
+          "macbook", grants=[{"actions": ["dynamodb:BatchWriteItem", "dynamodb:DescribeTable"],
+                              "resources": ["arn:aws:dynamodb:us-east-1:111122223333:table/warehouse"],
+                              "suggested_hours": 3},
+                             {"actions": ["s3:GetObject", "s3:DeleteObject"],
+                              "resources": ["arn:aws:s3:::nightly-import/*"], "suggested_hours": 3},
+                             {"actions": ["logs:*"], "resources": ["*"]}])
     s.add("data-pipeline", ["dynamodb:*"], ["*"], "Create and manage tables for the nightly import job.", "macbook")
     s.add("orders", ["dynamodb:PutItem", "dynamodb:UpdateItem"], ["arn:aws:dynamodb:us-east-1:111122223333:table/orders"],
           "Write order status updates from the fulfilment worker.", "macbook")

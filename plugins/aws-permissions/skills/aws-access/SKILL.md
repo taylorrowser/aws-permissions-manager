@@ -17,6 +17,7 @@ You never get admin AWS credentials. AWS access is organised into **projects**, 
    - Ask for exactly the denied action(s) on the specific resource ARN(s) from the error message.
    - Give a one-sentence reason the owner will understand.
    - Prefer narrow requests. Wildcards like `s3:*` or `Resource: *` are harder for the owner to approve.
+   - Group what one task needs into **one request, with one grant per resource set** (`grants`, or `apm request --grant 's3:GetObject=arn:aws:s3:::my-bucket/*' --grant 'dynamodb:PutItem=arn:aws:dynamodb:...:table/orders'`). Don't send the union of all actions on the union of all resources, and don't send several requests for one task. The owner approves, times and revokes each grant on its own.
    - Suggest how long you need it (`duration`, or `--for 3h`): 1h, 3h, 1d, 1w or permanent. Pick the shortest that covers the task; the owner decides, and a time-limited grant ends by itself.
    - Then wait with `check_request` (`wait_seconds: 120`, repeat while pending), and retry once it is approved.
    - If it's rejected, read the note and stop or adjust. Don't re-request the same thing.
