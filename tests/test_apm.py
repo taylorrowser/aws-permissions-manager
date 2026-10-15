@@ -845,6 +845,7 @@ class RefusalTests(unittest.TestCase):
                 (["lambda:UpdateFunctionCode"], ["*"]), (["lambda:*"], ["*"]), (["ecs:RunTask"], ["*"]),
                 (["lambda:UpdateFunctionConfiguration"], [fn + "*"]), (["ssm:Send*"], ["*"]),
                 (["lambda:UpdateFunctionCode"], [f"arn:aws:lambda:us-east-1:{ACCOUNT}:function*"]),
+                (["lambda:UpdateFunctionCode"], [fn + "?*"]),
                 (["cloudformation:UpdateStack"], ["*"]), (["cloudformation:*"], ["*"]),
                 (["cloudformation:ExecuteStackRefactor"], ["*"]),
                 (["cloudformation:CreateChangeSet"], [f"arn:aws:cloudformation:*:{ACCOUNT}:stack/web/*"]),
