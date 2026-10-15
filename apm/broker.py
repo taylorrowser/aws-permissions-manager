@@ -30,7 +30,7 @@ class Broker:
         self._cfn, self._cfn_clients = cloudformation, {}
 
     def stacks(self, region):
-        """[(stack name, stored RoleARN or "")] of every live stack in a region, read now. Raises if
+        """[(stack name, stored RoleARN or "", stack id ARN)] of every live stack in a region, read now. Raises if
         the listing fails: callers treat that as a refusal, never as "no stacks"."""
         client = self._cfn_clients.get(region)
         if client is None:
@@ -43,7 +43,7 @@ class Broker:
         out, kw = [], {}
         while True:
             page = client.describe_stacks(**kw)
-            out += [(s["StackName"], s.get("RoleARN", "")) for s in page.get("Stacks", [])]
+            out += [(s["StackName"], s.get("RoleARN", ""), s["StackId"]) for s in page.get("Stacks", [])]
             if not page.get("NextToken"):
                 return out
             kw = {"NextToken": page["NextToken"]}

@@ -86,7 +86,9 @@ class FakeCloudFormation:
         self.stacks, self.failing, self.calls = {}, set(), []
 
     def add(self, region, name, role_arn=""):
-        self.stacks.setdefault(region, []).append({"StackName": name, **({"RoleARN": role_arn} if role_arn else {})})
+        stack_id = f"arn:aws:cloudformation:{region}:{ACCOUNT}:stack/{name}/{len(self.calls):08d}-0000-0000-0000-000000000000"
+        self.stacks.setdefault(region, []).append({"StackName": name, "StackId": stack_id,
+                                                   **({"RoleARN": role_arn} if role_arn else {})})
 
     def client(self, region):
         fake = self
@@ -872,6 +874,9 @@ class RefusalTests(unittest.TestCase):
         self.cfn.add("us-east-1", "web-prod", f"arn:aws:iam::{ACCOUNT}:role/cdk-exec")  # on the second page
         status, r = self.ask(["cloudformation:UpdateStack"], [self.STACK])
         self.assertEqual(status, 400)
+        self.assertIn("stored role of stack web-prod", r["error"])
+        status, r = self.ask(["cloudformation:UpdateStack"], [f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:*/web-prod/*"])
+        self.assertEqual(status, 400)  # a wildcard resource type still matches stack/web-prod/<id>
         self.assertIn("stored role of stack web-prod", r["error"])
         self.assertEqual(self.ask(["cloudformation:UpdateStack"],
                                   [f"arn:aws:cloudformation:us-east-1:{ACCOUNT}:stack/other-*/*"])[0], 201)

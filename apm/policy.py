@@ -304,20 +304,17 @@ def _every(resource, service):
 
 
 def _stacks(resource):
-    """(region, account, stack name) patterns of the stacks a resource can match, or None if none."""
+    """(region, account, resource part) patterns of a resource that can match a stack, or None.
+    Any wildcard resource part may match one ("*/web/*" does), so it's checked against the listing."""
     if resource == "*":
         return "*", "*", "*"
     arn = _arn(resource)
     if not arn or not fnmatch.fnmatchcase("cloudformation", arn[0]):
         return None
     region, account, rest = arn[1:]
-    if rest.startswith("stack/"):  # stack/<name>/<id>
-        name = rest.split("/")[1] or "*"
-    elif fnmatch.fnmatchcase("stack/name/id", rest):  # "*", "st*", ...
-        name = "*"
-    else:
+    if not rest.startswith("stack/") and "*" not in rest and "?" not in rest:
         return None
-    return region, account, name
+    return region, account, rest
 
 
 def refusals(actions, resources, account, list_stacks):
@@ -327,7 +324,8 @@ def refusals(actions, resources, account, list_stacks):
     - run-as actions on every resource (they run as some other role);
     - CloudFormation stack writes on every stack, in a wildcard region, or on any existing stack
       with a stored RoleARN (the write runs as that role). list_stacks(region) returns
-      [(stack name, role ARN or "")] for the account, read fresh; if it fails, the grant is refused;
+      [(stack name, role ARN or "", stack id ARN)] for the account, read fresh; if it fails, the
+      grant is refused;
     - policy variables and incomplete ARNs, which IAM expands, so they can't be checked as written.
     """
     out = []
@@ -348,7 +346,7 @@ def refusals(actions, resources, account, list_stacks):
         target = _stacks(r)
         if not target:
             continue
-        region, account_pattern, name = target
+        region, account_pattern, pattern = target
         if r == "*":
             out.append(f"{what} on every resource would run as any stack's stored role; name the stacks")
         elif not REGION_RE.match(region):
@@ -364,7 +362,9 @@ def refusals(actions, resources, account, list_stacks):
                     continue
             if listed[region] is None:
                 continue
-            held = sorted(s for s, role in listed[region] if role and fnmatch.fnmatchcase(s, name))
+            # Matched like IAM would: the pattern against the stack's own resource part, stack/<name>/<id>.
+            held = sorted(s for s, role, stack_id in listed[region]
+                          if role and fnmatch.fnmatchcase(stack_id.split(":", 5)[-1], pattern))
             if held:
                 out.append(f"{what} on {r} would run as the stored role of stack {', '.join(held)}")
     return out
