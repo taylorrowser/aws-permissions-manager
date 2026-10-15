@@ -4,6 +4,8 @@ confirm dialogs, local times, offline handling, install help and push notificati
 Screens: Requests (/, /requests/<id>, /connect/<code>: a list and a reading pane), Projects
 (/projects) and Settings (/settings: notifications, agent keys, account). Every list leads with
 what matters on a phone: project, reason and how risky the request is."""
+import calendar
+import hashlib
 import html
 import json
 import re
@@ -640,46 +642,148 @@ def history(rid, events):
 
 
 # ---------- projects ----------
+# Each project leads with one line on what it can change and read, then its grants by service.
+# Within a service, grants on the same resources with the same time limit share a row. A row's id
+# comes from what it covers, not from grant ids, so it stays open (see app.js) across a removal.
 
-def _grant(project, s, store, reasons=()):
-    sid = s.get("Sid", "")
-    ref = policy.parse_sid(sid)
+def _svc(action):
+    return "*" if action == "*" else action.split(":", 1)[0]
+
+
+def _svc_name(service):
+    return "everything" if service == "*" else SERVICES.get(service, service)
+
+
+def _names(services):
+    names = sorted(_svc_name(x) for x in services)
+    return _and(names) if len(names) <= 4 else ", ".join(names[:3]) + f" and {len(names) - 3} more"
+
+
+def project_summary(statements):
+    """One line: what a project can change and what it can only read, by service."""
+    changes, reads = set(), set()
+    for s in statements:
+        for a in _list(s.get("Action", [])):
+            (reads if a != "*" and _reads(_verb(a)) else changes).add(_svc(a))
+    if "*" in changes:
+        return "Changes everything."
+    reads -= changes
+    out = ([f"Changes {_names(changes)}."] if changes else []) + ([f"Reads {_names(reads)}."] if reads else [])
+    return " ".join(out) or "No access."
+
+
+def row_id(project, service, resources, ends):
+    """A row's id, from what it covers: service, resources (as a set) and time limit."""
+    key = json.dumps([service, sorted(set(resources)), ends])
+    return f"row-{project}-{hashlib.sha256(key.encode()).hexdigest()[:12]}"
+
+
+def service_rows(project, statements):
+    """[(service, [row])]: each statement's actions split by service, then merged into rows of the same
+    resources and time limit. A row is {"id", "actions", "resources", "ends", "parts": [(statement,
+    its actions in this service)]}. Services sort by name, everything ("*") first."""
+    services = {}
+    for s in statements:
+        resources, ends = _list(s.get("Resource", [])), policy.expiry(s)
+        by_service = {}
+        for a in _list(s.get("Action", [])):
+            by_service.setdefault(_svc(a), []).append(a)
+        for service, actions in by_service.items():
+            rid = row_id(project, service, resources, ends)
+            row = services.setdefault(service, {}).setdefault(
+                rid, {"id": rid, "actions": [], "resources": list(dict.fromkeys(resources)), "ends": ends, "parts": []})
+            row["actions"] += [a for a in actions if a not in row["actions"]]
+            row["parts"].append((s, actions))
+    order = sorted(services, key=lambda x: (x != "*", _svc_name(x).lower()))
+    return [(x, list(services[x].values())) for x in order]
+
+
+def _backing(store, s):
+    """(request, live grant) behind an IAM statement: (None, None) for one APM didn't write (built
+    in), (request, None) for a grant that ended but IAM still holds."""
+    ref = policy.parse_sid(s.get("Sid", ""))
     req = store.get(ref[0]) if ref else None
-    g = next((g for g in policy.live_grants(req) if g["sid"] == sid), None) if req and req["status"] == "approved" else None
-    actions, resources = _list(s.get("Action", [])), _list(s.get("Resource", []))
-    if g:  # each action and ARN of a grant the store backs can be removed on its own
-        on = _removable(project, sid, "resource", resources)
-        listed = _removable(project, sid, "action", actions)
-    else:
-        on = ("<span>all resources</span>" if _everything(resources) else f'<ul class=codes>{_codes(resources)}</ul>')
-        listed = f'<ul class=codes>{_codes(actions)}</ul>'
-    which = f" grant {g['n']}" if g and req.get("grants") else ""
-    why = (f'<p class=muted>{e(req["reason"])} <a href="/requests/{req["id"]}">#{req["id"]}{which}</a></p>' if req
-           else f'<p class=muted>Grant <code>{e(sid)}</code></p>')
-    blocked = ('<span class=badge>Blocked</span>' if reasons else "")
-    notes = ('<ul class=notes>' + "".join(f"<li>{e(x)}</li>" for x in reasons) + "</ul>" if reasons else "")
-    ends = g["expires_at"] if g else 0
-    extend = ""
-    if ends:  # a countdown, and Extend: a new duration from now, or permanent
-        why += f'<p class=muted>{_ends(ends)}</p>'
-        extend = _extend(project, sid, "/projects")
-    return (f'<li><div><p class=line>{blocked}{_risk_chip(actions, resources)}</p>{listed}'
-            f'<p class=on>on {on}</p>{why}{notes}{extend}</div>'
-            + _form({"op": "revoke", "project": project, "sid": sid}, "Revoke early" if ends else "Revoke", "danger small",
-                    f"Revoke this grant from {project}? Agents lose it within minutes.", "/projects") + "</li>")
+    if not req:
+        return None, None
+    g = next((g for g in policy.live_grants(req) if g["sid"] == s.get("Sid")), None) if req["status"] == "approved" else None
+    return req, g
 
 
-def _removable(project, sid, field, items):
-    """A grant's actions (or ARNs), each with Remove: the owner narrows the grant. Removing the last
-    one ends the grant, so the confirm says so."""
+def _ts(iso):
+    return calendar.timegm(time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")) if iso else 0
+
+
+def _row(project, row, backing, flagged):
+    """One row, closed: the plain line, its risk and time limit. Open: the exact actions and ARNs,
+    each with Remove; each grant's why, who and when, with Extend and Revoke; the IAM statement."""
+    actions, resources = row["actions"], row["resources"]
+    sids = [s.get("Sid", "") for s, _ in row["parts"]]
+    live = {sid: backing[sid][1] for sid in sids if backing[sid][1]}
+    blocked = '<span class=badge>Blocked</span>' if any(sid in flagged for sid in sids) else ""
+    ends = _ends(_ts(row["ends"])) if row["ends"] else ""
+    out = [f'<li><details class=grant-row id="{row["id"]}"><summary><span class=plain>{e(plain(actions, resources))}</span>'
+           f'<span class=line>{blocked}{_risk_chip(actions, resources)}{f"<span class=muted>{ends}</span>" if ends else ""}'
+           '</span></summary><div class=grant-body>'
+           + _removable(project, "action", actions, live) + _removable(project, "resource", resources, live)]
+    for s, _ in row["parts"]:
+        sid = s.get("Sid", "")
+        req, g = backing[sid]
+        if not req:
+            out.append(f'<div class=why><p><span class=badge>built in</span> <code>{e(sid)}</code></p></div>')
+            continue
+        which = f" grant {g['n']}" if g and req.get("grants") else ""
+        notes = "".join(f"<li>{e(x)}</li>" for x in flagged.get(sid, ()))
+        controls = (_extend(project, sid, "/projects") if g else "") + _form(
+            {"op": "revoke", "project": project, "sid": sid}, "Revoke early" if g and g["expires_at"] else "Revoke",
+            "danger small", f"Revoke {sid} from {project}? Agents lose it within minutes.", "/projects")
+        out.append(f'<div class=why><p>{e(req["reason"])} <a href="/requests/{req["id"]}">#{req["id"]}{which}</a></p>'
+                   f'<p class=muted>{e(req.get("requester") or "unknown")}, {_time(req["created_at"])}</p>'
+                   + (f"<ul class=notes>{notes}</ul>" if notes else "") + f'<div class=controls>{controls}</div></div>')
+    stmts = [s for s, _ in row["parts"]]
+    out.append(f'<details class=iam id="{row["id"]}-iam"><summary>IAM statement</summary>'
+               f'<pre>{e(json.dumps(stmts[0] if len(stmts) == 1 else stmts, indent=2))}</pre></details></div></details></li>')
+    return "".join(out)
+
+
+def _removable(project, field, items, live):
+    """A row's actions (or ARNs), each with Remove, which narrows every live grant on the row that
+    holds it. A grant left with none ends, so the confirm says so."""
     out = []
     for x in items:
-        last = len(items) == 1
-        confirm = (f"Remove {x}? It's the only {field} left, so this revokes {sid}." if last
-                   else f"Remove {x} from {sid}? Agents lose it within minutes.")
-        out.append(f'<li><code>{e(x)}</code>' + _form({"op": "narrow", "project": project, "sid": sid, field: x},
+        holders = [g for g in live.values() if x in g[field + "s"]]
+        if not holders:
+            out.append(f"<li><code>{e(x)}</code></li>")
+            continue
+        sids = " ".join(g["sid"] for g in holders)
+        ending = [g["sid"] for g in holders if len(g[field + "s"]) == 1]
+        confirm = (f"Remove {x}? It's the last {field} of {_and(ending)}, so this revokes it." if ending
+                   else f"Remove {x}? Agents lose it within minutes.")
+        out.append(f'<li><code>{e(x)}</code>' + _form({"op": "narrow", "project": project, "sid": sids, field: x},
                                                        "Remove", "quiet small", confirm, "/projects") + "</li>")
     return f'<ul class="codes removable" aria-label="{field.capitalize()}s">{"".join(out)}</ul>'
+
+
+def _details(app, project, synced, flagged):
+    """Project details: warnings first, then the role and how to use it, Re-apply and Delete."""
+    out = []
+    if not synced:
+        out.append("<p class=warn role=alert><b>IAM doesn't match your decisions.</b> An update failed; the grants "
+                   "above may be wrong until you re-apply.</p>")
+    if flagged:
+        out.append('<p class=warn role=alert><b>Agents get no credentials for this project</b> until you '
+                   f'revoke {_and(sorted(flagged))}: they would be refused if requested now.</p>')
+    out.append(f'<dl class=meta><dt>Role</dt><dd><code>{e(policy.role_name(project))}</code></dd>'
+               f'<dt>Account</dt><dd>{e(app.broker.account)}</dd><dt>Profile</dt><dd><code>apm-{e(project)}</code></dd></dl>')
+    if callable(getattr(app, "usage", None)):  # the usage audit, where this deployment has it
+        out.append(f'<p><a href="/usage?project={e(project)}">When was each grant last used?</a></p>')
+    out.append('<div class=controls>'
+               + _form({"op": "sync_project", "project": project}, "Re-apply decisions", "primary" if not synced else "small",
+                       "", "/projects")
+               + _form({"op": "remove_project", "project": project}, "Delete project", "danger small",
+                       f"Delete project {project} and all its grants? Agents lose access within an hour.", "/projects")
+               + "</div>")
+    return (f'<details class=project-details id="project-{e(project)}-details"{" open" if not synced or flagged else ""}>'
+            f'<summary>Project details</summary>{"".join(out)}</details>')
 
 
 def projects_page(app, owner, msg=""):
@@ -696,36 +800,22 @@ def projects_page(app, owner, msg=""):
         statements = grants["Statement"] if grants else []
         synced = broker.in_sync(project, store.approved(project))
         flagged = app.flagged(project, grants or policy.doc())
-        worst = _worst_chip(statements) if statements else ""
-        warn = ('<span class=badge>IAM mismatch</span>' if not synced else "") + \
-            ('<span class=badge>Credentials blocked</span>' if flagged else "")
-        out.append(f'<details class="row project" id="project-{e(project)}"><summary>'
-                   f'<span class=head><b>{e(project)}</b><span class=right>{_plural(len(statements), "grant")}</span></span>'
-                   f'<span class=line>{warn}{worst}<span class=muted>profile <code>apm-{e(project)}</code></span></span></summary>')
-        if not synced:
-            out.append('<div class=warn role=alert><p><b>IAM doesn\'t match your decisions.</b> An update failed; '
-                       'the grants below may be wrong until you re-apply.</p>'
-                       + _form({"op": "sync_project", "project": project}, "Re-apply decisions", "primary", "", "/projects")
-                       + "</div>")
-        if flagged:
-            out.append('<div class=warn role=alert><p><b>Agents get no credentials for this project</b> until you '
-                       f'revoke {_and(sorted(flagged))}: they would be refused if requested now.</p></div>')
         # A flagged approval IAM never received (its write failed) still blocks credentials: list it
         # too, so it can be revoked.
         held = {s.get("Sid", "") for s in statements}
-        shown = statements + [policy.statement(g["sid"], g["actions"], g["resources"]) for r in store.approved(project)
+        shown = statements + [policy.statement(g["sid"], g["actions"], g["resources"], g["expires_at"])
+                              for r in store.approved(project)
                               for g in policy.live_grants(r) if g["sid"] in flagged and g["sid"] not in held]
-        if not shown:
-            out.append("<p class=muted>No grants yet.</p>")
-        else:
-            out.append("<ul class=grants>" + "".join(_grant(project, s, store, flagged.get(s.get("Sid", ""), ()))
-                                                    for s in shown) + "</ul>")
-        out.append(f'<p class=muted>Role <code>{e(policy.role_name(project))}</code></p>'
-                   '<details class=danger-zone><summary>Delete project…</summary>'
-                   '<p class=muted>Removes the role and every grant. Agents lose access within an hour.</p>'
-                   + _form({"op": "remove_project", "project": project}, f"Delete {project}", "danger",
-                           f"Delete project {project} and all its grants?", "/projects")
-                   + "</details></details>")
+        backing = {s.get("Sid", ""): _backing(store, s) for s in shown}
+        warn = ('<span class=badge>IAM mismatch</span>' if not synced else "") + \
+            ('<span class=badge>Credentials blocked</span>' if flagged else "")
+        out.append(f'<details class="row project" id="project-{e(project)}"><summary>'
+                   f'<span class=head><b>{e(project)}</b>{warn}{_worst_chip(statements) if statements else ""}</span>'
+                   f'<span class=line>{e(project_summary(statements))}</span></summary>')
+        for service, rows in service_rows(project, shown):
+            out.append(f'<section class=service><h3>{e("All services" if service == "*" else _svc_name(service))}</h3>'
+                       f'<ul class=grant-rows>{"".join(_row(project, r, backing, flagged) for r in rows)}</ul></section>')
+        out.append(_details(app, project, synced, flagged) + "</details>")
     if projects:
         out.append("</div>")
     return layout(app, owner, "projects", "Projects", "".join(out), st, msg)

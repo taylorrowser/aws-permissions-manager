@@ -102,7 +102,7 @@ a.item[aria-current=true]{background:var(--selected);box-shadow:inset 2px 0 0 va
 .state{font-size:.8rem;color:var(--muted)}
 .item .reason{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:.9rem;color:var(--muted)}
 details.decided{margin-top:16px}
-details.decided>summary,details.more>summary,details.policy>summary,details.danger-zone>summary{cursor:pointer;min-height:40px;display:flex;align-items:center;
+details.decided>summary,details.more>summary,details.iam>summary,details.project-details>summary{cursor:pointer;min-height:40px;display:flex;align-items:center;
 color:var(--muted);font-weight:500;font-size:.9rem}
 .items .more{display:flex;justify-content:center;padding:4px 0}
 
@@ -144,20 +144,25 @@ transform:rotate(45deg);transition:transform .15s}
 .head .right{margin-left:auto;color:var(--muted);font-size:.82rem;white-space:nowrap;display:flex;gap:8px;font-variant-numeric:tabular-nums}
 .line{display:flex;align-items:center;gap:8px;font-size:.85rem;flex-wrap:wrap;margin:0}
 .row>*:not(summary){padding:0 16px}
-.row>p,.row>.danger-zone{margin:8px 0}
-.row>.warn{margin:12px 16px;padding:8px 12px}
-.row>.grants{margin:0;padding:0}
 .card{border:1px solid var(--line);border-radius:8px;padding:16px;margin:0 0 16px;overflow-wrap:anywhere}
 .card p{margin:0 0 8px}
 .warn{padding:8px 12px;border:1px solid var(--border);border-radius:8px;margin:8px 0;font-size:.9rem}
 .warn-text{font-weight:500}
-details.policy,details.danger-zone{margin:4px 0}
-.grants{list-style:none;padding:0;margin:0}
-.grants>li{border-top:1px solid var(--line);padding:12px 16px;display:flex;gap:12px;align-items:flex-start;justify-content:space-between}
-.grants>li>div{flex:1;min-width:0}
-.grants p{margin:4px 0 0;font-size:.9rem}
-.grants .line{margin:0 0 4px}
-.on{display:flex;gap:6px;flex-wrap:wrap;align-items:baseline}
+/* a project's grants by service: rows that open in place */
+.service{margin:12px 0}
+.grant-rows{list-style:none;padding:0;margin:0;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.grant-rows>li{border-top:1px solid var(--line)}
+.grant-rows>li:first-child{border-top:0}
+.grant-row>summary{list-style:none;cursor:pointer;padding:8px 12px;display:flex;flex-direction:column;gap:4px;font-size:.9rem}
+.grant-row>summary::-webkit-details-marker{display:none}
+.grant-row>summary .plain{font-weight:500;overflow-wrap:anywhere}
+.grant-row[open]>summary{background:var(--sub)}
+.grant-body{padding:4px 12px 8px;font-size:.9rem}
+.why{border-top:1px solid var(--line);margin-top:8px;padding-top:8px}
+.why p{margin:0 0 4px}
+.why .controls{margin-top:4px}
+details.iam{margin-top:4px}
+details.project-details{margin:4px 0 12px}
 
 /* flat lists (devices, keys) */
 .list{list-style:none;padding:0;margin:0 0 12px;border:1px solid var(--line);border-radius:8px;overflow:hidden}

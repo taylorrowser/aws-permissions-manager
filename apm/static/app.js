@@ -530,7 +530,8 @@ if (typeof document !== "undefined") {
 
   document.addEventListener("submit", async (event) => {
     const form = event.target;
-    if (form.method.toLowerCase() !== "post" || form.hasAttribute("data-native") || form.closest("dialog")) return;
+    // Read attributes, not the method and action properties: a field named "action" (Remove on Projects) shadows them.
+    if ((form.getAttribute("method") || "").toLowerCase() !== "post" || form.hasAttribute("data-native") || form.closest("dialog")) return;
     event.preventDefault();
     if (pager.busy) return; // one submit at a time, or a later response could replace an earlier one (a new key)
     if (!navigator.onLine) {
@@ -548,7 +549,7 @@ if (typeof document !== "undefined") {
     await pager.submit(async () => { // false if something else was submitted while the dialog was open
       if (button) { button.disabled = true; button.textContent += "…"; }
       try {
-        const resp = await fetch(form.action, { method: "POST", credentials: "same-origin",
+        const resp = await fetch(form.getAttribute("action"), { method: "POST", credentials: "same-origin",
           headers: { Accept: "text/html" }, body: new URLSearchParams(new FormData(form)) });
         const html = await resp.text();
         const next = afterSubmit(resp, location.pathname);
