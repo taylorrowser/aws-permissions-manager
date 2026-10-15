@@ -753,7 +753,7 @@ class UsageTests(WebCase):
         self.assertNotIn("matched", acts["s3:GetObject"])
         wild = acts["s3:Get*"]
         self.assertFalse(wild["per_action"])
-        self.assertEqual(wild["matched"], ["s3:getobject"])  # GetBucketPolicy is tracked but never used
+        self.assertEqual(wild["matched"], ["s3:getbucketpolicy", "s3:getobject"])  # tracked, used or not
         self.assertEqual(wild["last_used"], int(self.iam.services[0]["LastAuthenticated"].timestamp()))
         self.assertFalse(acts["s3:ListBucket"]["per_action"])  # untracked: the service's last use
         self.assertTrue(acts["s3:ListBucket"]["used"])

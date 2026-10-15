@@ -32,7 +32,7 @@ def action_usage(action, index):
         last, per_action, matched = tracked[name], True, None
     else:
         last, per_action = service_last, False
-        matched = sorted(f"{service}:{t}" for t, at in tracked.items() if at and fnmatch.fnmatchcase(t, name)) \
+        matched = sorted(f"{service}:{t}" for t in tracked if fnmatch.fnmatchcase(t, name)) \
             if "*" in name or "?" in name else None
     out = {"action": action, "last_used": last, "per_action": per_action, "used": last is not None}
     if matched is not None:

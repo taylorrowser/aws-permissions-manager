@@ -435,6 +435,8 @@ def cmd_usage(a):
         for x in g["actions"]:
             scope = "" if x["per_action"] else " (service-level)"
             print(f"  {x['action']}: {_when(x['last_used'])}{scope}")
+            if x.get("matched"):
+                print(f"    matches tracked actions: {', '.join(x['matched'])}")
     print(report["note"])
 
 
