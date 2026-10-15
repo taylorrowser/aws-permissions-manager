@@ -344,7 +344,7 @@ def _where(arn):
     parts = arn.split(":", 5)
     if len(parts) < 6 or not parts[5]:
         return "", f"resource {arn}"
-    service, region, rest = parts[2], parts[3], parts[5]
+    service, region, account, rest = parts[2], parts[3], parts[4], parts[5]
     if service == "s3":
         bucket, _, path = rest.partition("/")
         kind, name, extra = "bucket", bucket, f" ({path})" if path and path != "*" else ""
@@ -357,7 +357,8 @@ def _where(arn):
         phrase = f"every {kind} matching {name}"
     else:
         phrase = f"{kind} {name}"
-    return kind.lower(), phrase + extra + (" in every region" if region == "*" else "")
+    spread = [w for w, v in (("region", region), ("account", account)) if _wild(v)]
+    return kind.lower(), phrase + extra + (f" in every {' and '.join(spread)}" if spread else "")
 
 
 def _and(items):

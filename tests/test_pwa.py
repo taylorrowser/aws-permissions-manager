@@ -176,6 +176,8 @@ class ScreenTests(Base):
             (["s3:PutObject"], ["arn:aws:s3:::logs-*"], "Write S3 on every bucket matching logs-*"),
             (["s3:GetObject"], ["arn:aws:s3:::*"], "Read S3 on every bucket"),
             (["dynamodb:GetItem"], ["arn:aws:dynamodb:*:1:table/t"], "Read DynamoDB table t in every region"),
+            (["lambda:InvokeFunction"], ["arn:aws:lambda:us-east-1:*:function:api"], "Invoke Lambda function api in every account"),
+            (["dynamodb:GetItem"], ["arn:aws:dynamodb:*:*:table/t"], "Read DynamoDB table t in every region and account"),
             (["ec2:*Instances"], ["*"], "Write EC2 (any *Instances action), on every resource"),
             (["s3:GetObject", "dynamodb:PutItem"], ["arn:aws:s3:::b/*", "arn:aws:dynamodb:us-east-1:1:table/t"],
              "Read S3 and write DynamoDB on bucket b and table t"),

@@ -90,22 +90,27 @@ function canRefresh(s) {
 // Orders everything that replaces the screen, so a slow, older response never lands on top of a
 // newer one. Opening a row and submitting a form each claim the screen: a row load that another
 // open or a submit overtook is dropped. A background refresh applies only if nothing claimed the
-// screen while it loaded and the owner is idle. One submit at a time, and no row opens during one.
+// screen while it loaded and the owner is idle, and none starts while a row is loading. One submit
+// at a time, and no row opens during one. claim() drops whatever is loading (before a confirm).
 // load(url) resolves to a page (or null); apply(page, {url, background}) puts it on screen.
 function createPager({ load, apply, idle }) {
-  let latest = 0, busy = false;
+  let latest = 0, busy = false, opening = 0;
   return {
     get busy() { return busy; },
+    claim() { latest++; },
     async open(url) {
       if (busy) return false;
       const mine = ++latest;
-      const page = await load(url);
-      if (mine !== latest || !page) return false;
-      apply(page, { url, background: false });
-      return true;
+      opening = mine;
+      try {
+        const page = await load(url);
+        if (mine !== latest || !page) return false;
+        apply(page, { url, background: false });
+        return true;
+      } finally { if (opening === mine) opening = 0; }
     },
     async refresh(url) {
-      if (busy || !idle()) return false;
+      if (busy || opening || !idle()) return false;
       const at = latest;
       const page = await load(url);
       if (at !== latest || busy || !page || !idle()) return false;
@@ -358,7 +363,7 @@ if (typeof document !== "undefined") {
   // On wide screens a row opens in the pane without a page load; the URL still follows it. On
   // phones a request is its own page, so links work as links.
   async function openPane(path) {
-    if (path === location.pathname || pager.busy) return;
+    if (path === location.pathname || pager.busy || $("confirm")?.open) return;
     history.pushState(null, "", path);
     try { await pager.open(path); } catch (_) { flash("Couldn't reach the server. Check your connection and try again."); }
   }
@@ -459,7 +464,10 @@ if (typeof document !== "undefined") {
       $("offline").focus?.();
       return;
     }
-    if (form.dataset.confirm && !(await askConfirm(form))) return;
+    if (form.dataset.confirm) {
+      pager.claim(); // a row still loading must not replace the pane behind the dialog
+      if (!(await askConfirm(form))) return;
+    }
     const button = form.querySelector("button");
     const label = button?.textContent;
     const removingHere = form.closest("[data-device]")?.dataset.device === thisDevice;

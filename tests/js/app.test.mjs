@@ -198,3 +198,24 @@ test("keyboard: arrows move between rows, a approves, r rejects, never while typ
   assert.equal(app.step(ids, "connect-AB2C-DE3F", "prev"), "connect-AB2C-DE3F");
   assert.equal(app.step([], null, "next"), null);
 });
+
+test("a refresh doesn't start while a row is loading, so an older row can't land over it", async () => {
+  const { pager, loads, applied } = harness();
+  const open = pager.open("/requests/2");
+  assert.equal(await pager.refresh("/requests/2"), false);
+  loads[0].resolve();
+  assert.equal(await open, true);
+  const later = pager.refresh("/requests/2"); // once it has landed, refreshes run again
+  loads[1].resolve("fresher");
+  assert.equal(await later, true);
+  assert.deepEqual(applied.map(([page]) => page), ["page /requests/2", "fresher"]);
+});
+
+test("a confirm drops a row still loading, so it can't replace the pane behind the dialog", async () => {
+  const { pager, loads, applied } = harness();
+  const open = pager.open("/requests/2");
+  pager.claim(); // the owner pressed Approve on the request on screen
+  loads[0].resolve();
+  assert.equal(await open, false);
+  assert.deepEqual(applied, []);
+});
