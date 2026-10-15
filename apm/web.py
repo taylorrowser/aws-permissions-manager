@@ -308,7 +308,7 @@ class App:
                 name = re.sub(r"[^A-Za-z0-9 ._@-]", "", form.get("name", "")).strip()[:40] or "agent"
                 secret = self.store.create_key(name)
                 return Response(200, pages.settings_page(self, owner, f"Created API key {name!r}.", new_key=secret))
-            msg = self.decide(form)
+            msg = self.decide(form, owner)
             # A decided request has nothing left to do on its own page; go back to the list.
             if op in ("approve", "reject") and back.startswith("/requests/"):
                 back = "/"
@@ -316,7 +316,7 @@ class App:
         except (BrokerError, Conflict, ValueError) as e:
             return redirect(back + "?msg=" + _q(f"Error: {e}"))
 
-    def decide(self, form):
+    def decide(self, form, actor="owner"):
         """Grant changes run entirely under the project's lease. The decision is recorded in
         DynamoDB first (conditional, strongly consistent), then the role's policy is rewritten
         from the project's approved requests, so IAM never holds a grant for a request that
@@ -338,7 +338,8 @@ class App:
                     return f"Rejected request #{r['id']}."
                 self.store.set_status(r["id"], "approved", expect="pending")
                 try:
-                    self.broker.sync(project, self.store.approved(project))
+                    self.iam_change("approve", project, actor,
+                                    lambda: self.broker.sync(project, self.store.approved(project)), [r["id"]])
                 except BrokerError:
                     # Refused before writing anything (e.g. the size limit): safe to undo.
                     self.store.set_status(r["id"], "pending", expect="approved")
@@ -352,14 +353,18 @@ class App:
                 return f"Approved request #{r['id']} for {project}."
         if op == "revoke":
             project, sid = form["project"], form["sid"]
+            ids = []  # the event names the request only if it belongs to this project
             with self.store.lease(project):
                 if sid.startswith("Req") and sid[3:].isdigit():
                     r = self.store.get(int(sid[3:]), consistent=True)
-                    if r and r["project"] == project and r["status"] == "approved":
-                        self.store.set_status(r["id"], "revoked", expect="approved")
+                    if r and r["project"] == project:
+                        ids = [r["id"]]
+                        if r["status"] == "approved":
+                            self.store.set_status(r["id"], "revoked", expect="approved")
                 # Rewriting from the approved requests drops this grant (and anything else not approved).
                 try:
-                    self.broker.sync(project, self.store.approved(project))
+                    self.iam_change("revoke", project, actor,
+                                    lambda: self.broker.sync(project, self.store.approved(project)), ids)
                 except Exception as e:
                     print(f"IAM sync for {project} failed while revoking {sid}: {e!r}")
                     return (f"Error: recorded the revoke of {sid}, but updating IAM failed ({type(e).__name__}). "
@@ -368,14 +373,18 @@ class App:
         if op == "sync_project":
             project = form["project"]
             with self.store.lease(project):
-                self.broker.sync(project, self.store.approved(project))
+                approved = self.store.approved(project)
+                self.iam_change("sync_project", project, actor, lambda: self.broker.sync(project, approved),
+                                [r["id"] for r in approved])
             return f"Re-applied your decisions to {project}."
         if op == "remove_project":
             project = form["project"]
             with self.store.lease(project):
-                for r in self.store.approved(project):
+                approved = self.store.approved(project)
+                for r in approved:
                     self.store.set_status(r["id"], "revoked", "project removed", expect="approved")
-                self.broker.remove_project(project)
+                self.iam_change("remove_project", project, actor, lambda: self.broker.remove_project(project),
+                                [r["id"] for r in approved])
             return f"Removed project {project} and its role."
         if op == "delete_key":
             self.store.delete_key(form.get("pk", ""))
@@ -384,6 +393,56 @@ class App:
             self.store.remove_device(form.get("pk", ""))
             return "Removed the device from notifications."
         return "Unknown action."
+
+    def iam_change(self, op, project, actor, write, targets=(), detail=""):
+        """Run `write`, one IAM rewrite of the project's role that returns the policy document it
+        wrote (None if it wrote none), and record exactly one audit event for it, whatever happens:
+        outcome `applied`, `refused` (refused before writing) or `failed` (the write errored, so its
+        effect is unknown). `targets` are the requests the change is for. Re-raises the error. Call
+        it under the project's lease."""
+        targets = sorted({int(i) for i in targets})
+        event = {"op": op, "outcome": "applied", "error": "", "project": project, "account": self.broker.account,
+                 "role_arn": policy.role_arn(self.broker.account, project), "targets": targets,
+                 "request_ids": targets, "agent_keys": [], "actor": actor, "at": int(time.time()),
+                 "previous_grants": [], "grants": [], "policy_sha256": ""}
+        if detail:
+            event["detail"] = detail
+        try:
+            # What IAM grants right now, so a grant this write clears traces back to its request.
+            # Without it the event couldn't say what was removed, so nothing is written.
+            try:
+                live = (self.broker.grants(project) or policy.doc())["Statement"]
+            except Exception as e:
+                raise BrokerError(f"couldn't read {project}'s current grants ({type(e).__name__}); "
+                                  "nothing was changed, try again") from e
+            event["previous_grants"] = [s.get("Sid", "") for s in live]
+            event["request_ids"] = sorted(set(targets) | _request_ids(event["previous_grants"]))
+            doc = write()
+            if doc:
+                event["grants"] = [s.get("Sid", "") for s in doc["Statement"]]
+                event["policy_sha256"] = hashlib.sha256(policy.dumps(doc).encode()).hexdigest()
+                event["request_ids"] = sorted(set(event["request_ids"]) | _request_ids(event["grants"]))
+        except Exception as e:
+            event["outcome"] = "refused" if isinstance(e, BrokerError) else "failed"
+            event["error"] = f"{type(e).__name__}: {e}"[:300]
+            raise
+        finally:
+            self._record(event)
+        return doc
+
+    def _record(self, event):
+        """CloudWatch first, so the event survives a table outage; the table copy feeds History."""
+        try:
+            keys = {r.get("requester") for r in map(self.store.get, event["request_ids"]) if r}
+            event["agent_keys"] = sorted(k for k in keys if k)
+        except Exception as e:
+            print(json.dumps({"event": "audit_keys_failed", "error": str(e)[:300]}))
+        print(json.dumps({"event": "iam_change", **event}))
+        try:
+            self.store.add_event(event)
+        except Exception as e:
+            print(json.dumps({"event": "audit_store_failed", "op": event["op"], "project": event["project"],
+                              "error": str(e)[:300]}))
 
     # ----- notifications -----
 
@@ -582,6 +641,10 @@ def state_version(store):
              [(s["pk"], s.get("last_ok_at"), s.get("last_error_at"), s.get("failures")) for s in store.subscriptions()]]
     pending = sum(1 for r in requests if r["status"] == "pending") + len(connects)
     return hashlib.sha256(json.dumps(state, default=str).encode()).hexdigest()[:16], pending
+
+
+def _request_ids(sids):
+    return {int(s[3:]) for s in sids if s.startswith("Req") and s[3:].isdigit()}
 
 
 def _public(r):

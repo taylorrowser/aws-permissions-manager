@@ -1,6 +1,7 @@
 import base64
 import datetime
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -448,6 +449,119 @@ class GrantConsistencyTests(unittest.TestCase):
         self.app.broker.remove_project("myapp")
         self.assertEqual(self.iam.policies, {})
         self.assertNotIn("apm-myapp", self.iam.roles)
+
+
+class AuditTests(unittest.TestCase):
+    """Every IAM rewrite records exactly one event, whether it applied, was refused or failed."""
+
+    def setUp(self):
+        self.app, self.iam, _ = make_app()
+
+    def add(self, resources=("*",)):
+        rid = self.app.store.add("myapp", ["s3:GetObject"], list(resources), "x", "laptop")
+        return self.app.store.get(rid)
+
+    def approve(self, r):
+        return self.app.decide({"op": "approve", "id": str(r["id"]), "digest": r["digest"]}, "owner@example.com")
+
+    def events(self):
+        return self.app.store.events()
+
+    def test_each_op_writes_one_applied_event(self):
+        r1, r2 = self.add(), self.add()
+        self.approve(r1)
+        self.approve(r2)
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
+        self.app.decide({"op": "sync_project", "project": "myapp"})
+        self.app.decide({"op": "remove_project", "project": "myapp"})
+        ev = self.events()
+        self.assertEqual([(e["op"], e["outcome"]) for e in ev],
+                         [("approve", "applied"), ("approve", "applied"), ("revoke", "applied"),
+                          ("sync_project", "applied"), ("remove_project", "applied")])
+        first = ev[0]
+        self.assertEqual((first["project"], first["account"], first["actor"], first["request_ids"], first["agent_keys"]),
+                         ("myapp", ACCOUNT, "owner@example.com", [1], ["laptop"]))
+        self.assertEqual(first["role_arn"], policy.role_arn(ACCOUNT, "myapp"))
+        self.assertEqual(first["grants"], ["Req1"])
+        self.assertEqual(ev[1]["grants"], ["Req1", "Req2"])
+        self.assertEqual(ev[1]["request_ids"], [1, 2])  # Req1 was live in IAM
+        self.assertEqual(first["policy_sha256"], hashlib.sha256(policy.dumps(policy.grants_document([r1])).encode()).hexdigest())
+        self.assertEqual(ev[2]["grants"], ["Req2"])
+        self.assertEqual((ev[4]["grants"], ev[4]["policy_sha256"], ev[4]["request_ids"]), ([], "", [2]))
+        self.app.decide({"op": "revoke", "project": "other", "sid": "Req2"})  # another project's request
+        self.assertEqual(self.events()[-1]["request_ids"], [])
+
+    def test_refused_and_failed_writes_are_recorded(self):
+        big = ["arn:aws:s3:::bucket-" + "x" * 60 + f"-{i}/*" for i in range(60)]
+        self.approve(self.add(big))
+        from apm.broker import BrokerError
+        with self.assertRaises(BrokerError):
+            self.approve(self.add(big))
+        self.iam.put_role_policy = mock.Mock(side_effect=TimeoutError("read timed out"))
+        self.assertIn("updating IAM failed", self.approve(self.add()))
+        ev = self.events()
+        self.assertEqual([e["outcome"] for e in ev], ["applied", "refused", "failed"])
+        self.assertIn("inline policy limit", ev[1]["error"])
+        self.assertEqual(ev[2]["error"], "TimeoutError: read timed out")
+
+    def test_a_grant_cleared_by_a_later_sync_traces_back_to_its_request(self):
+        self.approve(self.add())
+        self.iam.put_role_policy = mock.Mock(side_effect=TimeoutError("read timed out"))
+        self.iam.delete_role_policy = mock.Mock(side_effect=TimeoutError("read timed out"))
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
+        del self.iam.put_role_policy, self.iam.delete_role_policy
+        self.app.decide({"op": "sync_project", "project": "myapp"})
+        reapply = self.events()[-1]
+        self.assertEqual((reapply["op"], reapply["request_ids"], reapply["grants"]), ("sync_project", [1], []))
+        page = self.app(web.Request("GET", "/requests/1", cookies=session_cookie(self.app))).body
+        self.assertIn("History", page)
+        for label in ("Approved", "Revoke failed", "Grant removed (re-apply)"):
+            self.assertIn(label, page)
+
+    def test_history_shows_only_changes_for_the_request_or_that_removed_its_grant(self):
+        self.approve(self.add())
+        self.approve(self.add())
+        self.app.decide({"op": "revoke", "project": "myapp", "sid": "Req1"})
+        self.assertEqual(self.events()[-1]["targets"], [1])
+        page = self.app(web.Request("GET", "/requests/2", cookies=session_cookie(self.app))).body
+        self.assertIn("Approved", page)
+        self.assertNotIn("Revoked", page)  # request 2 kept its grant
+
+    def test_a_grant_restored_by_another_approval_shows_in_its_history(self):
+        real_put = self.iam.put_role_policy
+        self.iam.put_role_policy = mock.Mock(side_effect=RuntimeError("throttled"))
+        self.approve(self.add())  # recorded as approved, but IAM never got it
+        self.iam.put_role_policy = real_put
+        self.approve(self.add())
+        last = self.events()[-1]
+        self.assertEqual((last["targets"], last["request_ids"], last["agent_keys"]), ([2], [1, 2], ["laptop"]))
+        page = self.app(web.Request("GET", "/requests/1", cookies=session_cookie(self.app))).body
+        self.assertIn("Grant added (approval)", page)
+
+    def test_a_failed_live_read_refuses_the_change_before_writing(self):
+        self.approve(self.add())
+        self.iam.get_role_policy = mock.Mock(side_effect=TimeoutError("read timed out"))
+        msg = self.app.action({"op": "sync_project", "project": "myapp", "back": "/projects"}, "owner")
+        self.assertIn("nothing+was+changed", msg.headers["Location"])
+        del self.iam.get_role_policy
+        self.assertEqual([s["Sid"] for s in self.app.broker.grants("myapp")["Statement"]], ["Req1"])
+        last = self.events()[-1]
+        self.assertEqual((last["op"], last["outcome"]), ("sync_project", "refused"))
+
+    def test_cloudwatch_first_and_a_failed_table_write_does_not_fail_the_change(self):
+        real_put = self.app.store.t.put_item
+
+        def put(Item, **kw):
+            if Item.get("kind") == "event":
+                raise RuntimeError("dynamodb down")
+            return real_put(Item, **kw)
+        self.app.store.t.put_item = put
+        with mock.patch("builtins.print") as out:
+            self.assertEqual(self.approve(self.add()), "Approved request #1 for myapp.")
+        lines = [json.loads(c.args[0]) for c in out.call_args_list]
+        self.assertEqual([l["event"] for l in lines], ["iam_change", "audit_store_failed"])
+        self.assertEqual(lines[0]["outcome"], "applied")
+        self.assertEqual(self.app.broker.grants("myapp")["Statement"][0]["Sid"], "Req1")
 
 
 class PushTests(unittest.TestCase):
