@@ -41,8 +41,8 @@ def seed(app):
     s = app.store
     s.create_key("macbook")
 
-    def decide(rid, op="approve"):
-        app.decide({"op": op, "id": str(rid), "digest": s.get(rid)["digest"]})
+    def decide(rid, op="approve", hours=0):
+        app.decide({"op": op, "id": str(rid), "digest": s.get(rid)["digest"], "hours-1": str(hours)})
 
     first = s.add("website", ["s3:GetObject", "s3:PutObject"], ["arn:aws:s3:::example-site/*"],
                   "Upload the built site to the bucket.", "macbook")
@@ -52,7 +52,10 @@ def seed(app):
                     f"Run the weekly usage report ({i + 1}).", "macbook")
         decide(rid, "reject" if i % 3 else "approve")
     s.add("website", ["cloudfront:CreateInvalidation"], ["*"],
-          "Invalidate the CDN after deploying so visitors see the new pages.", "macbook")
+          "Invalidate the CDN after deploying so visitors see the new pages.", "macbook", suggested_hours=3)
+    # Time-limited: Projects shows its countdown, Extend and Revoke early.
+    decide(s.add("website", ["logs:FilterLogEvents"], ["arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/site*"],
+                 "Read the site function's logs while debugging a failed deploy.", "macbook"), hours=3)
     s.add("data-pipeline", ["dynamodb:*"], ["*"], "Create and manage tables for the nightly import job.", "macbook")
     s.add("orders", ["dynamodb:PutItem", "dynamodb:UpdateItem"], ["arn:aws:dynamodb:us-east-1:111122223333:table/orders"],
           "Write order status updates from the fulfilment worker.", "macbook")

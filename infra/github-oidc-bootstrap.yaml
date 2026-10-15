@@ -155,6 +155,11 @@ Resources:
                 Effect: Allow
                 Action: lambda:*
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:apm-dev
+              - Sid: Sweep # the expiry sweep's schedule
+                Effect: Allow
+                Action: [events:PutRule, events:DescribeRule, events:DeleteRule, events:PutTargets, events:RemoveTargets,
+                         events:ListTargetsByRule, events:TagResource, events:UntagResource, events:ListTagsForResource]
+                Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/apm-dev-sweep
               - Sid: Table
                 Effect: Allow
                 Action: [dynamodb:CreateTable, dynamodb:DescribeTable, dynamodb:UpdateTable,
@@ -187,6 +192,7 @@ Resources:
                   - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/agents/*
                   - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/apm-agent-boundary
                   - !Sub arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:apm
+                  - !Sub arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/apm-sweep
                   - !Sub arn:${AWS::Partition}:dynamodb:*:${AWS::AccountId}:table/apm
                   - !Sub arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:parameter/apm/*
                   - !Sub arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:/aws/lambda/apm:*
@@ -272,6 +278,11 @@ Resources:
                 Effect: Allow
                 Action: lambda:*
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:apm-pr-*
+              - Sid: Sweep # the expiry sweep's schedule
+                Effect: Allow
+                Action: [events:PutRule, events:DescribeRule, events:DeleteRule, events:PutTargets, events:RemoveTargets,
+                         events:ListTargetsByRule, events:TagResource, events:UntagResource, events:ListTagsForResource]
+                Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/apm-pr-*-sweep
               - Sid: Table
                 Effect: Allow
                 Action: [dynamodb:CreateTable, dynamodb:DeleteTable, dynamodb:DescribeTable, dynamodb:UpdateTable,
@@ -314,7 +325,9 @@ Resources:
                   - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/apm-agent-boundary
                   - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/apm-dev_agent-boundary
                   - !Sub arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:apm
+                  - !Sub arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/apm-sweep
                   - !Sub arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:apm-dev
+                  - !Sub arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/apm-dev-sweep
                   - !Sub arn:${AWS::Partition}:dynamodb:*:${AWS::AccountId}:table/apm
                   - !Sub arn:${AWS::Partition}:dynamodb:*:${AWS::AccountId}:table/apm-dev
                   - !Sub arn:${AWS::Partition}:ssm:*:${AWS::AccountId}:parameter/apm/*
@@ -432,6 +445,11 @@ Resources:
                          lambda:UpdateFunctionConfiguration, lambda:TagResource,
                          lambda:UntagResource, lambda:GetPolicy, lambda:AddPermission, lambda:RemovePermission]
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:apm
+              - Sid: Sweep # the expiry sweep's schedule
+                Effect: Allow
+                Action: [events:PutRule, events:DescribeRule, events:DeleteRule, events:PutTargets, events:RemoveTargets,
+                         events:ListTargetsByRule, events:TagResource, events:UntagResource, events:ListTagsForResource]
+                Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/apm-sweep
               - Sid: Table
                 Effect: Allow
                 Action: [dynamodb:DescribeTable, dynamodb:UpdateTable, dynamodb:DescribeContinuousBackups,

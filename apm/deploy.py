@@ -112,6 +112,14 @@ def template(account, region, domain, zone_id, owner_emails, workos_client_id, v
             "FunctionName": {"Ref": "Function"}, "Action": "lambda:InvokeFunction",
             "Principal": "apigateway.amazonaws.com",
             "SourceArn": {"Fn::Sub": "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"}}},
+        # The expiry sweep: tidies time-limited grants out of IAM and marks them expired (App.sweep).
+        "Sweep": {"Type": "AWS::Events::Rule", "Properties": {
+            "Name": f"{n.base}-sweep", "Description": "apm: remove expired grants every 15 minutes",
+            "ScheduleExpression": "rate(15 minutes)", "State": "ENABLED",
+            "Targets": [{"Id": "sweep", "Arn": {"Fn::GetAtt": ["Function", "Arn"]}, "Input": '{"apm_sweep": true}'}]}},
+        "SweepPermission": {"Type": "AWS::Lambda::Permission", "Properties": {
+            "FunctionName": {"Ref": "Function"}, "Action": "lambda:InvokeFunction",
+            "Principal": "events.amazonaws.com", "SourceArn": {"Fn::GetAtt": ["Sweep", "Arn"]}}},
         "Certificate": {"Type": "AWS::CertificateManager::Certificate", "Properties": {
             "DomainName": domain, "ValidationMethod": "DNS",
             "DomainValidationOptions": [{"DomainName": domain, "HostedZoneId": zone_id}]}},

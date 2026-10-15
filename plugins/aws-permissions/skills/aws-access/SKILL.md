@@ -17,6 +17,7 @@ You never get admin AWS credentials. AWS access is organised into **projects**, 
    - Ask for exactly the denied action(s) on the specific resource ARN(s) from the error message.
    - Give a one-sentence reason the owner will understand.
    - Prefer narrow requests. Wildcards like `s3:*` or `Resource: *` are harder for the owner to approve.
+   - Suggest how long you need it (`duration`, or `--for 3h`): 1h, 3h, 1d, 1w or permanent. Pick the shortest that covers the task; the owner decides, and a time-limited grant ends by itself.
    - Then wait with `check_request` (`wait_seconds: 120`, repeat while pending), and retry once it is approved.
    - If it's rejected, read the note and stop or adjust. Don't re-request the same thing.
 4. **Some actions can never be granted:** IAM changes, `sts:AssumeRole`, Organizations, account, SSO/identity, billing and domain registration (`route53domains`). Stopping or changing CloudTrail logging, and anything belonging to AWS Permissions itself, is denied even if approved. Don't request them. Tell the user if a task needs them.

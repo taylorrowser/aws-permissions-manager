@@ -419,6 +419,7 @@ def stage_arns(stage):
         policy.broker_role_arn(ACCOUNT, n), policy.role_arn(ACCOUNT, "myapp", n),
         policy.boundary_arn(ACCOUNT, n),
         f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{n.function}",
+        f"arn:aws:events:{REGION}:{ACCOUNT}:rule/{n.base}-sweep",
         f"arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{n.table}",
         f"arn:aws:ssm:{REGION}:{ACCOUNT}:parameter{n.param_prefix}/session-secret",
         f"arn:aws:logs:{REGION}:{ACCOUNT}:log-group:/aws/lambda/{n.function}:*",

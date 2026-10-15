@@ -114,6 +114,7 @@ ul.notes{margin:0 0 8px;padding-left:20px;font-size:.88rem}
 ul.notes li{margin:2px 0}
 ul.codes{list-style:none;padding:0;margin:4px 0 0;display:flex;flex-wrap:wrap;gap:4px}
 .note{font-size:.9rem;margin:0 0 12px}
+.lasts{display:flex;align-items:center;gap:8px;margin:10px 0 0;font-size:.9rem}
 details.more{margin:0 0 12px}
 dl.meta{display:grid;grid-template-columns:max-content 1fr;gap:4px 12px;margin:4px 0 8px;font-size:.9rem}
 dl.meta dt{color:var(--muted)}dl.meta dd{margin:0;min-width:0}
@@ -183,6 +184,8 @@ box-shadow:0 8px 24px rgba(0,0,0,.18);pointer-events:none;animation:toast 4.5s f
 /* forms */
 .field{display:flex;gap:8px}
 .create{margin:0 0 8px}
+select{font:inherit;font-size:.9rem;min-height:36px;padding:0 8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg)}
+.extend{display:flex;gap:8px;margin-top:8px}
 input[type=text]{font:inherit;flex:1;min-width:0;min-height:44px;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--fg)}
 .secret{font-size:15px;padding:12px;background:var(--sub);border-radius:8px;user-select:all;word-break:break-all}
 .new-key{border-color:var(--border)}

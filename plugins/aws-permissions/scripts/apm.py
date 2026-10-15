@@ -3,7 +3,7 @@
 
     apm login [--paste]            connect this machine (owner approves in the browser), or paste a key
     apm projects [--search TEXT]   projects and what each is allowed to do
-    apm request --project P -a ACTION [-r ARN] --reason WHY [--wait]
+    apm request --project P -a ACTION [-r ARN] --reason WHY [--for 3h] [--wait]
     apm status [ID] | apm wait ID
     apm use PROJECT                set up AWS profile apm-PROJECT (credentials stay out of view)
     apm credentials PROJECT        AWS credential_process helper (used by the profile)
@@ -30,7 +30,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 DEFAULT_URL = "https://apm.taylorrowser.com"
 HOME = Path(os.environ.get("APM_HOME", Path.home() / ".apm"))
 CLIENT_FILE = HOME / "client.json"
@@ -151,9 +151,23 @@ def projects(search=""):
     return call("GET", "/api/projects" + (f"?search={quote(search)}" if search else ""))["projects"]
 
 
-def request(project, actions, resources, reason):
-    return call("POST", "/api/requests", {"project": project, "actions": actions,
-                                          "resources": resources or ["*"], "reason": reason})
+# How long a grant may last, as the owner can approve it: 1h, 3h, 1d, 1w or permanent.
+DURATIONS = {"1h": 1, "3h": 3, "1d": 24, "24h": 24, "1w": 168, "168h": 168, "permanent": 0}
+
+
+def hours(duration):
+    """'3h' -> 3, 'permanent' -> 0. ApmError for anything the owner can't pick."""
+    h = DURATIONS.get(str(duration).strip().lower())
+    if h is None:
+        raise ApmError(f"duration {duration!r} isn't one of 1h, 3h, 1d, 1w or permanent")
+    return h
+
+
+def request(project, actions, resources, reason, duration=None):
+    body = {"project": project, "actions": actions, "resources": resources or ["*"], "reason": reason}
+    if duration is not None:
+        body["suggested_hours"] = hours(duration)
+    return call("POST", "/api/requests", body)
 
 
 def get_request(rid):
@@ -326,6 +340,8 @@ def main(argv=None):
     s.add_argument("--action", "-a", action="append", required=True, help="IAM action, repeatable")
     s.add_argument("--resource", "-r", action="append", default=[], help="resource ARN, repeatable (default *)")
     s.add_argument("--reason", required=True)
+    s.add_argument("--for", dest="duration", metavar="DURATION",
+                   help="how long you need it: 1h, 3h, 1d, 1w or permanent (the owner decides)")
     s.add_argument("--wait", action="store_true", help="block until the owner decides (up to 30 min)")
     s = sub.add_parser("status", help="show requests")
     s.add_argument("id", nargs="?", type=int)
@@ -378,7 +394,7 @@ def cmd_projects(a):
 
 
 def cmd_request(a):
-    r = request(a.project, a.action, a.resource, a.reason)
+    r = request(a.project, a.action, a.resource, a.reason, a.duration)
     print(f"Request #{r['id']} sent to the owner for approval.")
     if a.wait:
         return _finish(wait(r["id"], 1800))
@@ -457,9 +473,12 @@ TOOLS = [
          "project": {"type": "string", "description": "lowercase letters, digits and dashes, e.g. myapp"},
          "actions": {"type": "array", "items": {"type": "string"}, "description": "IAM actions, e.g. s3:GetObject"},
          "resources": {"type": "array", "items": {"type": "string"}, "description": "Resource ARNs (default *)"},
-         "reason": {"type": "string", "description": "Why you need this, shown to the owner"}}}},
+         "reason": {"type": "string", "description": "Why you need this, shown to the owner"},
+         "duration": {"type": "string", "enum": ["1h", "3h", "1d", "1w", "permanent"],
+                      "description": "How long you need it; the owner picks the final duration. Suggest the "
+                                     "shortest that covers the task."}}}},
     {"name": "check_request",
-     "description": "Get the status of a permission request (pending, approved, rejected, revoked). Set "
+     "description": "Get the status of a permission request (pending, approved, rejected, revoked, expired). Set "
                     "wait_seconds (max 120) to wait for the owner's decision; call again if still pending.",
      "inputSchema": {"type": "object", "required": ["request_id"], "properties": {
          "request_id": {"type": "integer"},
@@ -552,14 +571,16 @@ class McpServer:
                 f"`AWS_PROFILE={profile}`. Credentials refresh automatically and are never displayed. "
                 "If a call fails with AccessDenied, use request_permissions.")
 
-    def tool_request_permissions(self, project, actions, reason, resources=None):
-        r = request(project, list(actions), list(resources or []), reason)
+    def tool_request_permissions(self, project, actions, reason, resources=None, duration=None):
+        r = request(project, list(actions), list(resources or []), reason, duration)
         return (f"Request #{r['id']} sent to the owner. Call check_request with request_id={r['id']} and "
                 "wait_seconds=120 to wait for the decision.")
 
     def tool_check_request(self, request_id, wait_seconds=0):
         r = wait(request_id, max(0, min(int(wait_seconds), 120)))
         out = {k: r[k] for k in ("id", "project", "status", "actions", "resources", "note")}
+        if r.get("expires_at"):
+            out["expires_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["expires_at"]))
         if r["status"] == "approved":
             out["next"] = f"Call get_aws_credentials with project={r['project']!r} (or reuse its profile) and retry."
         elif r["status"] == "pending":
