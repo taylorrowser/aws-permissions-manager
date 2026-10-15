@@ -3,7 +3,10 @@
 
     apm login [--paste]            connect this machine (owner approves in the browser), or paste a key
     apm projects [--search TEXT]   projects and what each is allowed to do
-    apm request --project P -a ACTION [-r ARN] --reason WHY [--wait]
+    apm request --project P -a ACTION [-r ARN] --reason WHY [--for 3h] [--wait]
+    apm request --project P --grant 'a1,a2=arn1,arn2' [--grant ...] --reason WHY   several grants, one request
+    apm request ... --replaces Req22 [--replaces Req52g3]   grants the new request supersedes
+    apm remove --project P --grant Req22 [-a ACTION] [-r ARN] --reason WHY   drop access you no longer need
     apm status [ID] | apm wait ID
     apm usage PROJECT              when each of a project's grants was last used
     apm use PROJECT                set up AWS profile apm-PROJECT (credentials stay out of view)
@@ -31,7 +34,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.8.0"
 DEFAULT_URL = "https://apm.taylorrowser.com"
 HOME = Path(os.environ.get("APM_HOME", Path.home() / ".apm"))
 CLIENT_FILE = HOME / "client.json"
@@ -152,9 +155,62 @@ def projects(search=""):
     return call("GET", "/api/projects" + (f"?search={quote(search)}" if search else ""))["projects"]
 
 
-def request(project, actions, resources, reason):
-    return call("POST", "/api/requests", {"project": project, "actions": actions,
-                                          "resources": resources or ["*"], "reason": reason})
+# How long a grant may last, as the owner can approve it: 1h, 3h, 1d, 1w or permanent.
+DURATIONS = {"1h": 1, "3h": 3, "1d": 24, "24h": 24, "1w": 168, "168h": 168, "permanent": 0}
+
+
+def hours(duration):
+    """'3h' -> 3, 'permanent' -> 0. ApmError for anything the owner can't pick."""
+    h = DURATIONS.get(str(duration).strip().lower())
+    if h is None:
+        raise ApmError(f"duration {duration!r} isn't one of 1h, 3h, 1d, 1w or permanent")
+    return h
+
+
+MAX_GRANTS = 9
+
+
+def request(project, actions, resources, reason, duration=None, grants=None, replaces=None):
+    """grants: [{"actions", "resources", "duration" (optional)}], one per resource set, instead of
+    actions and resources. duration then applies to each grant that doesn't name its own. replaces:
+    grants of the project (Req22, Req52g3, as `apm projects` shows them) that approving it revokes."""
+    extra = {"replaces": list(replaces)} if replaces else {}
+    if grants and (actions or resources):
+        raise ApmError("give either grants or actions/resources, not both")
+    if grants:
+        if len(grants) > MAX_GRANTS:
+            raise ApmError(f"at most {MAX_GRANTS} grants per request")
+        body = {"project": project, "reason": reason, "grants": [], **extra}
+        for g in grants:
+            item = {"actions": list(g.get("actions") or []), "resources": list(g.get("resources") or []) or ["*"]}
+            d = g.get("duration") or duration
+            if d is not None:
+                item["suggested_hours"] = hours(d)
+            body["grants"].append(item)
+        return call("POST", "/api/requests", body)
+    if not actions:
+        raise ApmError("give at least one action, or grants")
+    body = {"project": project, "actions": actions, "resources": resources or ["*"], "reason": reason, **extra}
+    if duration is not None:
+        body["suggested_hours"] = hours(duration)
+    return call("POST", "/api/requests", body)
+
+
+def parse_grant(text):
+    """'s3:GetObject,s3:PutObject=arn:aws:s3:::b/*' -> {"actions": [...], "resources": [...]}. No
+    '=...' means every resource."""
+    acts, _, res = text.partition("=")
+    actions = [a.strip() for a in acts.split(",") if a.strip()]
+    if not actions:
+        raise ApmError(f"--grant {text!r} names no actions; use 'action1,action2=arn1,arn2'")
+    return {"actions": actions, "resources": [r.strip() for r in res.split(",") if r.strip()] or ["*"]}
+
+
+def remove(project, grant, actions, resources, reason):
+    """Drop the named actions or resources from one grant (Req22, Req52g3, as `apm projects` shows
+    them), or the whole grant if neither is given. It takes effect at once: no approval needed."""
+    return call("POST", "/api/remove", {"project": project, "grant": grant, "actions": list(actions or []),
+                                        "resources": list(resources or []), "reason": reason})
 
 
 def usage(project):
@@ -329,10 +385,22 @@ def main(argv=None):
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("request", help="ask the owner for permissions on a project")
     s.add_argument("--project", required=True)
-    s.add_argument("--action", "-a", action="append", required=True, help="IAM action, repeatable")
+    s.add_argument("--action", "-a", action="append", default=[], help="IAM action, repeatable")
     s.add_argument("--resource", "-r", action="append", default=[], help="resource ARN, repeatable (default *)")
+    s.add_argument("--grant", "-g", action="append", default=[], metavar="'A1,A2=ARN1,ARN2'",
+                   help="one grant: actions on resources; repeat for each resource set (instead of -a/-r)")
     s.add_argument("--reason", required=True)
+    s.add_argument("--for", dest="duration", metavar="DURATION",
+                   help="how long you need it: 1h, 3h, 1d, 1w or permanent (the owner decides)")
+    s.add_argument("--replaces", action="append", default=[], metavar="GRANT",
+                   help="a grant this request supersedes, as `apm projects` names it (Req22, Req52g3); repeatable")
     s.add_argument("--wait", action="store_true", help="block until the owner decides (up to 30 min)")
+    s = sub.add_parser("remove", help="drop access a project no longer needs (no approval needed)")
+    s.add_argument("--project", required=True)
+    s.add_argument("--grant", required=True, help="the grant, exactly as `apm projects` names it (Req22, Req52g3)")
+    s.add_argument("--action", "-a", action="append", default=[], help="an action to drop, repeatable")
+    s.add_argument("--resource", "-r", action="append", default=[], help="a resource ARN to drop, repeatable")
+    s.add_argument("--reason", required=True, help="why it's no longer needed, shown to the owner")
     s = sub.add_parser("status", help="show requests")
     s.add_argument("id", nargs="?", type=int)
     s.add_argument("--project")
@@ -387,11 +455,20 @@ def cmd_projects(a):
 
 
 def cmd_request(a):
-    r = request(a.project, a.action, a.resource, a.reason)
+    if a.grant and (a.action or a.resource):
+        raise ApmError("use either --grant or --action/--resource, not both")
+    if not a.grant and not a.action:
+        raise ApmError("give --action (with --resource), or --grant")
+    r = request(a.project, a.action, a.resource, a.reason, a.duration, [parse_grant(g) for g in a.grant] or None,
+                a.replaces)
     print(f"Request #{r['id']} sent to the owner for approval.")
     if a.wait:
         return _finish(wait(r["id"], 1800))
     print(f"Check with `apm status {r['id']}` or block with `apm wait {r['id']}`.")
+
+
+def cmd_remove(a):
+    print(remove(a.project, a.grant, a.action, a.resource, a.reason)["message"])
 
 
 def cmd_status(a):
@@ -399,10 +476,17 @@ def cmd_status(a):
     if not rows:
         print("No requests.")
     for r in rows:
-        line = f"#{r['id']} {r['status']:<9} {r['project']:<16} {', '.join(r['actions'])}"
-        if r["resources"] != ["*"]:
-            line += f" on {', '.join(r['resources'])}"
-        print(line + (f"  ({r['note']})" if r.get("note") else ""))
+        if r.get("grants"):
+            print(f"#{r['id']} {r['status']:<9} {r['project']:<16} {len(r['grants'])} grants"
+                  + (f"  ({r['note']})" if r.get("note") else ""))
+            for g in r["grants"]:
+                print(f"    {g['sid']}{' ' + g['ended'] if g['ended'] else ''}: {_grant_line(g)}")
+            continue
+        print(f"#{r['id']} {r['status']:<9} {r['project']:<16} {_grant_line(r)}" + (f"  ({r['note']})" if r.get("note") else ""))
+
+
+def _grant_line(g):
+    return ", ".join(g["actions"]) + (f" on {', '.join(g['resources'])}" if g["resources"] != ["*"] else "")
 
 
 def cmd_wait(a):
@@ -484,15 +568,42 @@ TOOLS = [
      "description": "Ask the owner to grant IAM permissions to a project; they approve or reject on their phone. "
                     "Request exactly what failed (from the AccessDenied message), with specific resource ARNs where "
                     "possible. A new project name creates that project on approval. IAM, STS AssumeRole, "
-                    "Organizations, account, SSO and billing actions can never be granted. Afterwards call "
-                    "check_request with wait_seconds to wait for the decision.",
-     "inputSchema": {"type": "object", "required": ["project", "actions", "reason"], "properties": {
+                    "Organizations, account, SSO and billing actions can never be granted. Give either actions "
+                    "(and resources) or grants, one per resource set, to ask for everything one task needs at once. "
+                    "Afterwards call check_request with wait_seconds to wait for the decision.",
+     "inputSchema": {"type": "object", "required": ["project", "reason"], "properties": {
          "project": {"type": "string", "description": "lowercase letters, digits and dashes, e.g. myapp"},
          "actions": {"type": "array", "items": {"type": "string"}, "description": "IAM actions, e.g. s3:GetObject"},
          "resources": {"type": "array", "items": {"type": "string"}, "description": "Resource ARNs (default *)"},
-         "reason": {"type": "string", "description": "Why you need this, shown to the owner"}}}},
+         "reason": {"type": "string", "description": "Why you need this, shown to the owner"},
+         "duration": {"type": "string", "enum": ["1h", "3h", "1d", "1w", "permanent"],
+                      "description": "How long you need it; the owner picks the final duration. Suggest the "
+                                     "shortest that covers the task."},
+         "grants": {"type": "array", "minItems": 1, "maxItems": 9,
+                    "description": "Instead of actions/resources: what one task needs, one grant per resource set "
+                                   "(e.g. read one bucket, write one table). The owner approves, times and revokes "
+                                   "each grant separately.",
+                    "items": {"type": "object", "required": ["actions"], "properties": {
+                        "actions": {"type": "array", "items": {"type": "string"}},
+                        "resources": {"type": "array", "items": {"type": "string"}},
+                        "duration": {"type": "string", "enum": ["1h", "3h", "1d", "1w", "permanent"]}}}},
+         "replaces": {"type": "array", "items": {"type": "string"},
+                      "description": "Grants of this project that the request supersedes, as list_projects names "
+                                     "them (e.g. Req22, Req52g3). Approving it revokes them, so the role's policy "
+                                     "stays under IAM's size limit."}}}},
+    {"name": "remove_permissions",
+     "description": "Drop access a project no longer needs. Takes effect at once, without approval, because it "
+                    "only shrinks access; the owner is notified. Name one grant exactly as list_projects shows it, "
+                    "then the exact actions or resources to drop from it, or neither to remove the whole grant. A "
+                    "grant left with no actions or no resources ends.",
+     "inputSchema": {"type": "object", "required": ["project", "grant", "reason"], "properties": {
+         "project": {"type": "string"},
+         "grant": {"type": "string", "description": "e.g. Req22 or Req52g3"},
+         "actions": {"type": "array", "items": {"type": "string"}, "description": "Actions to drop, exactly as listed"},
+         "resources": {"type": "array", "items": {"type": "string"}, "description": "Resource ARNs to drop, exactly as listed"},
+         "reason": {"type": "string", "description": "Why it's no longer needed, shown to the owner"}}}},
     {"name": "check_request",
-     "description": "Get the status of a permission request (pending, approved, rejected, revoked). Set "
+     "description": "Get the status of a permission request (pending, approved, rejected, revoked, expired). Set "
                     "wait_seconds (max 120) to wait for the owner's decision; call again if still pending.",
      "inputSchema": {"type": "object", "required": ["request_id"], "properties": {
          "request_id": {"type": "integer"},
@@ -591,14 +702,25 @@ class McpServer:
                 f"`AWS_PROFILE={profile}`. Credentials refresh automatically and are never displayed. "
                 "If a call fails with AccessDenied, use request_permissions.")
 
-    def tool_request_permissions(self, project, actions, reason, resources=None):
-        r = request(project, list(actions), list(resources or []), reason)
+    def tool_request_permissions(self, project, reason, actions=None, resources=None, duration=None, grants=None,
+                                 replaces=None):
+        r = request(project, list(actions or []), list(resources or []), reason, duration, grants, replaces)
         return (f"Request #{r['id']} sent to the owner. Call check_request with request_id={r['id']} and "
                 "wait_seconds=120 to wait for the decision.")
+
+    def tool_remove_permissions(self, project, grant, reason, actions=None, resources=None):
+        return remove(project, grant, actions, resources, reason)["message"]
 
     def tool_check_request(self, request_id, wait_seconds=0):
         r = wait(request_id, max(0, min(int(wait_seconds), 120)))
         out = {k: r[k] for k in ("id", "project", "status", "actions", "resources", "note")}
+        if r.get("expires_at"):
+            out["expires_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(r["expires_at"]))
+        if r.get("grants"):  # several: each ends (or was revoked) on its own
+            out["grants"] = [{"grant": g["sid"], "actions": g["actions"], "resources": g["resources"],
+                              **({"ended": g["ended"]} if g["ended"] else {}),
+                              **({"expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(g["expires_at"]))}
+                                 if g["expires_at"] else {})} for g in r["grants"]]
         if r["status"] == "approved":
             out["next"] = f"Call get_aws_credentials with project={r['project']!r} (or reuse its profile) and retry."
         elif r["status"] == "pending":

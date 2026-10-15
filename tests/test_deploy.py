@@ -59,6 +59,17 @@ def iam_match(pattern, arn):
     return fnmatch.fnmatchcase(arn, pattern)
 
 
+SWEEP = {
+    "Sweep": {"Type": "AWS::Events::Rule", "Properties": {
+        "Name": "apm-sweep", "Description": "apm: remove expired grants every 15 minutes",
+        "ScheduleExpression": "rate(15 minutes)", "State": "ENABLED",
+        "Targets": [{"Id": "sweep", "Arn": {"Fn::GetAtt": ["Function", "Arn"]}, "Input": '{"apm_sweep": true}'}]}},
+    "SweepPermission": {"Type": "AWS::Lambda::Permission", "Properties": {
+        "FunctionName": {"Ref": "Function"}, "Action": "lambda:InvokeFunction",
+        "Principal": "events.amazonaws.com", "SourceArn": {"Fn::GetAtt": ["Sweep", "Arn"]}}},
+}
+
+
 def resources(stmt):
     r = stmt["Resource"]
     return [r] if isinstance(r, str) else r
@@ -79,8 +90,21 @@ class ProdCompatibility(unittest.TestCase):
         allow = next(st for st in statements if st["Sid"] == "AllowNonAdminServices")
         allow["NotAction"] = allow["NotAction"][:11] + ["route53domains:*"] + allow["NotAction"][11:]
         statements += PROD_V1_BOUNDARY_DENIES
-        # Intended change 4 (usage audit): the broker may read Access Advisor reports on agent roles.
+        # Intended change 4: the broker may list stacks (read-only), to refuse stack writes that would run
+        # as a stack's stored role.
         broker = expected["Resources"]["BrokerRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+        broker.insert(4, {"Sid": "CheckStackRoles", "Effect": "Allow", "Resource": "*",
+                          "Action": ["cloudformation:DescribeStacks", "cloudformation:ListStacks"]})
+        # Intended change 5: the expiry sweep, a 15-minute schedule that invokes the Lambda.
+        expected["Resources"].update(SWEEP)
+        # Intended change 6: the AI reviewer may manage its one key parameter and invoke its own function.
+        broker.extend([
+            {"Sid": "ReviewerKey", "Effect": "Allow",
+             "Action": ["ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter"],
+             "Resource": f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/apm/llm-key"},
+            {"Sid": "QueueReview", "Effect": "Allow", "Action": "lambda:InvokeFunction",
+             "Resource": f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:apm"}])
+        # Intended change 7 (usage audit): the broker may read Access Advisor reports on agent roles.
         at = next(i for i, st in enumerate(broker) if st["Sid"] == "VendAgentCredentials") + 1
         broker[at:at] = [
             {"Sid": "AuditAgentRoleUsage", "Effect": "Allow", "Action": "iam:GenerateServiceLastAccessedDetails",
@@ -92,6 +116,8 @@ class ProdCompatibility(unittest.TestCase):
     def test_prod_resource_names_byte_identical(self):
         before = json.loads((ROOT / "tests/fixtures/prod_template_before_stages.json").read_text())
         after = json.loads(json.dumps(deploy.template(*PROD_ARGS)))
+        for added in SWEEP:  # new since, so not in the old template
+            del after["Resources"][added]
         self.assertEqual(sorted(after["Resources"]), sorted(before["Resources"]))
 
         def names(t):
@@ -150,8 +176,8 @@ class StageIsolation(unittest.TestCase):
             others = [o for o in all_stages if o != n]
             pol = policy.broker_policy(ACCOUNT, n)
             for stmt in pol["Statement"]:
-                if stmt["Effect"] != "Allow":
-                    continue
+                if stmt["Effect"] != "Allow" or not any(x.startswith(("iam:", "sts:")) for x in _actions(stmt, "Action")):
+                    continue  # only IAM and STS actions can touch a role
                 for pattern in resources(stmt):
                     for o in others:
                         if n.is_prod and stmt["Sid"] == "LookUpAgentRoles":
@@ -203,6 +229,19 @@ class StageIsolation(unittest.TestCase):
             self.assertFalse(iam_match(secrets_stmt["Resource"],
                                        f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter/apm/session-secret"))
             self.assertIn(f"stage {stage}", t["Description"])
+
+    def test_reviewer_writes_only_its_own_stage_key_and_invokes_only_itself(self):
+        stages = ["prod"] + NONPROD
+        for stage in stages:
+            t = deploy.template(*PROD_ARGS, stage=stage)
+            stmts = {s["Sid"]: s for s in t["Resources"]["BrokerRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]}
+            key, invoke = stmts["ReviewerKey"]["Resource"], stmts["QueueReview"]["Resource"]
+            for other in stages:
+                o = policy.Names(other)
+                own = other == stage
+                self.assertEqual(iam_match(key, f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter{o.param_prefix}/llm-key"), own)
+                self.assertEqual(iam_match(invoke, f"arn:aws:lambda:us-east-1:{ACCOUNT}:function:{o.function}"), own)
+                self.assertFalse(iam_match(key, f"arn:aws:ssm:us-east-1:{ACCOUNT}:parameter{o.param_prefix}/session-secret"))
 
     def test_retention_policies(self):
         def table(stage):

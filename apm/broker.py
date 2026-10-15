@@ -1,4 +1,5 @@
-"""Everything that touches IAM and STS. Runs inside the Lambda as the apm-broker role."""
+"""Everything that touches IAM and STS, plus the CloudFormation reads the grant checks need. Runs
+inside the Lambda as the apm-broker role."""
 import json
 import threading
 import time
@@ -14,6 +15,10 @@ class BrokerError(Exception):
     pass
 
 
+# PutRolePolicy errors that mean IAM rejected the document and wrote nothing.
+IAM_REFUSALS = {"LimitExceeded", "MalformedPolicyDocument"}
+
+
 def _is_missing(err):
     return getattr(err, "response", {}).get("Error", {}).get("Code") == "NoSuchEntity"
 
@@ -23,13 +28,33 @@ class Broker:
     never from a read of IAM (IAM reads are eventually consistent, and rewriting from a stale
     read could bring back a revoked grant). Callers serialize changes per project."""
 
-    def __init__(self, account, region, iam=None, sts=None):
+    def __init__(self, account, region, iam=None, sts=None, cloudformation=None):
         self.account, self.region = account, region
         if iam is None or sts is None:
             import boto3
             iam, sts = iam or boto3.client("iam"), sts or boto3.client("sts", region_name=region)
         self.iam, self.sts = iam, sts
         self.usage_jobs, self.usage_wait = {}, USAGE_WAIT_SECONDS  # project -> (job id, started at)
+        self._cfn, self._cfn_clients = cloudformation, {}
+
+    def stacks(self, region):
+        """[(stack name, stored RoleARN or "", stack id ARN)] of every live stack in a region, read now. Raises if
+        the listing fails: callers treat that as a refusal, never as "no stacks"."""
+        client = self._cfn_clients.get(region)
+        if client is None:
+            if self._cfn:
+                client = self._cfn(region)
+            else:
+                import boto3
+                client = boto3.client("cloudformation", region_name=region)
+            self._cfn_clients[region] = client
+        out, kw = [], {}
+        while True:
+            page = client.describe_stacks(**kw)
+            out += [(s["StackName"], s.get("RoleARN", ""), s["StackId"]) for s in page.get("Stacks", [])]
+            if not page.get("NextToken"):
+                return out
+            kw = {"NextToken": page["NextToken"]}
 
     def grants(self, project):
         """Current granted policy for a project role, read live from AWS. None if no role."""
@@ -43,7 +68,8 @@ class Broker:
         return json.loads(doc) if isinstance(doc, str) else doc
 
     def sync(self, project, approved):
-        """Make the role's grants exactly the given approved requests."""
+        """Make the role's grants exactly the given approved requests. Returns the document written,
+        or None when no grants are left and the policy was deleted."""
         new = policy.grants_document(approved)
         name = policy.role_name(project)
         with _lock:
@@ -53,12 +79,20 @@ class Broker:
                 except Exception as e:
                     if not _is_missing(e):
                         raise
-                return
+                return None
+            problem = policy.size_problem(project, new)
+            if problem:
+                raise BrokerError(f"{problem}; revoke or consolidate grants first")
             body = policy.dumps(new)
-            if len(body) > policy.MAX_INLINE_POLICY_CHARS:
-                raise BrokerError(f"project {project} would exceed the {policy.MAX_INLINE_POLICY_CHARS}-char inline policy limit; revoke or consolidate grants first")
             self._ensure_role(project)
-            self.iam.put_role_policy(RoleName=name, PolicyName=policy.GRANTS_POLICY, PolicyDocument=body)
+            try:
+                self.iam.put_role_policy(RoleName=name, PolicyName=policy.GRANTS_POLICY, PolicyDocument=body)
+            except Exception as e:
+                code = getattr(e, "response", {}).get("Error", {}).get("Code")
+                if code in IAM_REFUSALS:  # IAM said no, so nothing was written
+                    raise BrokerError(f"IAM refused the policy for {name} ({code}): {e}") from e
+                raise
+            return new
 
     def remove_project(self, project):
         """Delete every inline policy, then the role. Succeeds only once the role is gone."""
@@ -83,10 +117,12 @@ class Broker:
                     raise
 
     def in_sync(self, project, approved):
-        """Whether IAM currently grants exactly the approved requests (for the dashboard)."""
-        current = self.grants(project) or policy.doc()
-        return sorted(s.get("Sid", "") for s in current["Statement"]) == \
-            sorted(policy.sid(r["id"]) for r in approved)
+        """Whether IAM currently grants exactly the approved requests: the same actions and resources
+        (a narrowed grant), each until when it was approved (or extended) to (for the dashboard)."""
+        def ends(d):
+            return sorted((s.get("Sid", ""), sorted(_strings(s.get("Action", []))), sorted(_strings(s.get("Resource", []))),
+                           policy.expiry(s)) for s in d["Statement"])
+        return ends(self.grants(project) or policy.doc()) == ends(policy.grants_document(approved))
 
     def _all_policy_names(self, role):
         names, kw = [], {}
@@ -150,3 +186,6 @@ class Broker:
             Description=f"apm agent role for project {project}",
             Tags=[{"Key": "managed-by", "Value": "apm"}, {"Key": "project", "Value": project}])
 
+
+def _strings(v):
+    return v if isinstance(v, list) else [v]

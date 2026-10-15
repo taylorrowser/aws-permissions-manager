@@ -1,7 +1,8 @@
 // Owner web app behaviour. Pages work without it; this adds live refresh (the page polls /poll
-// while visible and swaps its data-live regions when something changed), in-page form submits,
-// confirm dialogs, offline and double-submit protection, local times, install help and push
-// notification sign-up.
+// while visible and swaps its data-live regions when something changed), the Requests reading pane
+// (rows open in place on wide screens), keyboard shortcuts, in-page form submits, toasts, confirm
+// dialogs, offline and double-submit protection, local times, install help and push notification
+// sign-up.
 "use strict";
 
 // ---------- pure helpers (also loaded by tests/js) ----------
@@ -52,6 +53,11 @@ function legacyTarget(hash) {
 
 function relativeTime(date, now) {
   const minutes = Math.round((now - date) / 60000);
+  if (minutes < 0) { // a grant's end: a countdown
+    const left = -minutes, hours = Math.floor(left / 60);
+    if (hours >= 48) return `in ${Math.round(hours / 24)} days`;
+    return hours ? `in ${hours} h${left % 60 ? ` ${left % 60} min` : ""}` : `in ${left} min`;
+  }
   if (minutes < 1) return "just now";
   if (minutes < 60) return `${minutes} min ago`;
   const sameDay = date.toDateString() === now.toDateString();
@@ -86,8 +92,112 @@ function canRefresh(s) {
   return Boolean(s.visible && s.online && !s.busy && !s.dialogOpen && !s.typing && !s.dirty && !s.secret);
 }
 
+// Orders everything that replaces the screen, so a slow, older response never lands on top of a
+// newer one. Opening a row and submitting a form each claim the screen: a row load that another
+// open or a submit overtook is dropped. A background refresh applies only if nothing claimed the
+// screen while it loaded and the owner is idle, and none starts while a row is loading. One submit
+// at a time, and no row opens during one. claim() drops whatever is loading (before a confirm).
+// load(url) resolves to a page (or null); apply(page, {url, background}) puts it on screen.
+function createPager({ load, apply, idle }) {
+  let latest = 0, busy = false, opening = 0;
+  return {
+    get busy() { return busy; },
+    get loading() { return opening !== 0; }, // a row is on its way into the pane
+    claim() { latest++; },
+    async open(url) {
+      if (busy) return false;
+      const mine = ++latest;
+      opening = mine;
+      try {
+        const page = await load(url);
+        if (mine !== latest || !page) return false;
+        apply(page, { url, background: false });
+        return true;
+      } finally { if (opening === mine) opening = 0; }
+    },
+    async refresh(url) {
+      if (busy || opening || !idle()) return false;
+      const at = latest;
+      const page = await load(url);
+      if (at !== latest || busy || !page || !idle()) return false;
+      apply(page, { url, background: true });
+      return true;
+    },
+    async submit(send) {
+      if (busy) return false;
+      busy = true;
+      latest++;
+      try { await send(); return true; } finally { busy = false; }
+    },
+  };
+}
+
+// Screens that are the Requests inbox: the list, a request, a connect request.
+function isInboxPath(path) {
+  return /^\/(requests\/\d{1,12}|connect\/[A-Z0-9]{4}-[A-Z0-9]{4})?$/.test(path);
+}
+
+// What to do with a form's response. here: the current path. "error": show it inline; "go": load
+// another screen; "swap": another inbox URL, put in place; "apply": same screen, put in place. A
+// refused approval ("Review it again") comes back to the same request, so the pane shows the
+// request as it is now with the error next to Approve.
+function afterSubmit({ ok, redirected, url }, here) {
+  if (!ok) return "error";
+  const path = redirected ? new URL(url, "http://x").pathname : here;
+  if (path === here) return "apply";
+  return isInboxPath(path) && isInboxPath(here) ? "swap" : "go";
+}
+
+// The digest an open request's Approve submits. A background refresh may redraw the pane with a
+// changed request; Approve keeps the digest of what the owner was looking at, so the server
+// refuses it ("Review it again") instead of approving changes nobody saw.
+function digestToSubmit({ background, sameRequest, seen, fresh }) {
+  return background && sameRequest && seen ? seen : fresh;
+}
+
+// Back or Forward while the Requests screen is open. The pane must follow the URL, so a pending
+// confirm (for the request being left) is cancelled first; mid-submit the page simply reloads.
+function onHistory({ dialogOpen, busy }) {
+  if (busy) return "reload";
+  return dialogOpen ? "cancel-then-open" : "open";
+}
+
+// Decided rows to carry over when a refresh redraws the list: rows loaded past the fresh first
+// page stay (ids are newest first); rows the fresh page has are taken from it.
+function keepDecided(freshIds, oldIds) {
+  const fresh = new Set(freshIds), floor = Math.min(...freshIds);
+  return oldIds.filter((id) => !fresh.has(id) && (!freshIds.length || id < floor));
+}
+
+// Requests keyboard: ↑/↓ (and k/j) move between rows, a approves, r rejects. Not while typing,
+// not with modifiers.
+function keyCommand(e, typing) {
+  if (typing || e.metaKey || e.ctrlKey || e.altKey) return null;
+  return { ArrowDown: "next", j: "next", ArrowUp: "prev", k: "prev", a: "approve", r: "reject" }[e.key] || null;
+}
+
+// The size check on the card (pages.request_pane): the grants policy with every grant permanent is
+// `size` characters, and each time-limited grant adds `perLimit`. Returns the warning to show, or "".
+function overLimit(size, perLimit, limit, policyName, hours) {
+  const total = size + perLimit * hours.filter((h) => h !== "0").length;
+  if (total <= limit) return "";
+  const n = (x) => x.toLocaleString("en-US");
+  return `Too big with these time limits: the inline policy ${policyName} would be ${n(total)} characters, ` +
+    `${n(total - limit)} over the ${n(limit)}-character limit. Make a grant permanent to approve.`;
+}
+
+// The row to move to from `current` (an id, or null for none) in `ids`.
+function step(ids, current, dir) {
+  if (!ids.length) return null;
+  const i = ids.indexOf(current);
+  if (i < 0) return dir === "next" ? ids[0] : ids[ids.length - 1];
+  return ids[Math.min(ids.length - 1, Math.max(0, i + (dir === "next" ? 1 : -1)))];
+}
+
 if (typeof module !== "undefined") {
-  module.exports = { isIOS, pushState, deniedHelp, keyBytes, sameKey, legacyTarget, relativeTime, rotateIfKeyChanged, canRefresh };
+  module.exports = { isIOS, pushState, deniedHelp, keyBytes, sameKey, legacyTarget, relativeTime, rotateIfKeyChanged,
+    canRefresh, createPager, isInboxPath, afterSubmit, onHistory, digestToSubmit, keepDecided, keyCommand, step,
+    overLimit };
 }
 
 // ---------- page behaviour ----------
@@ -116,10 +226,11 @@ if (typeof document !== "undefined") {
     for (const t of root.querySelectorAll("time[datetime]")) {
       const d = new Date(t.getAttribute("datetime"));
       t.title = d.toLocaleString();
-      t.textContent = relativeTime(d, new Date());
+      const now = new Date();
+      t.textContent = ("ends" in t.dataset ? (d > now ? "Ends " : "Ended ") : "") + relativeTime(d, now);
     }
     for (const li of root.querySelectorAll("[data-device]")) {
-      li.querySelector(".chip.this").hidden = li.dataset.device !== thisDevice;
+      li.querySelector(".badge.this").hidden = li.dataset.device !== thisDevice;
     }
   }
   hydrate();
@@ -139,27 +250,52 @@ if (typeof document !== "undefined") {
   }
   badge();
 
-  function flash(text, error = false) {
+  // Errors stay inline, where they happened; anything else is a toast.
+  function flash(text) {
     const slot = $("flash-slot");
     if (!slot) return;
     slot.innerHTML = "";
     const p = document.createElement("p");
-    p.className = error ? "flash error" : "flash";
-    p.setAttribute("role", "status");
+    p.className = "flash error";
+    p.setAttribute("role", "alert");
     p.tabIndex = -1;
     p.textContent = text;
     slot.append(p);
     p.focus({ preventScroll: true });
   }
 
+  function toast(text) {
+    const old = $("toast");
+    if (!old || !text) return;
+    const fresh = old.cloneNode(); // a new element restarts the fade
+    fresh.textContent = text;
+    old.replaceWith(fresh);
+  }
+
+  const wide = () => matchMedia("(min-width: 900px)").matches;
+  const pane = () => document.querySelector("[data-live=pane]");
+
+  function markSelected() {
+    const id = pane()?.dataset.id || "";
+    for (const a of document.querySelectorAll("a.item")) {
+      if (id && a.id === id) a.setAttribute("aria-current", "true"); else a.removeAttribute("aria-current");
+    }
+  }
+
   // ----- live refresh -----
   // Replace every data-live region with the same region from a freshly rendered page. Elements
-  // marked data-keep (the push controls, which hold script state) are carried over by id.
-  let busy = false;
-  function apply(html) {
+  // marked data-keep (the push controls, which hold script state) are carried over by id, open
+  // details stay open, Decided rows loaded so far stay, and the reading pane keeps its scroll
+  // position and, on a background refresh, the digest the owner saw.
+  function apply(html, { background = false } = {}) {
     const doc = new DOMParser().parseFromString(html, "text/html");
     const regions = doc.querySelectorAll("[data-live]");
     if (!regions.length) { location.reload(); return; } // not a signed-in screen any more
+    const focused = document.activeElement?.id;
+    const oldDecided = [...document.querySelectorAll("#decided-list > li:not(.more)")];
+    const oldMore = document.querySelector("#decided-list > .more");
+    const oldPane = pane();
+    const paneScroll = oldPane?.querySelector(".pane-body")?.scrollTop || 0;
     for (const fresh of regions) {
       const old = document.querySelector(`[data-live="${fresh.dataset.live}"]`);
       if (!old) continue;
@@ -167,36 +303,99 @@ if (typeof document !== "undefined") {
         const slot = fresh.querySelector(`#${CSS.escape(keep.id)}`);
         if (slot) slot.replaceWith(keep);
       }
-      // Rows the owner opened stay open.
+      for (const pick of old.querySelectorAll("select[id]")) { // durations picked but not submitted yet
+        const slot = fresh.querySelector(`select#${CSS.escape(pick.id)}`);
+        if (slot) slot.value = pick.value;
+      }
       const open = new Set([...old.querySelectorAll("details[open][id]")].map((d) => d.id));
       for (const d of fresh.querySelectorAll("details[id]")) if (open.has(d.id)) d.open = true;
+      if (fresh.dataset.live === "pane") {
+        const sameRequest = Boolean(fresh.dataset.id) && fresh.dataset.id === old.dataset.id;
+        const seen = old.querySelector("input[name=digest]")?.value;
+        for (const input of fresh.querySelectorAll("input[name=digest]")) {
+          input.value = digestToSubmit({ background, sameRequest, seen, fresh: input.value });
+        }
+      }
       old.replaceWith(fresh);
     }
+    document.querySelectorAll("form[data-size]").forEach(checkSize); // picks restored above
+    const list = $("decided-list");
+    if (list && oldDecided.length) {
+      const id = (li) => Number(li.querySelector("a")?.id.slice(4));
+      const keep = new Set(keepDecided([...list.querySelectorAll(":scope > li:not(.more)")].map(id), oldDecided.map(id)));
+      const carried = oldDecided.filter((li) => keep.has(id(li)));
+      const freshMore = list.querySelector(":scope > .more");
+      for (const li of carried) freshMore ? freshMore.before(li) : list.append(li);
+      if (carried.length) { // the old list already reached further; its sentinel (or its end) wins
+        freshMore?.remove();
+        if (oldMore) list.append(oldMore);
+        // Shown at once, then reloaded: rows below the first page may have changed (a revoke, or
+        // an older request decided since).
+        reloadDecided(Math.min(...carried.map(id)));
+      }
+    }
+    const main = doc.querySelector("main");
+    if (main?.dataset.view) document.querySelector("main").dataset.view = main.dataset.view;
+    document.title = doc.title;
     for (const k of ["pending", "version"]) document.body.dataset[k] = doc.body.dataset[k] ?? "";
+    toast(doc.getElementById("toast")?.textContent.trim());
+    const freshPane = pane();
+    if (freshPane && oldPane && freshPane.dataset.id === oldPane.dataset.id) {
+      const body = freshPane.querySelector(".pane-body");
+      if (body) body.scrollTop = paneScroll;
+    }
+    markSelected();
     hydrate();
     badge();
-    document.querySelector("#flash-slot .flash")?.focus({ preventScroll: true });
+    watchOlder();
+    const error = document.querySelector("#flash-slot .flash");
+    if (error) error.focus({ preventScroll: true });
+    else if (focused && $(focused)) $(focused).focus({ preventScroll: true });
   }
 
-  // A background refresh is checked again when its response arrives: the owner may have started
-  // typing, opened a confirm or submitted something meanwhile, and a submit's own response
-  // (which bumps `generation`) must never be overwritten by an older page.
-  let generation = 0;
-  async function refresh() {
-    if (!signedIn) return;
-    const started = generation;
-    const resp = await fetch(location.pathname + location.search, { credentials: "same-origin", headers: { Accept: "text/html" } });
-    if (!resp.ok) return;
-    const html = await resp.text();
-    if (started === generation && canRefresh(state())) apply(html);
+  // Replace the Decided rows below the first page, from `oldest` up to (not including) the fresh
+  // first page's last row, with what the server says now. A later redraw supersedes this one.
+  let decidedReload = 0;
+  async function reloadDecided(oldest) {
+    const mine = ++decidedReload;
+    try {
+      const list = $("decided-list");
+      const firstPage = [...list.querySelectorAll(":scope > li:not(.more)")].slice(0, 10);
+      const before = Number(firstPage[firstPage.length - 1]?.querySelector("a")?.id.slice(4));
+      if (!before) return;
+      const resp = await fetch(`/decided?before=${before}&since=${oldest}`, { credentials: "same-origin" });
+      if (!resp.ok || mine !== decidedReload) return;
+      const { html } = await resp.json();
+      const current = $("decided-list");
+      if (mine !== decidedReload || !current) return;
+      const t = document.createElement("template");
+      t.innerHTML = html;
+      const keep = [...current.querySelectorAll(":scope > li:not(.more)")].slice(0, 10);
+      current.replaceChildren(...keep, ...t.content.children);
+      hydrate(current);
+      markSelected();
+      watchOlder();
+    } catch (_) { /* rows stay as they were; the next refresh tries again */ }
   }
 
+  async function load(url) {
+    const resp = await fetch(url, { credentials: "same-origin", headers: { Accept: "text/html" } });
+    if (resp.status === 401) { location.reload(); return null; }
+    return resp.ok ? resp.text() : null;
+  }
+
+  const changed = (el) => el.type === "hidden" || el.type === "submit" ? false
+    : el.matches("select") ? [...el.options].some((o) => o.selected !== o.defaultSelected)
+      : el.type === "checkbox" || el.type === "radio" ? el.checked !== el.defaultChecked : el.value !== el.defaultValue;
+  const typingNow = () => Boolean(document.activeElement?.matches("input:not([type=hidden]),textarea,select,[contenteditable]"));
   const state = () => ({
-    visible: document.visibilityState === "visible", online: navigator.onLine, busy,
-    dialogOpen: Boolean($("confirm")?.open), typing: Boolean(document.activeElement?.matches("input,textarea")),
-    dirty: [...document.querySelectorAll("input[type=text],textarea")].some((i) => i.value !== ""),
+    visible: document.visibilityState === "visible", online: navigator.onLine, busy: pager.busy,
+    dialogOpen: Boolean($("confirm")?.open), typing: typingNow(),
+    dirty: [...document.querySelectorAll("input,textarea,select")].some(changed), // any unsaved choice or text
     secret: Boolean(document.querySelector(".secret")),
   });
+  const pager = createPager({ load, apply: (html, how) => apply(html, how), idle: () => canRefresh(state()) });
+  const refresh = () => (signedIn ? pager.refresh(location.pathname + location.search) : Promise.resolve(false));
 
   let polling = false;
   async function poll() {
@@ -207,15 +406,109 @@ if (typeof document !== "undefined") {
       if (resp.status === 401) { location.reload(); return; } // session ended: show sign-in
       if (!resp.ok) return;
       const { v } = await resp.json();
-      if (v !== document.body.dataset.version && canRefresh(state())) await refresh();
+      if (v !== document.body.dataset.version) await refresh();
     } catch (_) { /* offline or flaky; the next poll tries again */ } finally { polling = false; }
   }
   if (signedIn) setInterval(poll, 10000);
+  if (signedIn) setInterval(() => hydrate(), 30000); // countdowns and "5 min ago" keep moving while idle
   addEventListener("focus", poll);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
     swReady?.then((r) => r.update()).catch(() => {});
     poll();
+  });
+
+  // ----- Requests: the reading pane, Decided paging and the keyboard -----
+  // On wide screens a row opens in the pane without a page load; the URL still follows it. On
+  // phones a request is its own page, so links work as links.
+  // The URL moves once the row has loaded, so a failed load leaves URL and pane together and the
+  // row can be opened again.
+  async function openPane(path) {
+    if (path === location.pathname || pager.busy || $("confirm")?.open) return;
+    try {
+      if (await pager.open(path)) history.pushState(null, "", path);
+    } catch (_) { flash("Couldn't reach the server. Check your connection and try again."); }
+  }
+  document.addEventListener("click", (event) => {
+    const a = event.target.closest("a.item");
+    if (!a || !wide() || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    openPane(a.getAttribute("href"));
+  });
+  addEventListener("popstate", () => {
+    if (page !== "requests" || !isInboxPath(location.pathname)) return;
+    const how = onHistory({ dialogOpen: Boolean($("confirm")?.open), busy: pager.busy });
+    if (how === "reload") { location.reload(); return; }
+    if (how === "cancel-then-open") $("confirm").close(); // the confirm was for the request being left
+    pager.open(location.pathname).catch(() => location.reload());
+  });
+
+  // Decided loads 10 rows at a time as its end scrolls into view (or Older is tapped).
+  let loadingOlder = false, olderFailed = false;
+  async function loadOlder() {
+    const more = document.querySelector("#decided-list > .more");
+    if (!more || loadingOlder || !$("decided")?.open) return;
+    loadingOlder = true;
+    try {
+      const resp = await fetch(`/decided?before=${encodeURIComponent(more.dataset.before)}`, { credentials: "same-origin" });
+      if (!resp.ok) { olderFailed = true; return; }
+      const { html } = await resp.json();
+      const list = $("decided-list"), sentinel = list?.querySelector(":scope > .more");
+      if (!sentinel || sentinel.dataset.before !== more.dataset.before) return; // a refresh moved on meanwhile
+      const t = document.createElement("template");
+      t.innerHTML = html;
+      const have = new Set([...list.querySelectorAll("a.item")].map((a) => a.id));
+      for (const li of [...t.content.children]) {
+        if (!li.classList.contains("more") && !have.has(li.querySelector("a")?.id)) sentinel.before(li);
+      }
+      const next = t.content.querySelector(".more");
+      if (next) sentinel.replaceWith(next); else sentinel.remove();
+      hydrate(list);
+      markSelected();
+      olderFailed = false;
+    } catch (_) {
+      olderFailed = true; // Older stays as a button; scrolling doesn't retry in a loop
+    } finally {
+      loadingOlder = false;
+      watchOlder();
+    }
+  }
+  const olderObserver = "IntersectionObserver" in window
+    ? new IntersectionObserver((entries) => { if (entries.some((x) => x.isIntersecting)) loadOlder(); }) : null;
+  function watchOlder() {
+    if (!olderObserver) return;
+    olderObserver.disconnect();
+    const more = document.querySelector("#decided-list > .more");
+    if (more && !olderFailed) olderObserver.observe(more);
+  }
+  watchOlder();
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest("#decided-list > .more button")) return;
+    olderFailed = false;
+    loadOlder();
+  });
+  document.addEventListener("toggle", (event) => { if (event.target.id === "decided") watchOlder(); }, true);
+
+  document.addEventListener("keydown", (event) => {
+    if (page !== "requests") return;
+    const command = keyCommand(event, typingNow() || Boolean($("confirm")?.open));
+    if (!command) return;
+    if (command === "approve" || command === "reject") {
+      const button = document.querySelector(`.pane-actions button.${command}`);
+      // Not while another row is loading: the pane on screen isn't the one selected.
+      if (!button || button.disabled || pager.busy || pager.loading) return;
+      event.preventDefault();
+      button.click(); // the form's own submit: confirm, one at a time, digest
+      return;
+    }
+    const rows = [...document.querySelectorAll("a.item")].filter((a) => a.offsetParent !== null);
+    const current = document.activeElement?.matches("a.item") ? document.activeElement.id : pane()?.dataset.id || null;
+    const next = $(step(rows.map((a) => a.id), current, command) || "");
+    if (!next) return;
+    event.preventDefault();
+    next.focus();
+    next.scrollIntoView({ block: "nearest" });
+    if (wide()) openPane(next.getAttribute("href"));
   });
 
   // ----- forms: confirm, submit in place, block while offline, stop double submits -----
@@ -237,48 +530,65 @@ if (typeof document !== "undefined") {
 
   document.addEventListener("submit", async (event) => {
     const form = event.target;
-    if (form.method.toLowerCase() !== "post" || form.hasAttribute("data-native") || form.closest("dialog")) return;
+    // Read attributes, not the method and action properties: a field named "action" (Remove on Projects) shadows them.
+    if ((form.getAttribute("method") || "").toLowerCase() !== "post" || form.hasAttribute("data-native") || form.closest("dialog")) return;
     event.preventDefault();
-    if (busy) return; // one submit at a time, or a later response could replace an earlier one (a new key)
+    if (pager.busy) return; // one submit at a time, or a later response could replace an earlier one (a new key)
     if (!navigator.onLine) {
       showOffline(true);
       $("offline").focus?.();
       return;
     }
-    if (form.dataset.confirm && !(await askConfirm(form))) return;
-    if (busy) return; // something else was submitted while the dialog was open
-    const button = form.querySelector("button");
-    const label = button?.textContent;
-    if (button) { button.disabled = true; button.textContent += "…"; }
-    busy = true;
-    generation++; // any background refresh in flight is now stale
-    const removingHere = form.closest("[data-device]")?.dataset.device === thisDevice;
-    try {
-      const resp = await fetch(form.action, { method: "POST", credentials: "same-origin",
-        headers: { Accept: "text/html" }, body: new URLSearchParams(new FormData(form)) });
-      const html = await resp.text();
-      // Sent somewhere else (a request decided from its own screen goes back to the list): go there.
-      // A direct 200 (a new key) and a redirect back here are applied in place.
-      if (resp.redirected && new URL(resp.url).pathname !== location.pathname) { location.replace(resp.url); return; }
-      if (!resp.ok) { flash(errorText(html) || `That didn't save (HTTP ${resp.status}). Reload and try again.`, true); return; }
-      if (removingHere) unsubscribeHere?.(); // the server dropped this device; the browser must too, or it re-registers
-      apply(html);
-    } catch (_) {
-      flash("Couldn't reach the server. Check your connection and try again.", true);
-    } finally {
-      busy = false;
-      if (button && button.isConnected) { button.disabled = false; button.textContent = label; }
+    if (form.dataset.confirm) {
+      pager.claim(); // a row still loading must not replace the pane behind the dialog
+      if (!(await askConfirm(form))) return;
     }
+    const button = form.querySelector("button:not([type=button])"); // not e.g. Copy note
+    const label = button?.textContent;
+    const removingHere = form.closest("[data-device]")?.dataset.device === thisDevice;
+    await pager.submit(async () => { // false if something else was submitted while the dialog was open
+      if (button) { button.disabled = true; button.textContent += "…"; }
+      try {
+        const resp = await fetch(form.getAttribute("action"), { method: "POST", credentials: "same-origin",
+          headers: { Accept: "text/html" }, body: new URLSearchParams(new FormData(form)) });
+        const html = await resp.text();
+        const next = afterSubmit(resp, location.pathname);
+        if (next === "go") { location.replace(resp.url); return; }
+        if (next === "error") { flash(errorText(html) || `That didn't save (HTTP ${resp.status}). Reload and try again.`); return; }
+        if (removingHere) unsubscribeHere?.(); // the server dropped this device; the browser must too, or it re-registers
+        if (next === "swap") history.replaceState(null, "", new URL(resp.url).pathname);
+        apply(html);
+      } catch (_) {
+        flash("Couldn't reach the server. Check your connection and try again.");
+      } finally {
+        if (button && button.isConnected) { button.disabled = false; button.textContent = label; checkSize(button.form); }
+      }
+    });
   });
 
+  // Only offer Approve while the chosen durations fit (see overLimit). Runs when a picker changes,
+  // and after a refresh or a submit, which can restore picks or re-enable the button.
+  function checkSize(form) {
+    if (!form || !form.dataset.size) return;
+    const d = form.dataset;
+    const hours = [...form.elements].filter((el) => el.tagName === "SELECT").map((el) => el.value);
+    const warning = overLimit(Number(d.size), Number(d.perLimit), Number(d.limit), d.policy, hours);
+    // getAttribute: form.id would be the form's hidden "id" input.
+    const slot = $(form.getAttribute("id").replace("approve-", "size-")), button = form.querySelector("button.approve");
+    if (slot) { slot.textContent = warning; slot.hidden = !warning; }
+    if (button) button.disabled = Boolean(warning);
+  }
+  document.addEventListener("change", (event) => checkSize(event.target.form));
+
   document.addEventListener("click", async (event) => {
-    const copy = event.target.closest("#copy-key");
+    const copy = event.target.closest("#copy-key, button.copy");
     if (!copy) return;
+    const target = $(copy.dataset.target);
     try {
-      await navigator.clipboard.writeText($(copy.dataset.target).textContent);
+      await navigator.clipboard.writeText(target.value ?? target.textContent);
       copy.textContent = "Copied";
     } catch (_) {
-      copy.textContent = "Select the key and copy it";
+      copy.textContent = copy.id === "copy-key" ? "Select the key and copy it" : "Select the note and copy it";
     }
   });
 
@@ -306,7 +616,7 @@ if (typeof document !== "undefined") {
 
   // A notification arrived: something changed, so refresh whatever screen is open.
   navigator.serviceWorker?.addEventListener("message", (event) => {
-    if (event.data?.type === "push" && signedIn && canRefresh(state())) refresh().catch(() => {});
+    if (event.data?.type === "push") refresh().catch(() => {});
   });
 
   const status = $("push-status");

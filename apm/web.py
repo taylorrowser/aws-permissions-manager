@@ -21,7 +21,7 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 
-from . import pages, policy, usage
+from . import pages, policy, review, usage
 from .broker import Broker, BrokerError
 from .store import CONNECT_SECONDS, PENDING_LIMIT, Conflict, Store, subscription_id
 
@@ -48,6 +48,8 @@ SESSION_COOKIE = "__Host-apm_session"
 OAUTH_COOKIE = "__Host-apm_oauth"
 SESSION_SECONDS = 30 * 24 * 3600
 WORKOS_API = "https://api.workos.com/user_management"
+MAX_REPLACES = 20  # grants one request may supersede
+EXPIRY_ACTOR = "APM (time limit)"  # who the sweep's audit events name
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -173,9 +175,10 @@ def cookie(name, value, max_age):
 # ---------- the app ----------
 
 class App:
-    def __init__(self, settings, store, broker, http=None):
+    def __init__(self, settings, store, broker, http=None, reviewer=None):
         self.s, self.store, self.broker = settings, store, broker
         self.http = http or _http_json
+        self.reviewer = reviewer  # the optional AI reviewer (review.Reviewer)
 
     def __call__(self, req):
         try:
@@ -209,6 +212,12 @@ class App:
                 raise ApiError(401, "signed out")
             version, pending = state_version(self.store)
             return json_response({"v": version, "pending": pending})
+        if p == "/decided" and m == "GET":
+            # The next page of the Requests screen's Decided list, loaded as it scrolls into view.
+            if not owner:
+                raise ApiError(401, "signed out")
+            num = lambda k: int(v) if (v := req.query.get(k, "")).isdecimal() and len(v) <= 12 else None  # noqa: E731
+            return json_response(pages.decided_page(self, num("before"), num("since")))
         if m == "GET" and SCREENS.fullmatch(p):
             if not owner:
                 here = f"/usage?project={req.query.get('project', '')}" if p == "/usage" else p
@@ -251,9 +260,11 @@ class App:
             r = self.store.get(int(p.rsplit("/", 1)[1]))
             if not r:
                 return Response(404, pages.error_page(self, f"There is no request #{p.rsplit('/', 1)[1]}.", "/"))
-            return Response(200, pages.request_page(self, owner, r, msg, st))
+            return Response(200, pages.inbox(self, owner, st, msg, ("request", r)))
         if p.startswith("/connect/"):
-            return Response(200, pages.connect_page(self, owner, p.rsplit("/", 1)[1], msg))
+            return Response(200, pages.inbox(self, owner, pages.state(self), msg, ("connect", p.rsplit("/", 1)[1])))
+        if p == "/":
+            return Response(200, pages.inbox(self, owner, pages.state(self), msg))
         if p == "/usage":
             project = req.query.get("project", "")
             if not policy.PROJECT_RE.match(project) or project not in self.store.projects():
@@ -262,7 +273,7 @@ class App:
             return Response(200, pages.usage_page(self, owner, project, self.usage(project), st))
         if p in ("/devices", "/keys"):  # old screens (and old notification links): now under Settings
             return redirect("/settings")
-        view = {"/": pages.requests_page, "/projects": pages.projects_page, "/settings": pages.settings_page}[p]
+        view = {"/projects": pages.projects_page, "/settings": pages.settings_page}[p]
         return Response(200, view(self, owner, msg))
 
     # ----- owner auth (WorkOS AuthKit, PKCE) -----
@@ -312,11 +323,13 @@ class App:
                 c = self.store.decide_connect(form.get("code", ""), op == "approve_connect")
                 verb = "Connected" if op == "approve_connect" else "Rejected"
                 return redirect("/?msg=" + _q(f"{verb} agent {c['name']!r}."))
+            if op in ("save_llm_key", "remove_llm_key"):
+                return redirect("/settings?msg=" + _q(self.llm_key(op, form.get("llm_key", ""))))
             if op == "create_key":
                 name = re.sub(r"[^A-Za-z0-9 ._@-]", "", form.get("name", "")).strip()[:40] or "agent"
                 secret = self.store.create_key(name)
                 return Response(200, pages.settings_page(self, owner, f"Created API key {name!r}.", new_key=secret))
-            msg = self.decide(form)
+            msg = self.decide(form, owner)
             # A decided request has nothing left to do on its own page; go back to the list.
             if op in ("approve", "reject") and back.startswith("/requests/"):
                 back = "/"
@@ -324,7 +337,7 @@ class App:
         except (BrokerError, Conflict, ValueError) as e:
             return redirect(back + "?msg=" + _q(f"Error: {e}"))
 
-    def decide(self, form):
+    def decide(self, form, actor="owner"):
         """Grant changes run entirely under the project's lease. The decision is recorded in
         DynamoDB first (conditional, strongly consistent), then the role's policy is rewritten
         from the project's approved requests, so IAM never holds a grant for a request that
@@ -340,50 +353,144 @@ class App:
                 if not r or r["status"] != "pending":
                     return "That request is no longer pending."
                 if r["digest"] != form.get("digest"):
-                    return "That request changed after the page loaded. Review it again."
+                    raise Conflict("this request changed after you opened it. Review it again.")
                 if op == "reject":
                     self.store.set_status(r["id"], "rejected", form.get("note", "")[:500], expect="pending")
                     return f"Rejected request #{r['id']}."
-                self.store.set_status(r["id"], "approved", expect="pending")
+                grants = policy.grants_of(r)
+                hours = {g["n"]: policy.duration(form.get(f"hours-{g['n']}", "0")) for g in grants}  # one picker each
+                approved, replaces = self.store.approved(project), r.get("replaces") or []
+                changes, new, after = self.approval(r, hours, approved)
+                problem = policy.size_problem(project, after)
+                gone = ", ".join(x for x in replaces if x not in _replaced(replaces, approved)[1])  # those still live
+                ids, detail = [r["id"]] + [after["id"] for _, after in changes], f"replaces {gone}" if gone else ""
+                if problem:  # the size check comes first, before anything changes
+                    self.iam_change("approve", project, actor, lambda: _refuse(problem), ids, detail)
+                saved = []
+                try:  # then the grants it replaces are revoked, then it's approved
+                    for change in changes:
+                        self._save(change, f"replaced by #{r['id']}")
+                        saved.append(change)
+                    self.store.set_status(r["id"], "approved", expect="pending", expires_at=new["expires_at"],
+                                          grants=new.get("grants"))
+                except Exception:
+                    self._unsave(saved, approved)  # IAM wasn't touched: put the replaced grants back
+                    raise
+
+                def write():
+                    # Checked again, fresh: a stack may have gained a stored role since the request.
+                    stacks = self._stack_lister()
+                    problems = [_named(r, g, p) for g in grants for p in self.refusals(g["actions"], g["resources"], stacks)]
+                    if problems:
+                        raise BrokerError("refused: " + "; ".join(problems))
+                    return self.broker.sync(project, self.store.approved(project))
                 try:
-                    self.broker.sync(project, self.store.approved(project))
-                except BrokerError:
-                    # Refused before writing anything (e.g. the size limit): safe to undo.
-                    self.store.set_status(r["id"], "pending", expect="approved")
+                    self.iam_change("approve", project, actor, write, ids, detail)
+                except BrokerError as e:
+                    # Refused before writing anything (a refusal, the size limit): safe to undo.
+                    self.store.set_status(r["id"], "pending", expect="approved", expires_at=0, grants=r.get("grants"))
+                    if gone:
+                        raise BrokerError(f"{e}. It's pending again, but the grants it replaces ({gone}) were already "
+                                          f"revoked and IAM may still hold them: open Projects and tap Re-apply "
+                                          f"decisions for {project}.")
                     raise
                 except Exception as e:
                     # The write may or may not have reached IAM (e.g. a timeout after IAM applied
                     # it). Keep the approval recorded; Projects shows the mismatch and re-applies.
                     print(f"IAM sync for {project} failed after approving #{r['id']}: {e!r}")
-                    return (f"Approved request #{r['id']}, but updating IAM failed ({type(e).__name__}). "
+                    return (f"Error: approved request #{r['id']}, but updating IAM failed ({type(e).__name__}). "
                             f"Open Projects and tap Re-apply decisions for {project}.")
-                return f"Approved request #{r['id']} for {project}."
+                also = f" It replaced {gone}." if gone else ""
+                if len(grants) > 1:
+                    return f"Approved request #{r['id']} for {project}: " + ", ".join(
+                        f"grant {n} {'for ' + policy.DURATIONS[h].lower() if h else 'permanently'}" for n, h in hours.items()) + "." + also
+                return f"Approved request #{r['id']} for {project}" + (f" for {policy.DURATIONS[hours[1]]}." if hours[1] else ".") + also
         if op == "revoke":
             project, sid = form["project"], form["sid"]
+            ids, detail = [], ""  # the event names the request only if it belongs to this project
             with self.store.lease(project):
-                if sid.startswith("Req") and sid[3:].isdigit():
-                    r = self.store.get(int(sid[3:]), consistent=True)
-                    if r and r["project"] == project and r["status"] == "approved":
-                        self.store.set_status(r["id"], "revoked", expect="approved")
+                ref = policy.parse_sid(sid)
+                r = self.store.get(ref[0], consistent=True) if ref else None
+                if r and r["project"] == project:
+                    ids = [r["id"]]
+                    # Req<id> on a request with several grants revokes all of them.
+                    n = ref[1] if r.get("grants") else None
+                    if r["status"] == "approved" and (n is None or any(g["n"] == n for g in policy.live_grants(r))):
+                        self._save(_ended(r, None if n is None else [n], "revoked"))
+                        detail = _grant_names(r, [n]) if n else ""
                 # Rewriting from the approved requests drops this grant (and anything else not approved).
                 try:
-                    self.broker.sync(project, self.store.approved(project))
+                    self.iam_change("revoke", project, actor,
+                                    lambda: self.broker.sync(project, self.store.approved(project)), ids, detail)
                 except Exception as e:
                     print(f"IAM sync for {project} failed while revoking {sid}: {e!r}")
                     return (f"Error: recorded the revoke of {sid}, but updating IAM failed ({type(e).__name__}). "
                             f"It may still be active: open Projects and tap Re-apply decisions for {project}.")
             return f"Revoked {sid} from {project}."
+        if op == "extend":
+            project, sid = form["project"], form["sid"]
+            hours = policy.duration(form.get("hours", ""))
+            with self.store.lease(project):
+                ref = policy.parse_sid(sid)
+                r = self.store.get(ref[0], consistent=True) if ref else None
+                g = next((g for g in policy.live_grants(r) if g["sid"] == sid), None) if r and r["project"] == project and r["status"] == "approved" else None
+                if not g:
+                    raise Conflict(f"{sid} is no longer granted to {project}")
+                problems = self.refusals(g["actions"], g["resources"])
+                if problems:
+                    raise BrokerError("refused: " + "; ".join(problems))
+                expires_at = int(time.time()) + hours * 3600 if hours else 0
+                until = f"until {policy.iso(expires_at)}" if hours else "permanently"
+
+                def set_end(end):
+                    if r.get("grants"):
+                        self.store.set_grants(r["id"], [{**x, "expires_at": end} if x["n"] == g["n"] else x for x in r["grants"]])
+                    else:
+                        self.store.set_expiry(r["id"], end)
+                set_end(expires_at)
+                detail = f"{_grant_names(r, [g['n']])} {until}" if r.get("grants") else until
+                try:
+                    self.iam_change("extend", project, actor, lambda: self.broker.sync(project, self.store.approved(project)),
+                                    [r["id"]], detail=detail)
+                except BrokerError:
+                    set_end(g["expires_at"])  # refused before writing: IAM still has the old end
+                    raise
+                except Exception as e:
+                    print(f"IAM sync for {project} failed while extending {sid}: {e!r}")
+                    return (f"Error: couldn't extend {sid}: updating IAM failed ({type(e).__name__}), so it may still "
+                            f"end at the old time. Open Projects and tap Re-apply decisions for {project}.")
+            return f"Extended {sid} on {project} {'for ' + policy.DURATIONS[hours].lower() if hours else 'permanently'}."
+        if op == "narrow":
+            # sid: one grant, or every grant on a Projects row that holds the action or resource.
+            project, sids = form["project"], form["sid"].split()
+            actions, resources = [x for x in [form.get("action", "")] if x], [x for x in [form.get("resource", "")] if x]
+            if len(actions + resources) != 1 or not sids:
+                raise ValueError("name one action or one resource to remove")
+            done = []
+            for sid in sids:
+                try:
+                    out = self.shrink(project, sid, actions, resources, "narrow", actor)
+                except (Conflict, ValueError) as e:
+                    out = {"error": str(e), "message": ""}
+                if out["error"]:
+                    return "Error: " + (" ".join(done) + " Then " if done else "") + out["error"]
+                done.append(out["message"])
+            return " ".join(done)
         if op == "sync_project":
             project = form["project"]
             with self.store.lease(project):
-                self.broker.sync(project, self.store.approved(project))
+                approved = self.store.approved(project)
+                self.iam_change("sync_project", project, actor, lambda: self.broker.sync(project, approved),
+                                [r["id"] for r in approved])
             return f"Re-applied your decisions to {project}."
         if op == "remove_project":
             project = form["project"]
             with self.store.lease(project):
-                for r in self.store.approved(project):
-                    self.store.set_status(r["id"], "revoked", "project removed", expect="approved")
-                self.broker.remove_project(project)
+                approved = self.store.approved(project)
+                for r in approved:
+                    self._save(_ended(r, None, "revoked"), "project removed")
+                self.iam_change("remove_project", project, actor, lambda: self.broker.remove_project(project),
+                                [r["id"] for r in approved])
             return f"Removed project {project} and its role."
         if op == "delete_key":
             self.store.delete_key(form.get("pk", ""))
@@ -392,6 +499,235 @@ class App:
             self.store.remove_device(form.get("pk", ""))
             return "Removed the device from notifications."
         return "Unknown action."
+
+    def llm_key(self, op, value):
+        """Save or remove the AI reviewer's key. The value is never logged, echoed or shown again."""
+        if not self.reviewer:
+            return "Error: this deployment has no AI reviewer."
+        if op == "remove_llm_key":
+            self.reviewer.remove_key()
+            return ("Removed the AI reviewer's key. New requests get no AI review. To add a key again, wait about "
+                    "30 seconds: SSM refuses to recreate a parameter it has just deleted.")
+        value = value.strip()
+        if not 20 <= len(value) <= 500 or not value.isascii() or not value.isprintable() or " " in value:
+            return "Error: that doesn't look like an API key. Paste the whole key, with nothing around it."
+        try:
+            self.reviewer.save_key(value)
+        except Exception as e:
+            print(json.dumps({"event": "llm_key_save_failed", "error": type(e).__name__}))
+            return (f"Error: SSM didn't save the key ({type(e).__name__}). If you removed a key just now, wait about "
+                    "30 seconds and try again.")
+        return "Saved the AI reviewer's key. New requests get an AI review."
+
+    def shrink(self, project, sid, actions, resources, op, actor, why="", agent_key=""):
+        """Drop exactly these actions and resources from one live grant of the project, or the whole
+        grant if neither is given; a grant left with no actions or no resources ends as revoked. It only
+        takes access away, so it needs no approval: the owner's narrow and an agent's remove. Recorded
+        first, then IAM is rewritten, as in a revoke. Raises Conflict if the project doesn't hold sid,
+        ValueError if a name doesn't match exactly. Returns {"request", "message", "ended", "error"}:
+        error says what was already applied if the IAM write failed."""
+        with self.store.lease(project):
+            ref = policy.parse_sid(sid)
+            r = self.store.get(ref[0], consistent=True) if ref else None
+            live = policy.live_grants(r) if r and r["project"] == project and r["status"] == "approved" else []
+            several = bool(r and r.get("grants"))
+            targets = live if several and ref[1] is None else [g for g in live if g["sid"] == sid]
+            if not targets:
+                raise Conflict(f"{sid} isn't a grant {project} holds now; see `apm projects`")
+            if (actions or resources) and several and ref[1] is None:
+                raise ValueError(f"{sid} is a request with several grants; name the one to remove from: "
+                                 + ", ".join(g["sid"] for g in targets))
+            g = targets[0]
+            unknown = [x for x in actions if x not in g["actions"]] + [x for x in resources if x not in g["resources"]]
+            if unknown:
+                raise ValueError(f"{g['sid']} has no {', '.join(unknown)}. Use the exact names `apm projects` shows: "
+                                 f"{', '.join(g['actions'] + g['resources'])}")
+            keep_a = [x for x in g["actions"] if x not in actions]
+            keep_r = [x for x in g["resources"] if x not in resources]
+            what = ", ".join(actions + resources)
+            ended = not (actions or resources) or not keep_a or not keep_r
+            if not (actions or resources):
+                message = f"Removed {sid} from {project}."
+                detail = sid if op == "remove" else ""
+            else:
+                message = f"Removed {what} from {g['sid']} on {project}" + (", which ended it." if ended else ".")
+                detail = f"removed {what}" + (f" from {g['sid']}" if op == "remove" or several else "") + (", ending it" if ended else "")
+            if why:
+                detail += f". Reason: {why}"
+            note = f"removed by {actor}" + (f": {why}" if why else "")
+            if ended:
+                self._save(_ended(r, [t["n"] for t in targets] if several else None, "revoked"), note)
+            elif several:
+                grants = [{**x, "actions": keep_a, "resources": keep_r} if x["n"] == g["n"] else x for x in r["grants"]]
+                self.store.set_scope(r["id"], sorted({a for x in grants for a in x["actions"]}),
+                                     sorted({a for x in grants for a in x["resources"]}), grants)
+            else:
+                self.store.set_scope(r["id"], keep_a, keep_r)
+            out = {"request": r["id"], "message": message, "ended": ended, "error": ""}
+            try:
+                self.iam_change(op, project, actor, lambda: self.broker.sync(project, self.store.approved(project)),
+                                [r["id"]], detail, [agent_key] if agent_key else [])
+            except Exception as e:
+                print(f"IAM sync for {project} failed while removing from {sid}: {e!r}")
+                out["error"] = (f"recorded the removal ({message[:-1]}), but updating IAM failed ({type(e).__name__}), "
+                                f"so it may still be active until the owner re-applies decisions for {project}")
+            return out
+
+    def approval(self, r, hours, approved, now=None):
+        """What approving pending request r, each grant lasting hours[n] (0: permanent), does to its
+        project, given the project's approved requests: (the changes (see _ended) that revoke the grants
+        r replaces, r as approved, and the grants document that results, to size-check; the grants r
+        replaces are left out of it)."""
+        now = int(now or time.time())
+        ends = {n: now + h * 3600 if h else 0 for n, h in hours.items()}
+        if r.get("grants"):
+            new = {**r, "status": "approved", "expires_at": 0, "grants": [{**g, "expires_at": ends[g["n"]]} for g in r["grants"]]}
+        else:
+            new = {**r, "status": "approved", "expires_at": ends[1]}
+        ending = _replaced(r.get("replaces") or [], approved)[0]
+        changes = {old["id"]: _ended(old, ending[old["id"]], "revoked") for old in approved if old["id"] in ending}
+        after = [changes[old["id"]][1] if old["id"] in changes else old for old in approved]
+        return list(changes.values()), new, policy.grants_document(after + [new])
+
+    def iam_change(self, op, project, actor, write, targets=(), detail="", agent_keys=()):
+        """Run `write`, one IAM rewrite of the project's role that returns the policy document it
+        wrote (None if it wrote none), and record exactly one audit event for it, whatever happens:
+        outcome `applied`, `refused` (refused before writing) or `failed` (the write errored, so its
+        effect is unknown). `targets` are the requests the change is for. Re-raises the error. Call
+        it under the project's lease. agent_keys: keys that made the change themselves, named along
+        with the requests' keys."""
+        targets = sorted({int(i) for i in targets})
+        event = {"op": op, "outcome": "applied", "error": "", "project": project, "account": self.broker.account,
+                 "role_arn": policy.role_arn(self.broker.account, project), "targets": targets,
+                 "request_ids": targets, "agent_keys": list(agent_keys), "actor": actor, "at": int(time.time()),
+                 "previous_grants": [], "grants": [], "policy_sha256": ""}
+        if detail:
+            event["detail"] = detail
+        try:
+            # What IAM grants right now, so a grant this write clears traces back to its request.
+            # Without it the event couldn't say what was removed, so nothing is written.
+            try:
+                live = (self.broker.grants(project) or policy.doc())["Statement"]
+            except Exception as e:
+                raise BrokerError(f"couldn't read {project}'s current grants ({type(e).__name__}); "
+                                  "nothing was changed, try again") from e
+            event["previous_grants"] = [s.get("Sid", "") for s in live]
+            event["request_ids"] = sorted(set(targets) | _request_ids(event["previous_grants"]))
+            doc = write()
+            if doc:
+                event["grants"] = [s.get("Sid", "") for s in doc["Statement"]]
+                event["policy_sha256"] = hashlib.sha256(policy.dumps(doc).encode()).hexdigest()
+                event["request_ids"] = sorted(set(event["request_ids"]) | _request_ids(event["grants"]))
+        except Exception as e:
+            event["outcome"] = "refused" if isinstance(e, BrokerError) else "failed"
+            event["error"] = f"{type(e).__name__}: {e}"[:300]
+            raise
+        finally:
+            self._record(event)
+        return doc
+
+    def sweep(self, now=None):
+        """The expiry sweep (EventBridge, every 15 minutes). Expired grants are already dead in IAM
+        (their DateLessThan condition); this tidies up. Per project, under its lease: rewrite IAM
+        without them first, then mark them expired. If IAM fails the table is left alone and the
+        next sweep retries. Safe to repeat: a project with nothing expired isn't touched."""
+        now = int(now or time.time())
+        def due(r):
+            return [g["n"] for g in policy.live_grants(r) if 0 < g["expires_at"] <= now]
+        projects = sorted({r["project"] for r in self.store.list(status="approved") if due(r)})
+        done = {}
+        for project in projects:
+            try:
+                with self.store.lease(project):
+                    approved = self.store.approved(project)
+                    ending = {r["id"]: due(r) for r in approved if due(r)}
+                    if not ending:
+                        continue
+                    after = [_ended(r, ending[r["id"]], "expired") if r["id"] in ending else (None, r) for r in approved]
+                    detail = ", ".join(_grant_names(r, ending[r["id"]]) for r in approved
+                                       if r["id"] in ending and r.get("grants"))
+                    self.iam_change("expire", project, EXPIRY_ACTOR,
+                                    lambda: self.broker.sync(project, [new for _, new in after]), list(ending), detail)
+                    for change in after:
+                        if change[0] is not None:
+                            self._save(change)
+                    done[project] = sorted(ending)
+            except Exception as e:
+                print(json.dumps({"event": "sweep_failed", "project": project, "error": f"{type(e).__name__}: {e}"[:300]}))
+        print(json.dumps({"event": "sweep", "expired": done}))
+        return {"expired": done}
+
+    def _save(self, change, note=""):
+        """Record what _ended worked out: the request's grants, and its status if its last one ended."""
+        (status, grants), r = change
+        if status == "approved":
+            self.store.set_grants(r["id"], grants)
+        else:
+            self.store.set_status(r["id"], status, note, expect="approved", grants=grants)
+
+    def _unsave(self, changes, before):
+        """Undo _save for these changes, back to the requests as they were in `before`."""
+        was = {r["id"]: r for r in before}
+        for (status, _), r in changes:
+            old = was[r["id"]]
+            try:
+                if status == "approved":
+                    self.store.set_grants(r["id"], old["grants"])
+                else:
+                    self.store.set_status(r["id"], "approved", old.get("note", ""), expect=status,
+                                          expires_at=old.get("expires_at", 0), grants=old.get("grants"))
+            except Exception as e:
+                print(json.dumps({"event": "unsave_failed", "request": r["id"], "error": str(e)[:300]}))
+
+    def refusals(self, actions, resources, stacks=None):
+        """Why IAM must not hold this grant (policy.refusals), with stacks listed now."""
+        return policy.refusals(actions, resources, self.broker.account, stacks or self._stack_lister())
+
+    def _stack_lister(self):
+        """broker.stacks, read at most once per region for one check, failures included."""
+        seen = {}
+
+        def stacks(region):
+            if region not in seen:
+                try:
+                    seen[region] = self.broker.stacks(region)
+                except Exception as e:
+                    print(json.dumps({"event": "stack_listing_failed", "region": region, "error": str(e)[:300]}))
+                    seen[region] = e
+            if isinstance(seen[region], Exception):
+                raise seen[region]
+            return seen[region]
+        return stacks
+
+    def flagged(self, project, live=None):
+        """{grant id: reasons} for every approved grant and every statement IAM actually holds (which
+        catches a revoke whose IAM write failed) that would be refused now. live: the IAM document,
+        if the caller already read it. A project with any flagged grant gets no credentials."""
+        grants = [(g["sid"], g["actions"], g["resources"]) for r in self.store.approved(project) for g in policy.live_grants(r)]
+        doc = self.broker.grants(project) if live is None else live
+        grants += [(s.get("Sid", ""), _list(s.get("Action", [])), _list(s.get("Resource", [])))
+                   for s in (doc or policy.doc())["Statement"]]
+        out, stacks = {}, self._stack_lister()
+        for sid, actions, resources in grants:
+            for reason in self.refusals(actions, resources, stacks):
+                out.setdefault(sid, [])
+                if reason not in out[sid]:
+                    out[sid].append(reason)
+        return out
+
+    def _record(self, event):
+        """CloudWatch first, so the event survives a table outage; the table copy feeds History."""
+        try:
+            keys = {r.get("requester") for r in map(self.store.get, event["request_ids"]) if r} | set(event["agent_keys"])
+            event["agent_keys"] = sorted(k for k in keys if k)
+        except Exception as e:
+            print(json.dumps({"event": "audit_keys_failed", "error": str(e)[:300]}))
+        print(json.dumps({"event": "iam_change", **event}))
+        try:
+            self.store.add_event(event)
+        except Exception as e:
+            print(json.dumps({"event": "audit_store_failed", "op": event["op"], "project": event["project"],
+                              "error": str(e)[:300]}))
 
     # ----- notifications -----
 
@@ -480,6 +816,8 @@ class App:
             return json_response({"projects": self.projects(req.query.get("search", ""))})
         if p == "/api/requests" and m == "POST":
             return json_response(self.create_request(req.json(), key), 201)
+        if p == "/api/remove" and m == "POST":
+            return self.remove(req, key)
         if p == "/api/requests" and m == "GET":
             rows = self.store.list(status=req.query.get("status"), project=req.query.get("project"))[:50]
             return json_response({"requests": [_public(r) for r in rows]})
@@ -503,6 +841,12 @@ class App:
             if not policy.PROJECT_RE.match(project):
                 raise ApiError(400, "invalid project name")
             session = "apm-" + re.sub(r"[^\w+=,.@-]", "-", key["name"])
+            flagged = self.flagged(project)
+            if flagged:
+                print(json.dumps({"event": "credentials_refused", "project": project, "key": key["name"],
+                                  "grants": sorted(flagged)}))
+                raise ApiError(403, f"no credentials for {project} until the owner revokes these grants: " + "; ".join(
+                    f"{sid} ({', '.join(reasons)})" for sid, reasons in sorted(flagged.items())))
             try:
                 return json_response(self.broker.credentials(project, session))
             except BrokerError as e:
@@ -539,22 +883,145 @@ class App:
         raise ApiError(404, "unknown endpoint")
 
     def create_request(self, body, key):
-        try:
-            project, actions, resources, reason = policy.validate_request(
-                str(body.get("project", "")), _strs(body.get("actions")), _strs(body.get("resources")),
-                str(body.get("reason", "")))
-        except ValueError as e:
-            raise ApiError(400, str(e))
+        """One request, one reason: either the flat actions/resources/suggested_hours, or grants: [{actions,
+        resources, suggested_hours}] with 1-9 entries, one per resource set. Not both. replaces: Sids of
+        the project's approved grants (Req22, Req52g3) that this request supersedes."""
+        flat = [k for k in ("actions", "resources", "suggested_hours") if body.get(k) is not None]
+        if body.get("grants") is not None:
+            asked = body["grants"]
+            if flat:
+                raise ApiError(400, f"send either grants or {'/'.join(flat)}, not both")
+            if not isinstance(asked, list) or not 1 <= len(asked) <= policy.MAX_GRANTS or \
+                    not all(isinstance(g, dict) for g in asked):
+                raise ApiError(400, f"grants must be a list of 1-{policy.MAX_GRANTS} objects with actions and resources")
+        else:
+            asked = [body]
+        project, reason, grants = str(body.get("project", "")), str(body.get("reason", "")), []
+        for i, g in enumerate(asked, 1):
+            where = f"grant {i}: " if len(asked) > 1 else ""
+            try:
+                project, actions, resources, reason = policy.validate_request(
+                    project, _strs(g.get("actions")), _strs(g.get("resources")), reason)
+            except ValueError as e:
+                raise ApiError(400, where + str(e))
+            suggested = g.get("suggested_hours")
+            if suggested is not None:
+                try:
+                    suggested = policy.duration(suggested)
+                except ValueError as e:
+                    raise ApiError(400, f"{where}suggested_hours: {e}")
+            grants.append({"actions": actions, "resources": resources, "suggested_hours": suggested})
         if len(reason) > 1000:
             raise ApiError(400, "reason is too long (max 1000 characters)")
+        replaces = body.get("replaces") or []
+        replaces = [replaces] if isinstance(replaces, str) else replaces
+        if not isinstance(replaces, list) or len(replaces) > MAX_REPLACES or \
+                any(not isinstance(x, str) or not policy.SID_RE.match(x) for x in replaces):
+            raise ApiError(400, f"replaces must list up to {MAX_REPLACES} grants as `apm projects` names them, e.g. Req22 or Req52g3")
+        replaces = list(dict.fromkeys(replaces))
+        missing = _replaced(replaces, self.store.approved(project))[1] if replaces else []
+        if missing:
+            raise ApiError(400, f"replaces: {', '.join(missing)} isn't a grant {project} holds now; see `apm projects`")
         if self.store.pending_count(key["name"]) >= PENDING_LIMIT:
             raise ApiError(429, f"this API key already has {PENDING_LIMIT} pending requests; wait for the owner")
-        rid = self.store.add(project, actions, resources, reason, key["name"])
-        n = len(actions)
-        self.notify_safely({"title": f"Permission request #{rid}",
-                     "body": f"{project}: {n} action{'s' if n != 1 else ''} to review",
-                     "url": f"/requests/{rid}", "tag": f"req-{rid}"})
+        stacks = self._stack_lister()
+        problems = [(f"grant {i}: " if len(grants) > 1 else "") + p
+                    for i, g in enumerate(grants, 1) for p in self.refusals(g["actions"], g["resources"], stacks)]
+        if problems:
+            raise ApiError(400, "refused: " + "; ".join(problems))
+        if len(grants) > 1:
+            rid = self.store.add(project, [], [], reason, key["name"], grants=grants, replaces=replaces)
+            what = _plural(len(grants), "grant")
+        else:
+            g = grants[0]
+            rid = self.store.add(project, g["actions"], g["resources"], reason, key["name"], g["suggested_hours"],
+                                 replaces=replaces)
+            what = _plural(len(g["actions"]), "action")
+        self.notify_safely({"title": f"Permission request #{rid}", "body": f"{project}: {what} to review",
+                            "url": f"/requests/{rid}", "tag": f"req-{rid}"})
+        self.queue_review(rid)
         return _public(self.store.get(rid))
+
+    # ----- the AI reviewer (optional, advisory; see review.py) -----
+
+    def queue_review(self, rid):
+        """Ask for an AI review of a new request in the background. The request is already saved,
+        so a failure here only means it has no review."""
+        if not self.reviewer:
+            return
+        try:
+            self.reviewer.queue(rid)
+        except Exception as e:
+            print(json.dumps({"event": "review_queue_failed", "request": rid, "error": f"{type(e).__name__}: {e}"[:300]}))
+
+    def review(self, rid):
+        """{"apm_review": <id>}: review one pending request, if a key is set, and store the result.
+        An answer that can't be parsed is logged and dropped: the request shows "No AI review"."""
+        r = self.store.get(rid, consistent=True)  # written just before this invocation was queued
+        if not self.reviewer or not r or r["status"] != "pending" or r.get("review"):
+            return {"reviewed": False}
+        key = self.reviewer.key()
+        if not key:
+            return {"reviewed": False}
+        data = review.model_input(r, self.store.approved(r["project"]),
+                                  lambda grants: pages.LABELS[pages.worst_risk(grants)])
+        try:
+            answer = self.reviewer.ask(key, review.prompt(data))
+        except Exception as e:
+            print(json.dumps({"event": "review_failed", "request": rid, "error": f"{type(e).__name__}: {e}"[:300]}))
+            return {"reviewed": False}
+        found = review.sanitise(answer, len(policy.grants_of(r)))
+        if not found:
+            print(json.dumps({"event": "review_unparseable", "request": rid}))
+            return {"reviewed": False}
+        self.store.set_review(rid, review.stamp(found, self.reviewer.model))
+        print(json.dumps({"event": "review", "request": rid, "verdict": found["verdict"]}))
+        return {"reviewed": True}
+
+    def remove(self, req, key):
+        """An agent drops access it no longer needs: {project, grant: "Req22" | "Req52g3", actions?,
+        resources?, reason}. It only shrinks access, so it applies at once (see shrink). The owner is
+        pushed every attempt, failures included; History names the key and its reason."""
+        project = sid = reason = failure = ""
+        ref, done, actions, resources = None, None, [], []
+        try:
+            body = req.json()
+            project, sid, reason = str(body.get("project", "")), str(body.get("grant", "")), str(body.get("reason", "")).strip()
+            ref, actions, resources = policy.parse_sid(sid), _strs(body.get("actions")), _strs(body.get("resources"))
+            if not policy.PROJECT_RE.match(project):
+                raise ApiError(400, "invalid project name")
+            if not ref:
+                raise ApiError(400, "grant must name one grant as `apm projects` shows it, e.g. Req22 or Req52g3")
+            if not reason or len(reason) > 1000:
+                raise ApiError(400, "a reason is required (max 1000 characters)")
+            done = self.shrink(project, sid, actions, resources, "remove", key["name"], reason, key["name"])
+            failure = done["error"]
+        except ApiError as e:
+            failure = str(e)
+            raise
+        except (Conflict, ValueError) as e:
+            failure = str(e)
+            raise ApiError(409 if isinstance(e, Conflict) else 400, failure)
+        except Exception as e:
+            failure = type(e).__name__
+            raise
+        finally:  # no actions, ARNs or reasons: notifications land on lock screens
+            how = "narrowed" if actions or resources else "removed"
+            if not failure:
+                title, line = f"{key['name']} {how} {sid}", f"{project}: done, no approval needed"
+            elif done:
+                title, line = f"{key['name']} {how} {sid}", f"{project}: but updating IAM failed. Open Projects and re-apply."
+            elif ref and policy.PROJECT_RE.match(project):
+                title, line = f"{key['name']} couldn't remove {sid}", f"{project}: nothing was changed"
+            else:  # don't echo malformed input onto a lock screen
+                title, line = f"{key['name']} couldn't remove access", "Nothing was changed"
+            push = {"title": title, "body": line, "url": f"/requests/{ref[0]}" if done else "/projects",
+                    "tag": f"remove-{time.time_ns()}"}
+            self.notify_safely(push)
+        if failure:
+            return json_response({"error": failure, "request": done["request"]}, 502)
+        return json_response({"project": project, "grant": sid, "request": done["request"], "ended": done["ended"],
+                              "message": done["message"]})
 
     def projects(self, search=""):
         terms = [t.lower() for t in search.split() if t]
@@ -566,10 +1033,11 @@ class App:
             statements = []
             for s in grants["Statement"]:
                 sid = s.get("Sid", "")
-                req = self.store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
+                ref = policy.parse_sid(sid)
+                req = self.store.get(ref[0]) if ref else None
                 statements.append({"grant": sid, "actions": _list(s.get("Action", [])),
                                    "resources": _list(s.get("Resource", [])),
-                                   "reason": req["reason"] if req else ""})
+                                   "reason": req["reason"] if req else "", "expires": policy.expiry(s)})
             item = {"project": project, "grants": statements}
             if all(_matches(t, item) for t in terms):
                 out.append(item)
@@ -588,12 +1056,13 @@ class App:
             return {**out, "error": str(e) or type(e).__name__}
         if services is None:
             return {**out, "preparing": True}
-        reqs = {}
+        reqs = {}  # Sid -> its request, with that grant's own end
         for s in statements:
-            sid = s.get("Sid", "")
-            r = self.store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
+            ref = policy.parse_sid(s.get("Sid", ""))
+            r = self.store.get(ref[0]) if ref else None
             if r and r["project"] == project:
-                reqs[sid] = r
+                g = next((g for g in policy.grants_of(r) if g["sid"] == s["Sid"]), {})
+                reqs[s["Sid"]] = {**r, "expires_at": g.get("expires_at", 0)}
         return {**out, "grants": usage.report(statements, reqs, services, time.time())}
 
 
@@ -615,7 +1084,10 @@ def state_version(store):
     refresh the page every few seconds for nothing. Pages compute this *before* rendering, so a
     change that lands mid-render makes the next poll differ and refresh, never hide it."""
     requests, connects = store.list(), store.connects()
-    state = [[(r["id"], r["status"], r["digest"], r.get("decided_at")) for r in requests],
+    # Per request: anything a row or the reading pane shows. Fields later features add (a review,
+    # an expiry, per-grant state) are read with .get so they count as soon as they exist.
+    state = [[(r["id"], r["status"], r["digest"], r.get("decided_at"), r.get("note"), bool(r.get("review")),
+               r.get("expires_at"), r.get("grants")) for r in requests],
              [(c["code"], c["status"]) for c in connects],
              [k["pk"] for k in store.keys()],
              [(s["pk"], s.get("last_ok_at"), s.get("last_error_at"), s.get("failures")) for s in store.subscriptions()]]
@@ -623,9 +1095,70 @@ def state_version(store):
     return hashlib.sha256(json.dumps(state, default=str).encode()).hexdigest()[:16], pending
 
 
+def _request_ids(sids):
+    return {ref[0] for ref in map(policy.parse_sid, sids) if ref}
+
+
 def _public(r):
-    keep = ("id", "project", "actions", "resources", "reason", "status", "note", "requester", "created_at", "decided_at")
-    return {k: r.get(k) for k in keep}
+    keep = ("id", "project", "actions", "resources", "reason", "status", "note", "requester", "created_at", "decided_at",
+            "suggested_hours", "expires_at")
+    out = {k: r.get(k) for k in keep}
+    if r.get("replaces"):
+        out["replaces"] = r["replaces"]
+    if r.get("grants"):  # several grants: actions and resources above are their union
+        out["grants"] = [{k: g[k] for k in ("n", "sid", "actions", "resources", "suggested_hours", "expires_at", "ended")}
+                         for g in policy.grants_of(r)]
+    return out
+
+
+def _ended(r, ns, how):
+    """((status, grants), r after it): request r with its grants numbered ns (None: all) ended `how`
+    (revoked or expired). A request ends with its last grant: expired if they all expired, else
+    revoked. grants is None for a request with one grant, whose status alone says it ended."""
+    if not r.get("grants"):
+        return (how, None), {**r, "status": how}
+    grants = [{**g, "ended": how} if not g.get("ended") and (ns is None or g["n"] in ns) else g for g in r["grants"]]
+    if any(not g.get("ended") for g in grants):
+        status = "approved"
+    else:
+        status = "expired" if all(g["ended"] == "expired" for g in grants) else "revoked"
+    return (status, grants), {**r, "status": status, "grants": grants}
+
+
+def _refuse(problem):
+    raise BrokerError(problem)
+
+
+def _replaced(sids, approved):
+    """({request id: grant numbers, or None for all of them} of the grants these Sids name that are
+    live in the approved requests, [the Sids that name no live grant]). Req<id> on a request with
+    several grants names all of them, as in a revoke."""
+    found, missing = {}, []
+    for x in sids:
+        ref = policy.parse_sid(x)
+        r = next((r for r in approved if ref and r["id"] == ref[0]), None)
+        live = policy.live_grants(r) if r else []
+        ns = None if live and r.get("grants") and ref[1] is None else [g["n"] for g in live if g["sid"] == x]
+        if ns == []:
+            missing.append(x)
+        elif ns is None or found.get(ref[0], []) is None:
+            found[ref[0]] = None
+        else:
+            found[ref[0]] = sorted(set(found.get(ref[0], []) + ns))
+    return found, missing
+
+
+def _grant_names(r, ns):
+    """How an audit event names grants of a request with several: "grant 2 of #5"."""
+    return f"{'grant' if len(ns) == 1 else 'grants'} {', '.join(map(str, ns))} of #{r['id']}"
+
+
+def _named(r, g, problem):
+    return f"grant {g['n']}: {problem}" if r.get("grants") else problem
+
+
+def _plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
 
 def _strs(v):
@@ -668,6 +1201,8 @@ _app = None
 
 
 def handler(event, context):
+    """API Gateway requests, {"apm_sweep": true} from the EventBridge schedule and {"apm_review": <id>}
+    from the Lambda itself (App.queue_review)."""
     global _app
     if _app is None:
         import boto3
@@ -675,5 +1210,11 @@ def handler(event, context):
         region = os.environ.get("AWS_REGION", "us-east-1")
         table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
         store = Store(table)
-        _app = App(Settings.from_env(), store, Broker(account, region))
+        reviewer = review.lambda_reviewer(context.function_name, os.environ.get("PARAM_PREFIX", "/apm"))
+        _app = App(Settings.from_env(), store, Broker(account, region), reviewer=reviewer)
+    if event.get("apm_sweep") is True:
+        return _app.sweep()
+    if "apm_review" in event:
+        rid = event["apm_review"]
+        return _app.review(rid) if type(rid) is int and rid > 0 else {"reviewed": False}
     return _app(Request.from_lambda(event)).lambda_result()

@@ -79,14 +79,28 @@ class Store:
 
     # ---------- requests ----------
 
-    def add(self, project, actions, resources, reason, requester=""):
+    def add(self, project, actions, resources, reason, requester="", suggested_hours=None, grants=None, replaces=None):
+        """grants: for a request with several grants (2-9), [{"actions", "resources", "suggested_hours"
+        (optional)}]. Each is stored with its number n, its end and whether it ended; the request's
+        own actions and resources are then their union, for listing. replaces: Sids of approved grants
+        of the project that approving this request revokes."""
+        extra = {"suggested_hours": suggested_hours} if suggested_hours is not None else {}
+        if grants:
+            extra = {"grants": [{"n": n, "actions": g["actions"], "resources": g["resources"], "expires_at": 0,
+                                 "ended": "", **({"suggested_hours": g["suggested_hours"]}
+                                                 if g.get("suggested_hours") is not None else {})}
+                                for n, g in enumerate(grants, 1)]}
+            actions = sorted({a for g in grants for a in g["actions"]})
+            resources = sorted({x for g in grants for x in g["resources"]})
+        if replaces:
+            extra["replaces"] = list(replaces)
         rid = int(self.t.update_item(
             Key={"pk": "counter#request"}, UpdateExpression="ADD n :one",
             ExpressionAttributeValues={":one": 1}, ReturnValues="UPDATED_NEW")["Attributes"]["n"])
         self.t.put_item(Item={
             "pk": f"req#{rid}", "kind": "req", "id": rid, "project": project, "actions": actions,
             "resources": resources, "reason": reason, "requester": requester, "status": "pending",
-            "note": "", "created_at": int(time.time()), "decided_at": 0})
+            "note": "", "created_at": int(time.time()), "decided_at": 0, "expires_at": 0, **extra})
         return rid
 
     def get(self, request_id, consistent=False):
@@ -104,23 +118,91 @@ class Store:
                 if r["project"] == project and r["status"] == "approved"]
 
     def projects(self):
-        return sorted({r["project"] for r in self._scan("req") if r["status"] in ("approved", "revoked")})
+        return sorted({r["project"] for r in self._scan("req") if r["status"] in ("approved", "revoked", "expired")})
 
     def pending_count(self, requester):
         return sum(1 for r in self._scan("req") if r["status"] == "pending" and r["requester"] == requester)
 
-    def set_status(self, request_id, status, note="", expect=None):
+    def set_status(self, request_id, status, note="", expect=None, expires_at=None, grants=None):
+        """expires_at: when an approval ends (0 never), set with it. grants: a request's several grants,
+        each with its own end, set with it. None leaves either as it is."""
         kw = {}
         if expect:
             kw = {"ConditionExpression": "#s = :expect", "ExpressionAttributeValues": {":expect": expect}}
         kw.setdefault("ExpressionAttributeValues", {}).update({":s": status, ":n": note, ":t": int(time.time())})
+        update, names = "SET #s = :s, note = :n, decided_at = :t", {"#s": "status"}
+        if expires_at is not None:
+            update += ", expires_at = :x"
+            kw["ExpressionAttributeValues"][":x"] = int(expires_at)
+        if grants is not None:
+            update += ", #g = :g"  # by name: DynamoDB reserves many words
+            kw["ExpressionAttributeValues"][":g"] = grants
+            names["#g"] = "grants"
         try:
-            self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression="SET #s = :s, note = :n, decided_at = :t",
-                               ExpressionAttributeNames={"#s": "status"}, **kw)
+            self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression=update,
+                               ExpressionAttributeNames=names, **kw)
         except Exception as e:
             if getattr(e, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 raise Conflict(f"request #{request_id} is no longer {expect}")
             raise
+
+    def set_expiry(self, request_id, expires_at):
+        """Extend (or shorten) an approved grant. Raises Conflict if it's no longer approved."""
+        try:
+            self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression="SET expires_at = :x",
+                               ConditionExpression="#s = :expect", ExpressionAttributeNames={"#s": "status"},
+                               ExpressionAttributeValues={":x": int(expires_at), ":expect": "approved"})
+        except Exception as e:
+            if getattr(e, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                raise Conflict(f"request #{request_id} is no longer approved")
+            raise
+
+    def set_grants(self, request_id, grants):
+        """Change an approved request's several grants (an end, or one ended) while it stays approved.
+        Raises Conflict if it's no longer approved. When the last grant ends, use set_status."""
+        try:
+            self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression="SET #g = :g",
+                               ConditionExpression="#s = :expect", ExpressionAttributeNames={"#s": "status", "#g": "grants"},
+                               ExpressionAttributeValues={":g": grants, ":expect": "approved"})
+        except Exception as e:
+            if getattr(e, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                raise Conflict(f"request #{request_id} is no longer approved")
+            raise
+
+    def set_scope(self, request_id, actions, resources, grants=None):
+        """Narrow an approved request: its actions and resources, and for one with several grants,
+        the grants they're the union of. Raises Conflict if it's no longer approved."""
+        update, names = "SET #a = :a, #r = :r", {"#s": "status", "#a": "actions", "#r": "resources"}
+        values = {":a": actions, ":r": resources, ":expect": "approved"}
+        if grants is not None:
+            update += ", #g = :g"
+            names["#g"], values[":g"] = "grants", grants
+        try:
+            self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression=update,
+                               ConditionExpression="#s = :expect", ExpressionAttributeNames=names,
+                               ExpressionAttributeValues=values)
+        except Exception as e:
+            if getattr(e, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                raise Conflict(f"request #{request_id} is no longer approved")
+            raise
+
+    def set_review(self, request_id, review):
+        """Store the AI reviewer's opinion of a request (see review.sanitise)."""
+        self.t.update_item(Key={"pk": f"req#{int(request_id)}"}, UpdateExpression="SET #v = :v",
+                           ConditionExpression="attribute_exists(pk)", ExpressionAttributeNames={"#v": "review"},
+                           ExpressionAttributeValues={":v": review})
+
+    # ---------- audit events: one per IAM change (see App.iam_change) ----------
+
+    def add_event(self, event):
+        pk = f"event#{time.time_ns()}#{secrets.token_hex(4)}"
+        self.t.put_item(Item={**event, "pk": pk, "kind": "event"})
+        return pk
+
+    def events(self, request_id=None):
+        """Oldest first; with a request id, only the events that name it."""
+        rows = [e for e in self._scan("event") if request_id is None or int(request_id) in e.get("request_ids", [])]
+        return sorted(rows, key=lambda e: e["pk"])
 
     # ---------- agent API keys (only a hash is stored) ----------
 
@@ -263,5 +345,10 @@ def _view(r):
 
 def digest(r):
     """Fingerprint of what the owner sees, so a request edited after the page loaded can't be approved."""
-    body = json.dumps([r["id"], r["project"], r["actions"], r["resources"], r["reason"]])
+    parts = [r["id"], r["project"], r["actions"], r["resources"], r["reason"]]
+    if r.get("grants"):  # which grant asks for what
+        parts.append([[g["n"], g["actions"], g["resources"]] for g in r["grants"]])
+    if r.get("replaces"):  # which grants approving it revokes
+        parts.append(r["replaces"])
+    body = json.dumps(parts)
     return hashlib.sha256(body.encode()).hexdigest()

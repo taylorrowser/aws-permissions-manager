@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
-from apm import push, web
+from apm import pages, policy, push, web
 from test_apm import ORIGIN, OWNER, make_app, session_cookie
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,7 +46,7 @@ class ScreenTests(Base):
     def test_every_screen_renders_for_the_owner(self):
         rid = self.agent_request()
         for path, heading in [("/", "Requests"), ("/projects", "Projects"), ("/settings", "Settings"),
-                              (f"/requests/{rid}", f"Request #{rid}"), ("/connect/ABCD-EFGH", "Connect an agent")]:
+                              (f"/requests/{rid}", "Requests"), ("/connect/ABCD-EFGH", "Requests")]:
             with self.subTest(path=path):
                 resp = self.get(path)
                 self.assertEqual(resp.status, 200)
@@ -102,8 +102,7 @@ class ScreenTests(Base):
         resp = self.action({"op": "approve", "id": rid, "digest": r["digest"], "back": f"/requests/{rid}"})
         self.assertTrue(resp.headers["Location"].startswith("/?msg=Approved"))
         page = self.get(f"/requests/{rid}").body
-        self.assertIn("This request was", page)
-        self.assertIn("Approved", page)
+        self.assertIn("<p class=status>Approved", page)
         self.assertNotIn(">Approve</button>", page)
 
     def test_missing_request_and_expired_connect(self):
@@ -118,9 +117,9 @@ class ScreenTests(Base):
         body = self.get(f"/requests/{rid}").body
         self.assertIn("every DynamoDB action", body)
         self.assertIn("matches several S3 actions", body)
-        self.assertIn("all resources in the account", body)
+        self.assertIn("Do anything in DynamoDB and read S3 (any Get* action), on every resource", body)
         self.assertIn("Creates the project", body)
-        self.assertIn('class="chip risk-full">Full access<', body)
+        self.assertIn('class="risk risk-full"><span class=dot aria-hidden="true"></span>Full access<', body)
         self.assertIn('data-confirm="Approve full access (dynamodb:*, s3:Get*) for web?"', body)
         narrow = self.agent_request(actions=["s3:GetObject"], reason="read")
         self.assertNotIn("data-confirm", self.get(f"/requests/{narrow}").body)
@@ -128,7 +127,7 @@ class ScreenTests(Base):
                                      body=json.dumps({"project": "web", "actions": ["s3:DeleteObject"],
                                                       "resources": ["*", "arn:aws:s3:::example/*"], "reason": "x"}).encode()))
         body = self.get(f"/requests/{json.loads(mixed.body)['id']}").body
-        self.assertIn('class="chip risk-broad">Broad<', body)
+        self.assertIn('</span>Broad<', body)
         self.assertIn("every resource in the account", body)
         self.assertIn("data-confirm=", body)
 
@@ -150,6 +149,53 @@ class ScreenTests(Base):
         for actions, resources, want in cases:
             self.assertEqual(risk(actions, resources)[0], want, (actions, resources))
 
+    def test_risk_is_graded_per_grant(self):
+        from apm.pages import LABELS, worst_risk
+        read_everything = {"actions": ["s3:ListAllMyBuckets"], "resources": ["*"]}
+        scoped_write = {"actions": ["s3:PutObject"], "resources": ["arn:aws:s3:::b/*"]}
+        self.assertEqual(worst_risk([read_everything, scoped_write]), "write")  # not "broad": each is graded alone
+        self.assertEqual(worst_risk([read_everything]), "read")
+        self.assertEqual(worst_risk([scoped_write, {"actions": ["dynamodb:*"], "resources": ["arn:aws:dynamodb:us-east-1:1:table/t"]}]), "full")
+        self.assertEqual(list(LABELS.values()), ["Read-only", "Scoped write", "Broad", "Full access"])
+
+    def test_plain_english_lines(self):
+        from apm.pages import plain
+        cases = [
+            (["s3:GetObject", "s3:ListBucket"], ["arn:aws:s3:::order-exports", "arn:aws:s3:::order-exports/*"],
+             "Read S3 bucket order-exports"),
+            (["dynamodb:PutItem", "dynamodb:UpdateItem"], ["arn:aws:dynamodb:us-east-1:1:table/orders"], "Write DynamoDB table orders"),
+            (["ecs:UpdateService"], ["arn:aws:ecs:us-east-1:1:service/api"], "Update ECS service api"),
+            (["lambda:InvokeFunction"], ["arn:aws:lambda:us-east-1:1:function:resize"], "Invoke Lambda function resize"),
+            (["s3:DeleteObject"], ["arn:aws:s3:::b/tmp/*"], "Write S3 bucket b (every object matching tmp/*)"),  # not "Delete S3 bucket b"
+            (["sqs:SendMessage"], ["arn:aws:sqs:us-east-1:1:jobs"], "Write SQS queue jobs"),
+            (["dynamodb:*"], ["*"], "Do anything in DynamoDB, on every resource"),
+            (["*"], ["*"], "Do anything in AWS, on every resource"),
+            (["dynamodb:*"], ["arn:aws:dynamodb:us-east-1:1:table/orders"], "Do anything in DynamoDB on table orders"),
+            (["s3:Get*"], ["arn:aws:s3:::b/*"], "Read S3 bucket b (any Get* action)"),
+            (["s3:PutObject"], ["*", "arn:aws:s3:::b/*"], "Write S3, on every resource"),
+            (["s3:PutObject"], ["arn:aws:s3:::logs-*"], "Write S3 on every bucket matching logs-*"),
+            (["s3:GetObject"], ["arn:aws:s3:::*"], "Read S3 on every bucket"),
+            (["dynamodb:GetItem"], ["arn:aws:dynamodb:*:1:table/t"], "Read DynamoDB table t in every region"),
+            (["lambda:InvokeFunction"], ["arn:aws:lambda:us-east-1:*:function:api"], "Invoke Lambda function api in every account"),
+            (["dynamodb:GetItem"], ["arn:aws:dynamodb:*:*:table/t"], "Read DynamoDB table t in every region and account"),
+            (["ec2:*Instances"], ["*"], "Write EC2 (any *Instances action), on every resource"),
+            (["s3:GetObject", "dynamodb:PutItem"], ["arn:aws:s3:::b/*", "arn:aws:dynamodb:us-east-1:1:table/t"],
+             "Read S3 and write DynamoDB on bucket b and table t"),
+            (["s3:GetObject"], [f"arn:aws:s3:::b{i}" for i in range(4)] + ["arn:aws:s3:::x-*"],
+             "Read S3 on 5 resources, including every bucket matching x-*"),
+            (["dynamodb:GetItem"], [f"arn:aws:dynamodb:us-east-1:1:table/{t}" for t in "abc"] + ["arn:aws:dynamodb:*:*:table/d"],
+             "Read DynamoDB on 4 resources, including table d in every region and account"),
+            (["s3:GetObject"], [f"arn:aws:s3:::b/{c}*" for c in "abcd"],
+             "Read S3 on 4 resources, including bucket b (every object matching a*), bucket b (every object matching b*), "
+             "bucket b (every object matching c*) and bucket b (every object matching d*)"),
+            (["iam:PassRole"], ["arn:aws:iam::1:role/agents/apm-web"], "Pass IAM role agents/apm-web"),
+        ]
+        for actions, resources, want in cases:
+            self.assertEqual(plain(actions, resources), want, (actions, resources))
+            # Never understates: wildcards are always said (bucket/* is just the whole bucket).
+            if any("*" in x.removesuffix("/*") for x in actions + resources):
+                self.assertRegex(plain(actions, resources), r"\bevery\b|\bany\b|anything", (actions, resources))
+
     def test_project_label_is_its_riskiest_grant_not_a_mix(self):
         from apm.pages import _worst_chip
         statements = [{"Action": ["s3:ListAllMyBuckets"], "Resource": ["*"]},
@@ -161,10 +207,100 @@ class ScreenTests(Base):
     def test_requests_list_leads_with_project_reason_and_risk(self):
         rid = self.agent_request(actions=["s3:PutObject"], reason="upload the built site")
         body = self.get("/").body
-        row = body[body.index(f'id="req-{rid}"'):body.index("</summary>", body.index(f'id="req-{rid}"'))]
-        for text in ("<b>web</b>", "upload the built site", 'class="chip risk-broad">Broad<', "1 S3 action on all resources"):
+        row = body[body.index(f'id="req-{rid}"'):body.index("</a>", body.index(f'id="req-{rid}"'))]
+        for text in ("<b>web</b>", "upload the built site", "</span>Broad<", "New project"):
             self.assertIn(text, row)
-        self.assertNotIn("s3:PutObject", row)  # details stay folded until the row is opened
+        for gone in ("s3:PutObject", f"#{rid}", "laptop", "action"):  # no number, machine or counts
+            self.assertNotIn(gone, row)
+        self.assertIn('data-view="list"', body)
+        self.assertIn("Select a request", body)  # the reading pane, on wide screens
+
+    def test_the_list_shows_only_what_needs_a_decision(self):
+        self.app.store.add_connect("ci", "ab" * 32, "apm_abcdef")
+        waiting, done = self.agent_request(reason="still waiting"), self.agent_request(reason="already done")
+        r = self.app.store.get(done)
+        self.action({"op": "reject", "id": done, "digest": r["digest"], "back": "/"})
+        body = self.get("/").body
+        waiting_list = body[body.index('<ul class=items aria-label="Waiting">'):body.index("</ul>")]
+        self.assertLess(waiting_list.index('id="connect-'), waiting_list.index(f'id="req-{waiting}"'))  # connects first
+        self.assertNotIn(f'id="req-{done}"', waiting_list)
+        decided = body[body.index("<details class=decided id=decided>"):]
+        self.assertIn(f'id="req-{done}"', decided)
+        self.assertIn("<span class=state>Rejected</span>", decided)
+
+    def test_decided_loads_ten_at_a_time(self):
+        for i in range(23):
+            rid = self.agent_request(reason=f"r{i}")
+            self.action({"op": "reject", "id": rid, "digest": self.app.store.get(rid)["digest"], "back": "/"})
+        body = self.get("/").body
+        self.assertEqual(body.count("<span class=state>Rejected</span>"), 10)
+        self.assertIn('<li class=more data-before="14">', body)
+        page = json.loads(self.get("/decided", query={"before": "14"}).body)
+        self.assertEqual(re.findall(r'id="req-(\d+)"', page["html"]), [str(i) for i in range(13, 3, -1)])
+        self.assertEqual(page["before"], 4)
+        last = json.loads(self.get("/decided", query={"before": "4"}).body)
+        self.assertEqual((re.findall(r'id="req-(\d+)"', last["html"]), last["before"]), (["3", "2", "1"], None))
+        self.assertNotIn("class=more", last["html"])
+        self.assertEqual(self.get("/decided", owner=False).status, 401)
+        # A range the page already loaded comes back whole, as it is now, so a redraw can't leave it stale.
+        self.app.store.set_status(9, "revoked", expect="rejected")
+        reload = json.loads(self.get("/decided", query={"before": "14", "since": "6"}).body)
+        self.assertEqual(re.findall(r'id="req-(\d+)"', reload["html"]), [str(i) for i in range(13, 5, -1)])
+        self.assertIn('id="req-9"><span class=item-top><b>web</b><span class=state>Revoked', reload["html"])
+        self.assertEqual(reload["before"], 6)
+
+    def test_a_request_is_its_own_page_on_phones_and_the_pane_on_wide_screens(self):
+        rid = self.agent_request(actions=["s3:GetObject"], reason="read the exports")
+        body = self.get(f"/requests/{rid}").body
+        self.assertIn('data-view="item"', body)  # phones show the pane, wide screens both
+        self.assertIn(f'<a class=item href="/requests/{rid}" id="req-{rid}" aria-current="true">', body)
+        pane = body[body.index("<section class=pane"):]
+        self.assertIn(f'data-id="req-{rid}"', pane)
+        self.assertIn('<a class=back href="/">Requests</a>', pane)
+        actions = pane[pane.index("<div class=pane-actions>"):]  # Approve and Reject pinned under the scrolling body
+        self.assertIn(f'id="approve-{rid}"', actions)
+        self.assertIn('name="digest"', actions)
+        self.assertIn(f'name="back" value="/requests/{rid}"', actions)
+
+    def test_a_changed_request_is_refused_with_review_it_again(self):
+        rid = self.agent_request()
+        resp = self.action({"op": "approve", "id": rid, "digest": "0" * 64, "back": f"/requests/{rid}"})
+        location = resp.headers["Location"]
+        self.assertTrue(location.startswith(f"/requests/{rid}?msg=Error"), location)
+        self.assertIn("Review+it+again", location)
+        page = self.get(f"/requests/{rid}", query={"msg": parse_qs(urlparse(location).query)["msg"][0]}).body
+        actions = page[page.index("<div class=pane-actions>"):]
+        self.assertIn('class="flash error"', actions)  # inline, next to Approve
+        self.assertIn("Review it again", actions)
+        self.assertIn("<div id=toast class=toast role=status></div>", page)  # not a toast
+        self.assertEqual(self.app.store.get(rid)["status"], "pending")
+
+    def test_success_is_a_toast(self):
+        rid = self.agent_request()
+        resp = self.action({"op": "reject", "id": rid, "digest": self.app.store.get(rid)["digest"], "back": f"/requests/{rid}"})
+        page = self.get("/", query={"msg": parse_qs(urlparse(resp.headers["Location"]).query)["msg"][0]}).body
+        self.assertIn(f"<div id=toast class=toast role=status>Rejected request #{rid}.</div>", page)
+        self.assertNotIn('class="flash', page)
+
+    def test_history_sits_under_details_unless_an_iam_change_failed(self):
+        rid = self.agent_request()
+        self.action({"op": "approve", "id": rid, "digest": self.app.store.get(rid)["digest"], "back": "/"})
+        page = self.get(f"/requests/{rid}").body
+        details = page[page.index(f'<details class=more id="details-{rid}">'):page.index("</details>", page.index("details-"))]
+        self.assertIn("<h3>History</h3>", details)
+        self.iam.put_role_policy = mock.Mock(side_effect=RuntimeError("throttled"))
+        self.action({"op": "sync_project", "project": "web", "back": "/projects"})
+        page = self.get(f"/requests/{rid}").body
+        details = page[page.index(f'<details class=more id="details-{rid}">'):page.index("</details>", page.index("details-"))]
+        self.assertNotIn("<h3>History</h3>", details)
+        self.assertIn("Re-apply failed", page[page.index("</details>", page.index("details-")):])
+
+    def test_resource_policy_actions_are_labelled(self):
+        rid = self.agent_request(actions=["s3:PutBucketPolicy"])
+        self.assertIn("Can grant anyone anything on every resource it covers.", self.get(f"/requests/{rid}").body)
+        from apm.policy import resource_policy_actions
+        self.assertEqual(resource_policy_actions(["kms:*"]), ["kms:PutKeyPolicy", "kms:CreateGrant"])
+        self.assertEqual(resource_policy_actions(["s3:GetObject", "sqs:SendMessage"]), [])
 
     def test_reason_and_names_are_escaped(self):
         rid = self.agent_request(reason="<script>alert(1)</script>")
@@ -199,6 +335,9 @@ class ScreenTests(Base):
         css = (ROOT / "apm" / "static" / "app.css").read_text()
         for bad in ("position:fixed", "position:sticky", "100vh", "100dvh"):
             self.assertNotIn(bad, css)  # these move with the page on iOS; the body never scrolls instead
+        js = (ROOT / "apm" / "static" / "app.js").read_text()
+        for bad in ("form.action", "form.method"):  # a field named "action" (Remove on Projects) shadows them
+            self.assertNotIn(bad, js)
 
     def test_empty_states(self):
         self.assertIn("Nothing waiting", self.get("/").body)
@@ -522,3 +661,73 @@ class ServiceWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProjectsScreenTests(unittest.TestCase):
+    """Projects: a summary line, then grants by service in rows of the same resources and time limit."""
+    BUCKET = ["arn:aws:s3:::exports", "arn:aws:s3:::exports/*"]
+    TABLE = ["arn:aws:dynamodb:us-east-1:111122223333:table/orders"]
+    LATER = {"DateLessThan": {"aws:CurrentTime": "2030-01-01T00:00:00Z"}}
+
+    def stmt(self, sid, actions, resources, condition=None):
+        return {"Sid": sid, "Effect": "Allow", "Action": actions, "Resource": resources,
+                **({"Condition": condition} if condition else {})}
+
+    def test_the_summary_says_what_a_project_changes_and_reads(self):
+        summary = pages.project_summary
+        self.assertEqual(summary([]), "No access.")
+        self.assertEqual(summary([self.stmt("Req1", ["s3:GetObject"], self.BUCKET)]), "Reads S3.")
+        self.assertEqual(summary([self.stmt("Req1", ["s3:GetObject", "dynamodb:PutItem", "logs:Get*"], ["*"]),
+                                  self.stmt("Req2", ["s3:PutObject"], self.BUCKET)]),
+                         "Changes DynamoDB and S3. Reads CloudWatch Logs.")
+        self.assertEqual(summary([self.stmt("Req1", ["s3:List*", "dynamodb:*"], ["*"])]), "Changes DynamoDB. Reads S3.")
+        self.assertEqual(summary([self.stmt("Req1", ["*"], ["*"]), self.stmt("Req2", ["s3:GetObject"], ["*"])]),
+                         "Changes everything.")
+
+    def test_grants_group_by_service_and_merge_on_resources_and_time_limit(self):
+        rows = pages.service_rows("app", [
+            self.stmt("Req1", ["s3:GetObject", "dynamodb:GetItem"], self.BUCKET + self.TABLE),
+            self.stmt("Req2", ["s3:PutObject"], list(reversed(self.BUCKET + self.TABLE))),  # same set: same row
+            self.stmt("Req3", ["s3:DeleteObject"], self.BUCKET + self.TABLE, self.LATER),  # another time limit
+            self.stmt("Req4", ["*"], ["*"]),
+        ])
+        self.assertEqual([service for service, _ in rows], ["*", "dynamodb", "s3"])
+        s3 = rows[2][1]
+        self.assertEqual([r["actions"] for r in s3], [["s3:GetObject", "s3:PutObject"], ["s3:DeleteObject"]])
+        self.assertEqual([[s["Sid"] for s, _ in r["parts"]] for r in s3], [["Req1", "Req2"], ["Req3"]])
+        self.assertEqual(s3[1]["ends"], "2030-01-01T00:00:00Z")
+        self.assertEqual(rows[1][1][0]["actions"], ["dynamodb:GetItem"])  # a grant splits across services
+
+    def test_row_ids_come_from_what_the_row_covers_not_its_grants(self):
+        row_id = pages.row_id
+        self.assertEqual(row_id("app", "s3", self.BUCKET, ""), row_id("app", "s3", list(reversed(self.BUCKET)), ""))
+        ids = {row_id("app", "s3", self.BUCKET, ""), row_id("app", "s3", self.BUCKET, "2030-01-01T00:00:00Z"),
+               row_id("app", "s3", self.BUCKET[:1], ""), row_id("app", "sqs", self.BUCKET, ""),
+               row_id("web", "s3", self.BUCKET, "")}
+        self.assertEqual(len(ids), 5)
+        before = pages.service_rows("app", [self.stmt("Req1", ["s3:GetObject"], self.BUCKET),
+                                            self.stmt("Req2", ["s3:PutObject"], self.BUCKET)])
+        after = pages.service_rows("app", [self.stmt("Req2", ["s3:PutObject"], self.BUCKET)])  # Req1 revoked
+        self.assertEqual(before[0][1][0]["id"], after[0][1][0]["id"])
+
+    def test_a_statement_apm_did_not_write_is_built_in_and_has_no_controls(self):
+        app, iam, _ = make_app()
+        iam.policies[("apm-app", "apm-grants")] = {"Version": "2012-10-17", "Statement": [
+            self.stmt("SharedRead", ["s3:GetObject"], self.BUCKET)]}
+        with mock.patch.object(app.store, "projects", return_value=["app"]):
+            page = app(web.Request("GET", "/projects", cookies=session_cookie(app))).body
+        self.assertIn("<span class=badge>built in</span> <code>SharedRead</code>", page)
+        self.assertNotIn('value="narrow"', page)
+        self.assertNotIn('value="revoke"', page)
+        self.assertIn('href="/usage?project=app"', page)  # the usage audit, from Project details
+
+    def test_a_flagged_grant_iam_never_got_keeps_its_time_limit_and_row(self):
+        app, iam, _ = make_app()
+        rid = app.store.add("app", ["s3:GetObject"], self.BUCKET, "read exports", "laptop")
+        app.decide({"op": "approve", "id": str(rid), "digest": app.store.get(rid)["digest"], "hours-1": "3"})
+        ends = policy.iso(app.store.get(rid)["expires_at"])
+        iam.policies.clear()  # IAM lost it, and it would be refused now
+        with mock.patch.object(app, "flagged", return_value={f"Req{rid}": ["refused for the test"]}):
+            page = app(web.Request("GET", "/projects", cookies=session_cookie(app))).body
+        self.assertIn(f'id="{pages.row_id("app", "s3", self.BUCKET, ends)}"', page)
+        self.assertIn("data-ends", page)

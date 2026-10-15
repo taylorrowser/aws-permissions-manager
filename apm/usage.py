@@ -49,7 +49,7 @@ def grant_usage(stmt, request, index, now):
     cutoff = now - UNUSED_DAYS * 86400
     return {"grant": stmt.get("Sid", ""), "resources": _list(stmt.get("Resource", [])), "actions": actions,
             "last_used": last, "unused": (last is None or last < cutoff) and granted is not None and granted <= cutoff,
-            "granted_at": granted, "expires_at": (request or {}).get("expires_at"),
+            "granted_at": granted, "expires_at": (request or {}).get("expires_at") or None,
             "request": request["id"] if request else None, "reason": request["reason"] if request else "",
             "requester": request.get("requester", "") if request else ""}
 
