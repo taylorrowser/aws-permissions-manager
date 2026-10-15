@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -388,11 +389,11 @@ class GrantConsistencyTests(unittest.TestCase):
         real = self.app.store.set_status
         calls = []
 
-        def flaky(rid, status, note="", expect=None):
+        def flaky(rid, status, note="", expect=None, **kw):
             calls.append(status)
             if status == "approved":
                 raise RuntimeError("dynamodb down")
-            return real(rid, status, note, expect)
+            return real(rid, status, note, expect, **kw)
         self.app.store.set_status = flaky
         with self.assertRaises(RuntimeError):
             self.approve(r)
@@ -590,6 +591,97 @@ class AuditTests(unittest.TestCase):
         self.assertEqual([l["event"] for l in lines], ["iam_change", "audit_store_failed"])
         self.assertEqual(lines[0]["outcome"], "applied")
         self.assertEqual(self.app.broker.grants("myapp")["Statement"][0]["Sid"], "Req1")
+
+
+class TimeLimitTests(unittest.TestCase):
+    """Time-limited grants: IAM ends them by a condition; the sweep tidies them away."""
+
+    def setUp(self):
+        self.app, self.iam, _ = make_app()
+        self.key = self.app.store.create_key("laptop")
+
+    def ask(self, **extra):
+        body = {"project": "myapp", "actions": ["s3:GetObject"], "reason": "x", **extra}
+        resp = self.app(web.Request("POST", "/api/requests", headers={"Authorization": f"Bearer {self.key}"},
+                                    body=json.dumps(body).encode()))
+        return resp.status, json.loads(resp.body)
+
+    def approve(self, rid, hours):
+        r = self.app.store.get(rid)
+        return self.app.decide({"op": "approve", "id": str(rid), "digest": r["digest"], "hours-1": str(hours)}, "owner")
+
+    def statements(self):
+        doc = self.iam.policies.get(("apm-myapp", "apm-grants"))
+        return {s["Sid"]: s for s in doc["Statement"]} if doc else {}
+
+    def test_the_owner_picks_the_duration_and_the_condition_is_written(self):
+        self.assertEqual(self.ask(suggested_hours=2)[0], 400)
+        status, r = self.ask(suggested_hours=3)
+        self.assertEqual((status, r["suggested_hours"]), (201, 3))
+        page = self.app(web.Request("GET", f"/requests/{r['id']}", cookies=session_cookie(self.app))).body
+        self.assertIn(f'<select name="hours-1" form="approve-{r["id"]}"', page)
+        self.assertIn('<option value="3" selected>3 hours (suggested)</option>', page)
+        self.assertEqual(self.approve(r["id"], 24), "Approved request #1 for myapp for 1 day.")
+        end = self.app.store.get(r["id"])["expires_at"]
+        self.assertAlmostEqual(end, time.time() + 24 * 3600, delta=5)
+        self.assertEqual(self.statements()["Req1"]["Condition"], {"DateLessThan": {"aws:CurrentTime": policy.iso(end)}})
+        self.approve(self.ask()[1]["id"], 0)  # permanent: no condition
+        self.assertNotIn("Condition", self.statements()["Req2"])
+        self.assertTrue(self.app.broker.in_sync("myapp", self.app.store.approved("myapp")))
+
+    def test_the_sweep_removes_expired_grants_then_records_them_and_is_idempotent(self):
+        self.approve(self.ask()[1]["id"], 1)
+        self.approve(self.ask()[1]["id"], 0)
+        later = time.time() + 2 * 3600
+        self.assertEqual(self.app.sweep(later), {"expired": {"myapp": [1]}})
+        self.assertEqual(list(self.statements()), ["Req2"])
+        self.assertEqual(self.app.store.get(1)["status"], "expired")
+        ev = self.app.store.events()[-1]
+        self.assertEqual((ev["op"], ev["outcome"], ev["actor"], ev["request_ids"], ev["grants"]),
+                         ("expire", "applied", "APM (time limit)", [1, 2], ["Req2"]))  # every live grant, as for any write
+        before = (len(self.app.store.events()), repr(sorted(self.iam.policies.items())))
+        self.assertEqual(self.app.sweep(later), {"expired": {}})
+        self.assertEqual((len(self.app.store.events()), repr(sorted(self.iam.policies.items()))), before)
+        page = self.app(web.Request("GET", "/", cookies=session_cookie(self.app))).body
+        self.assertIn(f'Expired <time datetime="{policy.iso(self.app.store.get(1)["expires_at"])}"', page)
+
+    def test_iam_failing_during_the_sweep_changes_nothing_and_the_next_sweep_retries(self):
+        self.approve(self.ask()[1]["id"], 1)
+        written = repr(self.iam.policies)
+        self.iam.delete_role_policy = mock.Mock(side_effect=RuntimeError("throttled"))
+        later = time.time() + 2 * 3600
+        with mock.patch("builtins.print"):
+            self.assertEqual(self.app.sweep(later), {"expired": {}})
+        self.assertEqual(self.app.store.get(1)["status"], "approved")
+        self.assertEqual(repr(self.iam.policies), written)
+        self.assertEqual([(e["op"], e["outcome"]) for e in self.app.store.events()][-1], ("expire", "failed"))
+        del self.iam.delete_role_policy
+        self.assertEqual(self.app.sweep(later), {"expired": {"myapp": [1]}})
+        self.assertEqual((self.statements(), self.app.store.get(1)["status"]), ({}, "expired"))
+
+    def test_extend_and_a_failed_extend_is_reported(self):
+        self.approve(self.ask()[1]["id"], 1)
+        page = self.app(web.Request("GET", "/projects", cookies=session_cookie(self.app))).body
+        self.assertIn("Revoke early", page)
+        self.assertIn('name="op" value="extend"', page)
+        self.assertEqual(self.app.decide({"op": "extend", "project": "myapp", "sid": "Req1", "hours": "0"}, "owner"),
+                         "Extended Req1 on myapp permanently.")
+        self.assertNotIn("Condition", self.statements()["Req1"])
+        self.assertEqual(self.app.store.get(1)["expires_at"], 0)
+        ev = self.app.store.events()[-1]
+        self.assertEqual((ev["op"], ev["outcome"], ev.get("detail")), ("extend", "applied", "permanently"))
+        self.iam.put_role_policy = mock.Mock(side_effect=TimeoutError("read timed out"))
+        msg = self.app.decide({"op": "extend", "project": "myapp", "sid": "Req1", "hours": "3"}, "owner")
+        self.assertTrue(msg.startswith("Error: couldn't extend Req1"), msg)
+        self.assertEqual(self.app.store.events()[-1]["outcome"], "failed")
+        del self.iam.put_role_policy
+        page = self.app(web.Request("GET", "/projects", cookies=session_cookie(self.app))).body
+        self.assertIn("match your decisions", page)  # IAM still has no end; Re-apply fixes it
+
+    def test_the_schedule_invokes_the_sweep(self):
+        with mock.patch.object(web, "_app", self.app), mock.patch.object(self.app, "sweep", return_value={"expired": {}}) as sweep:
+            self.assertEqual(web.handler({"apm_sweep": True}, None), {"expired": {}})
+        sweep.assert_called_once_with()
 
 
 class PushTests(unittest.TestCase):
@@ -1135,8 +1227,9 @@ class ClientTests(unittest.TestCase):
 
     def test_cli(self):
         run = lambda *a: subprocess.run([self.python, str(CLIENT), *a], env=self.env, capture_output=True, text=True)
-        r = run("request", "--project", "web", "-a", "s3:GetObject", "--reason", "read")
+        r = run("request", "--project", "web", "-a", "s3:GetObject", "--reason", "read", "--for", "3h")
         self.assertIn("Request #1", r.stdout)
+        self.assertEqual(self.app.store.get(1)["suggested_hours"], 3)
         self.assertIn("pending", run("status").stdout)
         self.approve_all()
         self.assertEqual(run("wait", "1", "--timeout", "5").returncode, 0)

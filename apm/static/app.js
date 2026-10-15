@@ -53,6 +53,11 @@ function legacyTarget(hash) {
 
 function relativeTime(date, now) {
   const minutes = Math.round((now - date) / 60000);
+  if (minutes < 0) { // a grant's end: a countdown
+    const left = -minutes, hours = Math.floor(left / 60);
+    if (hours >= 48) return `in ${Math.round(hours / 24)} days`;
+    return hours ? `in ${hours} h${left % 60 ? ` ${left % 60} min` : ""}` : `in ${left} min`;
+  }
   if (minutes < 1) return "just now";
   if (minutes < 60) return `${minutes} min ago`;
   const sameDay = date.toDateString() === now.toDateString();
@@ -285,6 +290,10 @@ if (typeof document !== "undefined") {
       for (const keep of old.querySelectorAll("[data-keep]")) {
         const slot = fresh.querySelector(`#${CSS.escape(keep.id)}`);
         if (slot) slot.replaceWith(keep);
+      }
+      for (const pick of old.querySelectorAll("select[id]")) { // durations picked but not submitted yet
+        const slot = fresh.querySelector(`select#${CSS.escape(pick.id)}`);
+        if (slot) slot.value = pick.value;
       }
       const open = new Set([...old.querySelectorAll("details[open][id]")].map((d) => d.id));
       for (const d of fresh.querySelectorAll("details[id]")) if (open.has(d.id)) d.open = true;

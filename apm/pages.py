@@ -218,9 +218,11 @@ def error_page(app, text, back="/"):
 # are separate pages. Both URLs render the same two panes; data-view says which one a phone shows.
 
 def grants_of(r):
-    """The grants a request asks for, each {"actions", "resources"}. Everything on the card is per
+    """The grants a request asks for, each {"n", "actions", "resources", "suggested_hours" (None if
+    the agent didn't suggest a duration), "expires_at" (0: never)}. Everything on the card is per
     grant: requests carry one today, and a request with several returns one entry per grant here."""
-    return [{"actions": r["actions"], "resources": r["resources"]}]
+    return [{"n": 1, "actions": r["actions"], "resources": r["resources"],
+             "suggested_hours": r.get("suggested_hours"), "expires_at": r.get("expires_at", 0)}]
 
 
 def worst_risk(grants):
@@ -241,7 +243,7 @@ def inbox(app, owner, st, msg="", item=None):
     """The Requests screen. item: None (the list), ("request", r) or ("connect", code)."""
     store = app.store
     requests, connects = store.list(), store.connects()
-    projects = {r["project"] for r in requests if r["status"] in ("approved", "revoked")}  # as store.projects()
+    projects = {r["project"] for r in requests if r["status"] in ("approved", "revoked", "expired")}  # as store.projects()
     pending = [r for r in requests if r["status"] == "pending"]
     error, toast = _split(msg)
     kind, it = item or (None, None)
@@ -291,7 +293,15 @@ def _connect_row(c, selected):
 
 DECIDED_PAGE = 10
 DECIDED_RELOAD = 500  # most rows one reload of an already-loaded range returns
-STATUS_WORDS = {"approved": "Approved", "rejected": "Rejected", "revoked": "Revoked"}
+STATUS_WORDS = {"approved": "Approved", "rejected": "Rejected", "revoked": "Revoked", "expired": "Expired"}
+
+
+def _status(r):
+    """What happened to a decided request, and when: a request whose grants all expired is dated by
+    when they ended, anything else by its decision."""
+    if r["status"] == "expired":
+        return "Expired", max(g["expires_at"] for g in grants_of(r))
+    return STATUS_WORDS.get(r["status"], r["status"]), r["decided_at"]
 
 
 def decided_rows(requests, before=None, selected="", since=None):
@@ -302,8 +312,9 @@ def decided_rows(requests, before=None, selected="", since=None):
     rows = []
     for r in page:
         current = ' aria-current="true"' if selected == f"req-{r['id']}" else ""
+        word, when = _status(r)
         rows.append(f'<li><a class=item href="/requests/{r["id"]}" id="req-{r["id"]}"{current}><span class=item-top>'
-                    f'<b>{e(r["project"])}</b><span class=state>{e(STATUS_WORDS.get(r["status"], r["status"]))}</span></span>'
+                    f'<b>{e(r["project"])}</b><span class=state>{e(word)}{" " + _time(when) if r["status"] == "expired" else ""}</span></span>'
                     f'<span class=reason>{e(r["reason"])}</span></a></li>')
     return "".join(rows), (page[-1]["id"] if page and len(done) > len(page) else None)
 
@@ -431,14 +442,30 @@ def _scope_notes(actions, resources):
     return notes
 
 
-def _grant_card(g):
-    """One grant: the plain line and its risk, what it means, then the exact actions and ARNs."""
+def _durations(name, selected, suggested=None, form="", ident=""):
+    """A duration picker (policy.DURATIONS). form: the id of the form it submits with."""
+    opts = "".join(f'<option value="{h}"{" selected" if h == selected else ""}>{e(label)}'
+                   f'{" (suggested)" if h == suggested else ""}</option>' for h, label in policy.DURATIONS.items())
+    attrs = (f' form="{e(form)}"' if form else "") + (f' id="{e(ident)}"' if ident else "")
+    return f'<select name="{e(name)}"{attrs}>{opts}</select>'
+
+
+def _grant_card(g, form=""):
+    """One grant: the plain line and its risk, what it means, then the exact actions and ARNs. form:
+    the Approve form's id while the request is pending, which the grant's duration picker joins."""
     actions, resources = g["actions"], g["resources"]
     notes = _scope_notes(actions, resources)
+    if form:
+        suggested, name = g["suggested_hours"], "hours-%d" % g["n"]
+        lasts = f'<label class=lasts>For {_durations(name, suggested or 0, suggested, form, f"{form}-{name}")}</label>'
+    elif g["expires_at"]:
+        lasts = f'<p class=lasts>{"Ends" if g["expires_at"] > time.time() else "Ended"} {_time(g["expires_at"])}</p>'
+    else:
+        lasts = ""
     return (f'<section class=grant><p class=grant-head><span class=plain>{e(plain(actions, resources))}</span>'
             f'{_level_label(risk(actions, resources)[0])}</p>'
             + ('<ul class=notes>' + "".join(f"<li>{n}</li>" for n in notes) + "</ul>" if notes else "")
-            + f'<ul class=codes>{_codes(actions)}</ul><ul class=codes>{_codes(resources)}</ul></section>')
+            + f'<ul class=codes>{_codes(actions)}</ul><ul class=codes>{_codes(resources)}</ul>{lasts}</section>')
 
 
 def request_pane(app, r, projects, error=""):
@@ -452,14 +479,15 @@ def request_pane(app, r, projects, error=""):
            f'<header class=pane-head><h2 id=pane-title>{e(project)}</h2>{_badges(_kinds(r, projects))}</header>'
            f'<p class=reason>{e(r["reason"])}</p>']
     if not pending:
-        out.append(f'<p class=status>{e(STATUS_WORDS.get(r["status"], r["status"]))} {_time(r["decided_at"])}'
+        word, when = _status(r)
+        out.append(f'<p class=status>{e(word)} {_time(when)}'
                    + (f'. {e(r["note"])}' if r.get("note") else "")
                    + ('. See it in <a href="/projects">Projects</a>.' if r["status"] == "approved" else "") + "</p>")
         out.append(f'<div id=flash-slot>{_flash(error)}</div>')
-    out += [_grant_card(g) for g in grants]
+    out += [_grant_card(g, f"approve-{rid}" if pending else "") for g in grants]
     if project not in projects and pending:
         out.append(f'<p class=note>Creates the project and its role <code>{e(policy.role_name(project))}</code>.</p>')
-    stmt = policy.statement(rid, r["actions"], r["resources"])
+    stmt = policy.statement(rid, r["actions"], r["resources"], r.get("expires_at", 0))
     out.append(f'<details class=more id="details-{rid}"><summary>Details</summary><dl class=meta>'
                f'<dt>From</dt><dd>{e(r.get("requester") or "unknown")}</dd><dt>Asked</dt><dd>{_time(r["created_at"])}</dd>'
                f'<dt>Role</dt><dd><code>{e(policy.role_name(project))}</code></dd></dl>'
@@ -501,7 +529,8 @@ def connect_pane(c, code, error=""):
 
 # What each IAM change is called in a request's History: (done, attempted).
 EVENT_LABELS = {"approve": ("Approved", "Approval"), "revoke": ("Revoked", "Revoke"),
-                "sync_project": ("Re-applied", "Re-apply"), "remove_project": ("Project deleted", "Project deletion")}
+                "sync_project": ("Re-applied", "Re-apply"), "remove_project": ("Project deleted", "Project deletion"),
+                "expire": ("Expired", "Expiry"), "extend": ("Extended", "Extension")}
 
 
 def history(rid, events):
@@ -537,9 +566,19 @@ def _grant(project, s, store, reasons=()):
            else f'<p class=muted>Grant <code>{e(sid)}</code></p>')
     blocked = ('<span class=badge>Blocked</span>' if reasons else "")
     notes = ('<ul class=notes>' + "".join(f"<li>{e(x)}</li>" for x in reasons) + "</ul>" if reasons else "")
+    ends = req.get("expires_at", 0) if req and req["status"] == "approved" else 0
+    extend = ""
+    if ends:  # a countdown, and Extend: a new duration from now, or permanent
+        why += f'<p class=muted>{"Ends" if ends > time.time() else "Ended"} {_time(ends)}</p>'
+        extend = ('<form method="post" action="/action" class=extend>'
+                  + "".join(f'<input type="hidden" name="{k}" value="{e(v)}">'
+                            for k, v in (("op", "extend"), ("project", project), ("sid", sid), ("back", "/projects")))
+                  + f'<label class=sr-only for="extend-{e(sid)}">New duration from now</label>'
+                  + _durations("hours", 1, ident=f"extend-{sid}")
+                  + '<button class=small>Extend</button></form>')
     return (f'<li><div><p class=line>{blocked}{_risk_chip(actions, resources)}</p><ul class=codes>{_codes(actions)}</ul>'
-            f'<p class=on>on {on}</p>{why}{notes}</div>'
-            + _form({"op": "revoke", "project": project, "sid": sid}, "Revoke", "danger small",
+            f'<p class=on>on {on}</p>{why}{notes}{extend}</div>'
+            + _form({"op": "revoke", "project": project, "sid": sid}, "Revoke early" if ends else "Revoke", "danger small",
                     f"Revoke this grant from {project}? Agents lose it within minutes.", "/projects") + "</li>")
 
 

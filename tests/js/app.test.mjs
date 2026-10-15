@@ -58,6 +58,8 @@ test("times read naturally", () => {
   const now = new Date(2026, 9, 11, 15, 0);
   assert.equal(app.relativeTime(new Date(2026, 9, 11, 14, 59, 40), now), "just now");
   assert.equal(app.relativeTime(new Date(2026, 9, 11, 14, 45), now), "15 min ago");
+  assert.equal(app.relativeTime(new Date(2026, 9, 11, 17, 5), now), "in 2 h 5 min"); // a grant's end
+  assert.equal(app.relativeTime(new Date(2026, 9, 18, 15, 0), now), "in 7 days");
   assert.match(app.relativeTime(new Date(2026, 9, 11, 9, 5), now), /^today /);
   assert.match(app.relativeTime(new Date(2026, 9, 2, 9, 5), now), /Oct 2/);
 });

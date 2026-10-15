@@ -3,6 +3,7 @@ import fnmatch
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 
 GRANTS_POLICY = "apm-grants"
@@ -417,13 +418,41 @@ def sid(request_id):
     return f"Req{request_id}"
 
 
+# How long a grant lasts, in hours, as the owner picks it before Approve. 0 is permanent.
+DURATIONS = {1: "1 hour", 3: "3 hours", 24: "1 day", 168: "1 week", 0: "Permanent"}
+
+
+def duration(hours):
+    """A valid duration in hours (see DURATIONS), or ValueError."""
+    if type(hours) is int and hours in DURATIONS:
+        return hours
+    if isinstance(hours, str) and hours.strip().isdigit() and int(hours) in DURATIONS:
+        return int(hours)
+    raise ValueError(f"duration must be one of {', '.join(map(str, DURATIONS))} hours (0 is permanent)")
+
+
+def iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
 def grants_document(requests):
     """The project role's whole grants policy, built from its approved requests."""
-    return doc(*[statement(r["id"], r["actions"], r["resources"]) for r in sorted(requests, key=lambda r: r["id"])])
+    return doc(*[statement(r["id"], r["actions"], r["resources"], r.get("expires_at", 0))
+                 for r in sorted(requests, key=lambda r: r["id"])])
 
 
-def statement(request_id, actions, resources):
-    return {"Sid": sid(request_id), "Effect": "Allow", "Action": actions, "Resource": resources}
+def statement(request_id, actions, resources, expires_at=0):
+    """One grant. A time-limited one carries its end in a condition, so IAM ends it by itself, also
+    for credentials already handed out; the sweep removes it from the policy afterwards."""
+    stmt = {"Sid": sid(request_id), "Effect": "Allow", "Action": actions, "Resource": resources}
+    if expires_at:
+        stmt["Condition"] = {"DateLessThan": {"aws:CurrentTime": iso(expires_at)}}
+    return stmt
+
+
+def expiry(stmt):
+    """When a statement ends (its DateLessThan aws:CurrentTime), as written, or "" if never."""
+    return stmt.get("Condition", {}).get("DateLessThan", {}).get("aws:CurrentTime", "")
 
 
 def with_statement(policy, stmt):

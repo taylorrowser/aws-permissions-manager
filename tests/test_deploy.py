@@ -59,6 +59,17 @@ def iam_match(pattern, arn):
     return fnmatch.fnmatchcase(arn, pattern)
 
 
+SWEEP = {
+    "Sweep": {"Type": "AWS::Events::Rule", "Properties": {
+        "Name": "apm-sweep", "Description": "apm: remove expired grants every 15 minutes",
+        "ScheduleExpression": "rate(15 minutes)", "State": "ENABLED",
+        "Targets": [{"Id": "sweep", "Arn": {"Fn::GetAtt": ["Function", "Arn"]}, "Input": '{"apm_sweep": true}'}]}},
+    "SweepPermission": {"Type": "AWS::Lambda::Permission", "Properties": {
+        "FunctionName": {"Ref": "Function"}, "Action": "lambda:InvokeFunction",
+        "Principal": "events.amazonaws.com", "SourceArn": {"Fn::GetAtt": ["Sweep", "Arn"]}}},
+}
+
+
 def resources(stmt):
     r = stmt["Resource"]
     return [r] if isinstance(r, str) else r
@@ -84,12 +95,16 @@ class ProdCompatibility(unittest.TestCase):
         broker = expected["Resources"]["BrokerRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
         broker.insert(4, {"Sid": "CheckStackRoles", "Effect": "Allow", "Resource": "*",
                           "Action": ["cloudformation:DescribeStacks", "cloudformation:ListStacks"]})
+        # Intended change 5: the expiry sweep, a 15-minute schedule that invokes the Lambda.
+        expected["Resources"].update(SWEEP)
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS))), expected)
         self.assertEqual(json.loads(json.dumps(deploy.template(*PROD_ARGS, stage="prod"))), expected)
 
     def test_prod_resource_names_byte_identical(self):
         before = json.loads((ROOT / "tests/fixtures/prod_template_before_stages.json").read_text())
         after = json.loads(json.dumps(deploy.template(*PROD_ARGS)))
+        for added in SWEEP:  # new since, so not in the old template
+            del after["Resources"][added]
         self.assertEqual(sorted(after["Resources"]), sorted(before["Resources"]))
 
         def names(t):

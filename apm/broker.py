@@ -102,10 +102,11 @@ class Broker:
                     raise
 
     def in_sync(self, project, approved):
-        """Whether IAM currently grants exactly the approved requests (for the dashboard)."""
-        current = self.grants(project) or policy.doc()
-        return sorted(s.get("Sid", "") for s in current["Statement"]) == \
-            sorted(policy.sid(r["id"]) for r in approved)
+        """Whether IAM currently grants exactly the approved requests, each until when it was
+        approved (or extended) to (for the dashboard)."""
+        def ends(d):
+            return sorted((s.get("Sid", ""), policy.expiry(s)) for s in d["Statement"])
+        return ends(self.grants(project) or policy.doc()) == ends(policy.grants_document(approved))
 
     def _all_policy_names(self, role):
         names, kw = [], {}

@@ -47,6 +47,7 @@ SESSION_COOKIE = "__Host-apm_session"
 OAUTH_COOKIE = "__Host-apm_oauth"
 SESSION_SECONDS = 30 * 24 * 3600
 WORKOS_API = "https://api.workos.com/user_management"
+EXPIRY_ACTOR = "APM (time limit)"  # who the sweep's audit events name
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -344,7 +345,9 @@ class App:
                 if op == "reject":
                     self.store.set_status(r["id"], "rejected", form.get("note", "")[:500], expect="pending")
                     return f"Rejected request #{r['id']}."
-                self.store.set_status(r["id"], "approved", expect="pending")
+                hours = policy.duration(form.get("hours-1", "0"))  # one grant per request: grant 1
+                expires_at = int(time.time()) + hours * 3600 if hours else 0
+                self.store.set_status(r["id"], "approved", expect="pending", expires_at=expires_at)
 
                 def write():
                     # Checked again, fresh: a stack may have gained a stored role since the request.
@@ -356,7 +359,7 @@ class App:
                     self.iam_change("approve", project, actor, write, [r["id"]])
                 except BrokerError:
                     # Refused before writing anything (a refusal, the size limit): safe to undo.
-                    self.store.set_status(r["id"], "pending", expect="approved")
+                    self.store.set_status(r["id"], "pending", expect="approved", expires_at=0)
                     raise
                 except Exception as e:
                     # The write may or may not have reached IAM (e.g. a timeout after IAM applied
@@ -364,7 +367,7 @@ class App:
                     print(f"IAM sync for {project} failed after approving #{r['id']}: {e!r}")
                     return (f"Error: approved request #{r['id']}, but updating IAM failed ({type(e).__name__}). "
                             f"Open Projects and tap Re-apply decisions for {project}.")
-                return f"Approved request #{r['id']} for {project}."
+                return f"Approved request #{r['id']} for {project}" + (f" for {policy.DURATIONS[hours]}." if hours else ".")
         if op == "revoke":
             project, sid = form["project"], form["sid"]
             ids = []  # the event names the request only if it belongs to this project
@@ -384,6 +387,30 @@ class App:
                     return (f"Error: recorded the revoke of {sid}, but updating IAM failed ({type(e).__name__}). "
                             f"It may still be active: open Projects and tap Re-apply decisions for {project}.")
             return f"Revoked {sid} from {project}."
+        if op == "extend":
+            project, sid = form["project"], form["sid"]
+            hours = policy.duration(form.get("hours", ""))
+            with self.store.lease(project):
+                r = self.store.get(int(sid[3:]), consistent=True) if sid.startswith("Req") and sid[3:].isdigit() else None
+                if not r or r["project"] != project or r["status"] != "approved":
+                    raise Conflict(f"{sid} is no longer granted to {project}")
+                problems = self.refusals(r["actions"], r["resources"])
+                if problems:
+                    raise BrokerError("refused: " + "; ".join(problems))
+                before, expires_at = r.get("expires_at", 0), int(time.time()) + hours * 3600 if hours else 0
+                until = f"until {policy.iso(expires_at)}" if hours else "permanently"
+                self.store.set_expiry(r["id"], expires_at)
+                try:
+                    self.iam_change("extend", project, actor, lambda: self.broker.sync(project, self.store.approved(project)),
+                                    [r["id"]], detail=until)
+                except BrokerError:
+                    self.store.set_expiry(r["id"], before)  # refused before writing: IAM still has the old end
+                    raise
+                except Exception as e:
+                    print(f"IAM sync for {project} failed while extending {sid}: {e!r}")
+                    return (f"Error: couldn't extend {sid}: updating IAM failed ({type(e).__name__}), so it may still "
+                            f"end at the old time. Open Projects and tap Re-apply decisions for {project}.")
+            return f"Extended {sid} on {project} {'for ' + policy.DURATIONS[hours].lower() if hours else 'permanently'}."
         if op == "sync_project":
             project = form["project"]
             with self.store.lease(project):
@@ -443,6 +470,32 @@ class App:
         finally:
             self._record(event)
         return doc
+
+    def sweep(self, now=None):
+        """The expiry sweep (EventBridge, every 15 minutes). Expired grants are already dead in IAM
+        (their DateLessThan condition); this tidies up. Per project, under its lease: rewrite IAM
+        without them first, then mark them expired. If IAM fails the table is left alone and the
+        next sweep retries. Safe to repeat: a project with nothing expired isn't touched."""
+        now = int(now or time.time())
+        due = sorted({r["project"] for r in self.store.list(status="approved") if 0 < r.get("expires_at", 0) <= now})
+        done = {}
+        for project in due:
+            try:
+                with self.store.lease(project):
+                    approved = self.store.approved(project)
+                    ended = [r for r in approved if 0 < r.get("expires_at", 0) <= now]
+                    if not ended:
+                        continue
+                    keep = [r for r in approved if r not in ended]
+                    self.iam_change("expire", project, EXPIRY_ACTOR, lambda: self.broker.sync(project, keep),
+                                    [r["id"] for r in ended])
+                    for r in ended:
+                        self.store.set_status(r["id"], "expired", expect="approved")
+                    done[project] = [r["id"] for r in ended]
+            except Exception as e:
+                print(json.dumps({"event": "sweep_failed", "project": project, "error": f"{type(e).__name__}: {e}"[:300]}))
+        print(json.dumps({"event": "sweep", "expired": done}))
+        return {"expired": done}
 
     def refusals(self, actions, resources, stacks=None):
         """Why IAM must not hold this grant (policy.refusals), with stacks listed now."""
@@ -644,12 +697,18 @@ class App:
             raise ApiError(400, str(e))
         if len(reason) > 1000:
             raise ApiError(400, "reason is too long (max 1000 characters)")
+        suggested = body.get("suggested_hours")
+        if suggested is not None:
+            try:
+                suggested = policy.duration(suggested)
+            except ValueError as e:
+                raise ApiError(400, f"suggested_hours: {e}")
         if self.store.pending_count(key["name"]) >= PENDING_LIMIT:
             raise ApiError(429, f"this API key already has {PENDING_LIMIT} pending requests; wait for the owner")
         problems = self.refusals(actions, resources)
         if problems:
             raise ApiError(400, "refused: " + "; ".join(problems))
-        rid = self.store.add(project, actions, resources, reason, key["name"])
+        rid = self.store.add(project, actions, resources, reason, key["name"], suggested)
         n = len(actions)
         self.notify_safely({"title": f"Permission request #{rid}",
                      "body": f"{project}: {n} action{'s' if n != 1 else ''} to review",
@@ -669,7 +728,7 @@ class App:
                 req = self.store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
                 statements.append({"grant": sid, "actions": _list(s.get("Action", [])),
                                    "resources": _list(s.get("Resource", [])),
-                                   "reason": req["reason"] if req else ""})
+                                   "reason": req["reason"] if req else "", "expires": policy.expiry(s)})
             item = {"project": project, "grants": statements}
             if all(_matches(t, item) for t in terms):
                 out.append(item)
@@ -710,7 +769,8 @@ def _request_ids(sids):
 
 
 def _public(r):
-    keep = ("id", "project", "actions", "resources", "reason", "status", "note", "requester", "created_at", "decided_at")
+    keep = ("id", "project", "actions", "resources", "reason", "status", "note", "requester", "created_at", "decided_at",
+            "suggested_hours", "expires_at")
     return {k: r.get(k) for k in keep}
 
 
@@ -754,6 +814,7 @@ _app = None
 
 
 def handler(event, context):
+    """API Gateway requests, and {"apm_sweep": true} from the EventBridge schedule."""
     global _app
     if _app is None:
         import boto3
@@ -762,4 +823,6 @@ def handler(event, context):
         table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
         store = Store(table)
         _app = App(Settings.from_env(), store, Broker(account, region))
+    if event.get("apm_sweep") is True:
+        return _app.sweep()
     return _app(Request.from_lambda(event)).lambda_result()

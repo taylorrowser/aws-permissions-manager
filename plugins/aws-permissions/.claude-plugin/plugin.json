@@ -1,7 +1,7 @@
 {
   "name": "aws-permissions",
   "displayName": "AWS Permissions",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Scoped, owner-approved AWS access for agents: find a project, get its AWS profile, request new permissions.",
   "author": { "name": "Taylor Rowser" },
   "repository": "https://github.com/taylorrowser/aws-permissions-manager",
