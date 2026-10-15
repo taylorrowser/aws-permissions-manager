@@ -1237,6 +1237,9 @@ class ClientTests(unittest.TestCase):
         checked = json.loads(tool(13, "check_request", request_id=2)["content"][0]["text"])
         self.assertEqual([g["grant"] for g in checked["grants"]], ["Req2g1", "Req2g2"])
         self.assertEqual(self.app.store.get(2)["grants"][0]["suggested_hours"], 3)
+        mixed = tool(14, "request_permissions", project="myapp", reason="sync", resources=["arn:aws:s3:::b/*"],
+                     grants=[{"actions": ["s3:GetObject"]}])
+        self.assertTrue(mixed["isError"])  # resources outside grants would be dropped, widening the request to *
 
         # The AWS CLI would run this credential_process command from the profile.
         stable = self.tmp / "apm" / "bin" / "apm.py"
@@ -1390,6 +1393,8 @@ class ClientTests(unittest.TestCase):
                           (["sqs:SendMessage"], ["arn:aws:sqs:us-east-1:1:q"], 1)])
         self.assertIn("Req2g2: sqs:SendMessage on arn:aws:sqs:us-east-1:1:q", run("status", "2").stdout)
         self.assertIn("not both", run("request", "--project", "web", "--grant", "s3:GetObject", "-a", "s3:GetObject",
+                                      "--reason", "x").stderr)
+        self.assertIn("not both", run("request", "--project", "web", "--grant", "s3:GetObject", "-r", "arn:aws:s3:::b",
                                       "--reason", "x").stderr)
 
 

@@ -170,8 +170,8 @@ MAX_GRANTS = 9
 def request(project, actions, resources, reason, duration=None, grants=None):
     """grants: [{"actions", "resources", "duration" (optional)}], one per resource set, instead of
     actions and resources. duration then applies to each grant that doesn't name its own."""
-    if grants and actions:
-        raise ApmError("give either grants or actions, not both")
+    if grants and (actions or resources):
+        raise ApmError("give either grants or actions/resources, not both")
     if grants:
         if len(grants) > MAX_GRANTS:
             raise ApmError(f"at most {MAX_GRANTS} grants per request")
