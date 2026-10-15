@@ -21,7 +21,8 @@ agent ── aws --profile apm-<project> ── credential_process ────�
   - create roles under `/agents/`, and only with the boundary attached;
   - edit those roles' inline policies, and delete those roles;
   - assume them to vend credentials;
-  - read and write its DynamoDB table.
+  - read and write its DynamoDB table;
+  - list CloudFormation stacks (`DescribeStacks`), to refuse stack writes that would run as a stack's stored role.
 
   It can't remove a boundary or touch any other IAM resource, and no long-lived broker key exists anywhere.
 - **Agents hold only an API key.** It lets them list projects, request permissions and get credentials. Approving needs your WorkOS sign-in. Any key can use any approved project; you tell each agent which one to use.
@@ -122,6 +123,7 @@ The same script works as a CLI: `apm projects`, `apm request`, `apm status`, `ap
 
 - Agents can never touch apm itself, whatever you approve. The boundary denies its SSM parameters (`/apm*`, including the session secret and push key), its Lambda, table, stack, `apm-*` buckets and logs, its HTTP API (routes and integrations), anything tagged `managed-by=apm`, its DNS record and domain registration (`route53domains:*`). Without this, approving `ssm:GetParameter` or `lambda:UpdateFunctionCode` on `*` would let an agent forge your sign-in or replace the approval code. A boundary change takes effect only after a redeploy.
 - Each approve, reject, revoke or project deletion runs entirely under a per-project lease in DynamoDB and re-reads the request strongly consistent inside it, so concurrent Lambda instances can't interleave. The policy is never rebuilt from an IAM read, which can be stale, so a revoked grant can't come back. If IAM refuses a change before writing (the size limit), the approval goes back to pending. If an IAM write fails or its result is unknown (e.g. a timeout), the decision stays recorded. The dashboard flags any project whose IAM policy doesn't match its decisions, with a **Re-apply decisions** button.
+- Some grants are refused outright, because they would act as another role or can't be checked as written: run-as actions on `*` (`lambda:UpdateFunctionCode`, `lambda:UpdateFunctionConfiguration`, `ecs:UpdateService`, `ecs:RunTask`, `codebuild:StartBuild`, `states:UpdateStateMachine`, `ssm:SendCommand`, `ec2-instance-connect:SendSSHPublicKey`, or wildcards covering them); CloudFormation stack writes on `*`, in a wildcard region, or on any existing stack with a stored `RoleARN`; policy variables (`${…}`) in resources; and incomplete ARNs. They're checked when requested, again at approval (an approval refused there is recorded with outcome `refused`) and before every credential hand-out, with a fresh stack listing each time. If the listing fails, the grant counts as refused. A project with any such grant, approved or still held by IAM, gets no credentials (403, naming the grants) until you revoke it; **Projects** marks it. Resource-policy actions such as `s3:PutBucketPolicy` aren't refused, but the dashboard labels them.
 - `ssm:GetParametersByPath` on the root path `/` is denied too, since a recursive read of `/` would otherwise return `/apm/*`.
 - Approving `iam:PassRole` lets a project hand *another* agent role to a service. Approving `s3:*` on `*` means every bucket. Read the resources line; the dashboard flags wildcards.
 - Revoking removes the permission from the role immediately. Credentials already issued keep working until they expire (≤1 hour), but only with the role's *current* permissions.

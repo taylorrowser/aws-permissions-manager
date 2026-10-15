@@ -528,15 +528,17 @@ def history(rid, events):
 
 # ---------- projects ----------
 
-def _grant(project, s, store):
+def _grant(project, s, store, reasons=()):
     sid = s.get("Sid", "")
     req = store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
     actions, resources = _list(s.get("Action", [])), _list(s.get("Resource", []))
     on = ("<span>all resources</span>" if _everything(resources) else f'<ul class=codes>{_codes(resources)}</ul>')
     why = (f'<p class=muted>{e(req["reason"])} <a href="/requests/{req["id"]}">#{req["id"]}</a></p>' if req
            else f'<p class=muted>Grant <code>{e(sid)}</code></p>')
-    return (f'<li><div><p class=line>{_risk_chip(actions, resources)}</p><ul class=codes>{_codes(actions)}</ul>'
-            f'<p class=on>on {on}</p>{why}</div>'
+    blocked = ('<span class=badge>Blocked</span>' if reasons else "")
+    notes = ('<ul class=notes>' + "".join(f"<li>{e(x)}</li>" for x in reasons) + "</ul>" if reasons else "")
+    return (f'<li><div><p class=line>{blocked}{_risk_chip(actions, resources)}</p><ul class=codes>{_codes(actions)}</ul>'
+            f'<p class=on>on {on}</p>{why}{notes}</div>'
             + _form({"op": "revoke", "project": project, "sid": sid}, "Revoke", "danger small",
                     f"Revoke this grant from {project}? Agents lose it within minutes.", "/projects") + "</li>")
 
@@ -554,8 +556,10 @@ def projects_page(app, owner, msg=""):
         grants = broker.grants(project)
         statements = grants["Statement"] if grants else []
         synced = broker.in_sync(project, store.approved(project))
+        flagged = app.flagged(project, grants or policy.doc())
         worst = _worst_chip(statements) if statements else ""
-        warn = '<span class=badge>IAM mismatch</span>' if not synced else ""
+        warn = ('<span class=badge>IAM mismatch</span>' if not synced else "") + \
+            ('<span class=badge>Credentials blocked</span>' if flagged else "")
         out.append(f'<details class="row project" id="project-{e(project)}"><summary>'
                    f'<span class=head><b>{e(project)}</b><span class=right>{_plural(len(statements), "grant")}</span></span>'
                    f'<span class=line>{warn}{worst}<span class=muted>profile <code>apm-{e(project)}</code></span></span></summary>')
@@ -564,10 +568,14 @@ def projects_page(app, owner, msg=""):
                        'the grants below may be wrong until you re-apply.</p>'
                        + _form({"op": "sync_project", "project": project}, "Re-apply decisions", "primary", "", "/projects")
                        + "</div>")
+        if flagged:
+            out.append('<div class=warn role=alert><p><b>Agents get no credentials for this project</b> until you '
+                       f'revoke {_and(sorted(flagged))}: they would be refused if requested now.</p></div>')
         if not statements:
             out.append("<p class=muted>No grants yet.</p>")
         else:
-            out.append("<ul class=grants>" + "".join(_grant(project, s, store) for s in statements) + "</ul>")
+            out.append("<ul class=grants>" + "".join(_grant(project, s, store, flagged.get(s.get("Sid", ""), ()))
+                                                    for s in statements) + "</ul>")
         out.append(f'<p class=muted>Role <code>{e(policy.role_name(project))}</code></p>'
                    '<details class=danger-zone><summary>Delete project…</summary>'
                    '<p class=muted>Removes the role and every grant. Agents lose access within an hour.</p>'

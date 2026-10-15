@@ -20,7 +20,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 from apm import push, web  # noqa: E402
 from apm.broker import Broker  # noqa: E402
 from apm.store import Store  # noqa: E402
-from test_apm import FakeIAM, FakeSTS, FakeTable  # noqa: E402
+from test_apm import FakeCloudFormation, FakeIAM, FakeSTS, FakeTable  # noqa: E402
 
 OWNER = "owner@example.com"
 
@@ -30,7 +30,11 @@ def make_app(port, stage):
     settings = web.Settings(f"localhost:{port}", "client_dev", OWNER, public, "dev-session-secret",
                             vapid_private=private, stage=stage)
     settings.origin = f"http://localhost:{port}"
-    return web.App(settings, Store(FakeTable()), Broker("111122223333", "us-east-1", iam=FakeIAM(), sts=FakeSTS()))
+    cfn = FakeCloudFormation()
+    app = web.App(settings, Store(FakeTable()), Broker("111122223333", "us-east-1", iam=FakeIAM(), sts=FakeSTS(),
+                                                        cloudformation=cfn.client))
+    app.cfn = cfn
+    return app
 
 
 def seed(app):
@@ -56,6 +60,10 @@ def seed(app):
           "Check which assets are already uploaded before syncing.", "macbook")
     s.add("website", ["s3:PutBucketPolicy"], ["arn:aws:s3:::example-site"],
           "Let CloudFront read the bucket through an origin access control.", "macbook")
+    # A stack write approved before its stack had a stored role: Projects shows it blocked.
+    decide(s.add("infra", ["cloudformation:UpdateStack"], ["arn:aws:cloudformation:us-east-1:111122223333:stack/web-*/*"],
+                 "Update the web stack's parameters.", "macbook"))
+    app.cfn.add("us-east-1", "web-prod", "arn:aws:iam::111122223333:role/cdk-exec")
     s.add_connect("codex-cloud", "ab" * 32, "apm_abcdef", "203.0.113.7 apm-client/1.0")
 
 

@@ -1,4 +1,5 @@
-"""Everything that touches IAM and STS. Runs inside the Lambda as the apm-broker role."""
+"""Everything that touches IAM and STS, plus the CloudFormation reads the grant checks need. Runs
+inside the Lambda as the apm-broker role."""
 import json
 import threading
 
@@ -20,12 +21,32 @@ class Broker:
     never from a read of IAM (IAM reads are eventually consistent, and rewriting from a stale
     read could bring back a revoked grant). Callers serialize changes per project."""
 
-    def __init__(self, account, region, iam=None, sts=None):
+    def __init__(self, account, region, iam=None, sts=None, cloudformation=None):
         self.account, self.region = account, region
         if iam is None or sts is None:
             import boto3
             iam, sts = iam or boto3.client("iam"), sts or boto3.client("sts", region_name=region)
         self.iam, self.sts = iam, sts
+        self._cfn, self._cfn_clients = cloudformation, {}
+
+    def stacks(self, region):
+        """[(stack name, stored RoleARN or "")] of every live stack in a region, read now. Raises if
+        the listing fails: callers treat that as a refusal, never as "no stacks"."""
+        client = self._cfn_clients.get(region)
+        if client is None:
+            if self._cfn:
+                client = self._cfn(region)
+            else:
+                import boto3
+                client = boto3.client("cloudformation", region_name=region)
+            self._cfn_clients[region] = client
+        out, kw = [], {}
+        while True:
+            page = client.describe_stacks(**kw)
+            out += [(s["StackName"], s.get("RoleARN", "")) for s in page.get("Stacks", [])]
+            if not page.get("NextToken"):
+                return out
+            kw = {"NextToken": page["NextToken"]}
 
     def grants(self, project):
         """Current granted policy for a project role, read live from AWS. None if no role."""
