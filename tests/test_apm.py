@@ -1256,6 +1256,23 @@ class SizeAndReplacesTests(unittest.TestCase):
         self.assertEqual((ev["op"], ev["outcome"], ev["request_ids"], ev["detail"]),
                          ("approve", "applied", [1, 2, r["id"]], "replaces Req1, Req2g2"))
 
+    def test_a_failed_save_puts_the_replaced_grants_back(self):
+        self.approve(self.big()["id"])
+        r = self.big("s3:PutObject", replaces=["Req1"])
+        real = self.app.store.set_status
+
+        def flaky(rid, status, *a, **kw):
+            if rid == r["id"] and status == "approved":
+                raise RuntimeError("dynamodb down")
+            return real(rid, status, *a, **kw)
+        self.app.store.set_status = flaky
+        with self.assertRaises(RuntimeError):
+            self.approve(r["id"])
+        del self.app.store.set_status
+        self.assertEqual([self.app.store.get(i)["status"] for i in (1, r["id"])], ["approved", "pending"])
+        self.assertEqual(list(self.statements()), ["Req1"])
+        self.assertIn("Approved", self.approve(r["id"]))  # and it can simply be approved again
+
     def test_the_size_check_runs_before_anything_changes(self):
         self.approve(self.big()["id"])
         status, small = self.ask(actions=["sqs:SendMessage"], resources=["arn:aws:sqs:us-east-1:1:q"])

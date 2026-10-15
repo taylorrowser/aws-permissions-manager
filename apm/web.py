@@ -355,10 +355,16 @@ class App:
                 ids, detail = [r["id"]] + [after["id"] for _, after in changes], f"replaces {gone}" if gone else ""
                 if problem:  # the size check comes first, before anything changes
                     self.iam_change("approve", project, actor, lambda: _refuse(problem), ids, detail)
-                for change in changes:  # then the grants it replaces are revoked, then it's approved
-                    self._save(change, f"replaced by #{r['id']}")
-                self.store.set_status(r["id"], "approved", expect="pending", expires_at=new["expires_at"],
-                                      grants=new.get("grants"))
+                saved = []
+                try:  # then the grants it replaces are revoked, then it's approved
+                    for change in changes:
+                        self._save(change, f"replaced by #{r['id']}")
+                        saved.append(change)
+                    self.store.set_status(r["id"], "approved", expect="pending", expires_at=new["expires_at"],
+                                          grants=new.get("grants"))
+                except Exception:
+                    self._unsave(saved, approved)  # IAM wasn't touched: put the replaced grants back
+                    raise
 
                 def write():
                     # Checked again, fresh: a stack may have gained a stored role since the request.
@@ -557,6 +563,20 @@ class App:
             self.store.set_grants(r["id"], grants)
         else:
             self.store.set_status(r["id"], status, note, expect="approved", grants=grants)
+
+    def _unsave(self, changes, before):
+        """Undo _save for these changes, back to the requests as they were in `before`."""
+        was = {r["id"]: r for r in before}
+        for (status, _), r in changes:
+            old = was[r["id"]]
+            try:
+                if status == "approved":
+                    self.store.set_grants(r["id"], old["grants"])
+                else:
+                    self.store.set_status(r["id"], "approved", old.get("note", ""), expect=status,
+                                          expires_at=old.get("expires_at", 0), grants=old.get("grants"))
+            except Exception as e:
+                print(json.dumps({"event": "unsave_failed", "request": r["id"], "error": str(e)[:300]}))
 
     def refusals(self, actions, resources, stacks=None):
         """Why IAM must not hold this grant (policy.refusals), with stacks listed now."""

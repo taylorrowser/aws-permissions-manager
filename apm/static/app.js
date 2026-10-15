@@ -542,7 +542,7 @@ if (typeof document !== "undefined") {
       pager.claim(); // a row still loading must not replace the pane behind the dialog
       if (!(await askConfirm(form))) return;
     }
-    const button = form.querySelector("button");
+    const button = form.querySelector("button:not([type=button])"); // not e.g. Copy note
     const label = button?.textContent;
     const removingHere = form.closest("[data-device]")?.dataset.device === thisDevice;
     await pager.submit(async () => { // false if something else was submitted while the dialog was open
