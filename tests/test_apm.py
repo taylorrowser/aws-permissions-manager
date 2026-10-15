@@ -1418,6 +1418,23 @@ class RemoveTests(unittest.TestCase):
         self.assertEqual(self.pushes, [])  # the owner did it
 
 
+    def test_remove_on_a_projects_row_narrows_every_grant_on_it_and_the_row_stays_open(self):
+        self.grant(actions=["s3:GetObject", "s3:PutObject"], resources=self.BUCKET)
+        self.grant(actions=["s3:GetObject"], resources=self.BUCKET)  # same resources and time limit: one row
+        cookies = session_cookie(self.app)
+        page = self.app(web.Request("GET", "/projects", cookies=cookies)).body
+        row = re.findall(r'class=grant-row id="(row-myapp-[0-9a-f]+)"', page)
+        self.assertEqual(len(row), 1)
+        self.assertIn('name="sid" value="Req1 Req2"><input type="hidden" name="action" value="s3:GetObject"', page)
+        body = urlencode({"op": "narrow", "project": "myapp", "sid": "Req1 Req2", "action": "s3:GetObject",
+                          "back": "/projects"}).encode()
+        resp = self.app(web.Request("POST", "/action", headers={"Origin": ORIGIN}, cookies=cookies, body=body))
+        self.assertEqual(parse_qs(urlparse(resp.headers["Location"]).query)["msg"][0],
+                         "Removed s3:GetObject from Req1 on myapp. Removed s3:GetObject from Req2 on myapp, which ended it.")
+        self.assertEqual(self.statements(), {"Req1": (["s3:PutObject"], self.BUCKET)})
+        page = self.app(web.Request("GET", "/projects", cookies=cookies)).body
+        self.assertEqual(re.findall(r'class=grant-row id="(row-myapp-[0-9a-f]+)"', page), row)  # same id: still open
+
 class ClientTests(unittest.TestCase):
     """The plugin's stdlib client, run with the system Python like Claude Code/Codex would."""
 

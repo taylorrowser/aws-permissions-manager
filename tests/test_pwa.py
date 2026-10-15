@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
-from apm import push, web
+from apm import pages, push, web
 from test_apm import ORIGIN, OWNER, make_app, session_cookie
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -335,6 +335,9 @@ class ScreenTests(Base):
         css = (ROOT / "apm" / "static" / "app.css").read_text()
         for bad in ("position:fixed", "position:sticky", "100vh", "100dvh"):
             self.assertNotIn(bad, css)  # these move with the page on iOS; the body never scrolls instead
+        js = (ROOT / "apm" / "static" / "app.js").read_text()
+        for bad in ("form.action", "form.method"):  # a field named "action" (Remove on Projects) shadows them
+            self.assertNotIn(bad, js)
 
     def test_empty_states(self):
         self.assertIn("Nothing waiting", self.get("/").body)
@@ -658,3 +661,62 @@ class ServiceWorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProjectsScreenTests(unittest.TestCase):
+    """Projects: a summary line, then grants by service in rows of the same resources and time limit."""
+    BUCKET = ["arn:aws:s3:::exports", "arn:aws:s3:::exports/*"]
+    TABLE = ["arn:aws:dynamodb:us-east-1:111122223333:table/orders"]
+    LATER = {"DateLessThan": {"aws:CurrentTime": "2030-01-01T00:00:00Z"}}
+
+    def stmt(self, sid, actions, resources, condition=None):
+        return {"Sid": sid, "Effect": "Allow", "Action": actions, "Resource": resources,
+                **({"Condition": condition} if condition else {})}
+
+    def test_the_summary_says_what_a_project_changes_and_reads(self):
+        summary = pages.project_summary
+        self.assertEqual(summary([]), "No access.")
+        self.assertEqual(summary([self.stmt("Req1", ["s3:GetObject"], self.BUCKET)]), "Reads S3.")
+        self.assertEqual(summary([self.stmt("Req1", ["s3:GetObject", "dynamodb:PutItem", "logs:Get*"], ["*"]),
+                                  self.stmt("Req2", ["s3:PutObject"], self.BUCKET)]),
+                         "Changes DynamoDB and S3. Reads CloudWatch Logs.")
+        self.assertEqual(summary([self.stmt("Req1", ["s3:List*", "dynamodb:*"], ["*"])]), "Changes DynamoDB. Reads S3.")
+        self.assertEqual(summary([self.stmt("Req1", ["*"], ["*"]), self.stmt("Req2", ["s3:GetObject"], ["*"])]),
+                         "Changes everything.")
+
+    def test_grants_group_by_service_and_merge_on_resources_and_time_limit(self):
+        rows = pages.service_rows("app", [
+            self.stmt("Req1", ["s3:GetObject", "dynamodb:GetItem"], self.BUCKET + self.TABLE),
+            self.stmt("Req2", ["s3:PutObject"], list(reversed(self.BUCKET + self.TABLE))),  # same set: same row
+            self.stmt("Req3", ["s3:DeleteObject"], self.BUCKET + self.TABLE, self.LATER),  # another time limit
+            self.stmt("Req4", ["*"], ["*"]),
+        ])
+        self.assertEqual([service for service, _ in rows], ["*", "dynamodb", "s3"])
+        s3 = rows[2][1]
+        self.assertEqual([r["actions"] for r in s3], [["s3:GetObject", "s3:PutObject"], ["s3:DeleteObject"]])
+        self.assertEqual([[s["Sid"] for s, _ in r["parts"]] for r in s3], [["Req1", "Req2"], ["Req3"]])
+        self.assertEqual(s3[1]["ends"], "2030-01-01T00:00:00Z")
+        self.assertEqual(rows[1][1][0]["actions"], ["dynamodb:GetItem"])  # a grant splits across services
+
+    def test_row_ids_come_from_what_the_row_covers_not_its_grants(self):
+        row_id = pages.row_id
+        self.assertEqual(row_id("app", "s3", self.BUCKET, ""), row_id("app", "s3", list(reversed(self.BUCKET)), ""))
+        ids = {row_id("app", "s3", self.BUCKET, ""), row_id("app", "s3", self.BUCKET, "2030-01-01T00:00:00Z"),
+               row_id("app", "s3", self.BUCKET[:1], ""), row_id("app", "sqs", self.BUCKET, ""),
+               row_id("web", "s3", self.BUCKET, "")}
+        self.assertEqual(len(ids), 5)
+        before = pages.service_rows("app", [self.stmt("Req1", ["s3:GetObject"], self.BUCKET),
+                                            self.stmt("Req2", ["s3:PutObject"], self.BUCKET)])
+        after = pages.service_rows("app", [self.stmt("Req2", ["s3:PutObject"], self.BUCKET)])  # Req1 revoked
+        self.assertEqual(before[0][1][0]["id"], after[0][1][0]["id"])
+
+    def test_a_statement_apm_did_not_write_is_built_in_and_has_no_controls(self):
+        app, iam, _ = make_app()
+        iam.policies[("apm-app", "apm-grants")] = {"Version": "2012-10-17", "Statement": [
+            self.stmt("SharedRead", ["s3:GetObject"], self.BUCKET)]}
+        with mock.patch.object(app.store, "projects", return_value=["app"]):
+            page = app(web.Request("GET", "/projects", cookies=session_cookie(app))).body
+        self.assertIn("<span class=badge>built in</span> <code>SharedRead</code>", page)
+        self.assertNotIn('value="narrow"', page)
+        self.assertNotIn('value="revoke"', page)
+        self.assertNotIn("/usage?project=", page)  # no usage audit in this deployment

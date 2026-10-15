@@ -48,6 +48,9 @@ def seed(app):
     first = s.add("website", ["s3:GetObject", "s3:PutObject"], ["arn:aws:s3:::example-site/*"],
                   "Upload the built site to the bucket.", "macbook")
     decide(first)
+    # Same bucket, same time limit: Projects shows both grants on one row.
+    decide(s.add("website", ["s3:DeleteObject"], ["arn:aws:s3:::example-site/*"],
+                 "Remove pages the new build no longer has.", "macbook"))
     for i in range(12):  # enough history for Decided to page
         rid = s.add("reports", ["athena:StartQueryExecution", "athena:GetQueryResults"], ["*"],
                     f"Run the weekly usage report ({i + 1}).", "macbook")

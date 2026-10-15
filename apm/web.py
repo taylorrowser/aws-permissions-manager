@@ -450,12 +450,21 @@ class App:
                             f"end at the old time. Open Projects and tap Re-apply decisions for {project}.")
             return f"Extended {sid} on {project} {'for ' + policy.DURATIONS[hours].lower() if hours else 'permanently'}."
         if op == "narrow":
-            project, sid = form["project"], form["sid"]
+            # sid: one grant, or every grant on a Projects row that holds the action or resource.
+            project, sids = form["project"], form["sid"].split()
             actions, resources = [x for x in [form.get("action", "")] if x], [x for x in [form.get("resource", "")] if x]
-            if len(actions + resources) != 1:
+            if len(actions + resources) != 1 or not sids:
                 raise ValueError("name one action or one resource to remove")
-            done = self.shrink(project, sid, actions, resources, "narrow", actor)
-            return f"Error: {done['error']}" if done["error"] else done["message"]
+            done = []
+            for sid in sids:
+                try:
+                    out = self.shrink(project, sid, actions, resources, "narrow", actor)
+                except (Conflict, ValueError) as e:
+                    out = {"error": str(e), "message": ""}
+                if out["error"]:
+                    return "Error: " + (" ".join(done) + " Then " if done else "") + out["error"]
+                done.append(out["message"])
+            return " ".join(done)
         if op == "sync_project":
             project = form["project"]
             with self.store.lease(project):
