@@ -1,10 +1,13 @@
 """Everything that touches IAM and STS. Runs inside the Lambda as the apm-broker role."""
 import json
 import threading
+import time
 
 from . import policy
 
 _lock = threading.Lock()
+USAGE_JOB_SECONDS = 600  # reuse an Access Advisor job this long, so reloading a page starts no new job
+USAGE_WAIT_SECONDS = 8  # how long one page load waits for AWS to finish the report
 
 
 class BrokerError(Exception):
@@ -26,6 +29,7 @@ class Broker:
             import boto3
             iam, sts = iam or boto3.client("iam"), sts or boto3.client("sts", region_name=region)
         self.iam, self.sts = iam, sts
+        self.usage_jobs, self.usage_wait = {}, USAGE_WAIT_SECONDS  # project -> (job id, started at)
 
     def grants(self, project):
         """Current granted policy for a project role, read live from AWS. None if no role."""
@@ -92,6 +96,32 @@ class Broker:
             if not page.get("IsTruncated"):
                 return names
             kw = {"Marker": page["Marker"]}
+
+    def last_accessed(self, project):
+        """IAM Access Advisor's action-level report for a project role: its ServicesLastAccessed list,
+        or None while AWS is still preparing it. Read-only; raises on AWS errors and failed jobs."""
+        now = time.time()
+        job = self.usage_jobs.get(project)
+        if not job or now - job[1] > USAGE_JOB_SECONDS:
+            job_id = self.iam.generate_service_last_accessed_details(
+                Arn=policy.role_arn(self.account, project), Granularity="ACTION_LEVEL")["JobId"]
+            job = self.usage_jobs[project] = (job_id, now)
+        deadline = now + self.usage_wait
+        while True:
+            page = self.iam.get_service_last_accessed_details(JobId=job[0])
+            if page["JobStatus"] == "COMPLETED":
+                break
+            if page["JobStatus"] == "FAILED":
+                self.usage_jobs.pop(project, None)
+                raise BrokerError(f"Access Advisor job failed: {page.get('Error', {}).get('Message', 'no reason given')}")
+            if time.time() >= deadline:
+                return None
+            time.sleep(1)
+        services = list(page["ServicesLastAccessed"])
+        while page.get("IsTruncated"):
+            page = self.iam.get_service_last_accessed_details(JobId=job[0], Marker=page["Marker"])
+            services += page["ServicesLastAccessed"]
+        return services
 
     def credentials(self, project, session_name):
         """Short-lived credentials for a project role. Raises BrokerError if nothing is granted."""

@@ -185,7 +185,7 @@ if (typeof document !== "undefined") {
   async function refresh() {
     if (!signedIn) return;
     const started = generation;
-    const resp = await fetch(location.pathname, { credentials: "same-origin", headers: { Accept: "text/html" } });
+    const resp = await fetch(location.pathname + location.search, { credentials: "same-origin", headers: { Accept: "text/html" } });
     if (!resp.ok) return;
     const html = await resp.text();
     if (started === generation && canRefresh(state())) apply(html);

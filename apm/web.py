@@ -3,7 +3,7 @@
 - Owner dashboard (installable web app): WorkOS AuthKit sign-in, approve/reject/revoke, projects,
   and settings (push notification devices, API keys, account).
 - Agent API (Bearer API key): list projects and grants, request permissions, check requests,
-  get short-lived credentials for a project role.
+  get short-lived credentials for a project role, and see when each grant was last used.
 """
 import base64
 import fnmatch
@@ -21,7 +21,7 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode
 
-from . import pages, policy
+from . import pages, policy, usage
 from .broker import Broker, BrokerError
 from .store import CONNECT_SECONDS, PENDING_LIMIT, Conflict, Store, subscription_id
 
@@ -42,7 +42,7 @@ ASSET_VERSION = hashlib.sha256(b"".join((STATIC / n).read_bytes() for n, _ in ST
 # Checked by the browser on every start, so app updates arrive the next time the app opens.
 REVALIDATE = {"/sw.js", "/manifest.webmanifest", "/offline.html"}
 # Owner screens. Signed-out visits show the sign-in page and come back here after signing in.
-SCREENS = re.compile(r"/(projects|settings|devices|keys|requests/[0-9]{1,12}|connect/[A-Z0-9]{4}-[A-Z0-9]{4})?")
+SCREENS = re.compile(r"/(projects|usage|settings|devices|keys|requests/[0-9]{1,12}|connect/[A-Z0-9]{4}-[A-Z0-9]{4})?")
 SESSION_COOKIE = "__Host-apm_session"
 OAUTH_COOKIE = "__Host-apm_oauth"
 SESSION_SECONDS = 30 * 24 * 3600
@@ -252,6 +252,12 @@ class App:
             return Response(200, pages.request_page(self, owner, r, msg, st))
         if p.startswith("/connect/"):
             return Response(200, pages.connect_page(self, owner, p.rsplit("/", 1)[1], msg))
+        if p == "/usage":
+            project = req.query.get("project", "")
+            if not policy.PROJECT_RE.match(project) or project not in self.store.projects():
+                return redirect("/projects")
+            st = pages.state(self)
+            return Response(200, pages.usage_page(self, owner, project, self.usage(project), st))
         if p in ("/devices", "/keys"):  # old screens (and old notification links): now under Settings
             return redirect("/settings")
         view = {"/": pages.requests_page, "/projects": pages.projects_page, "/settings": pages.settings_page}[p]
@@ -480,6 +486,16 @@ class App:
             if not r:
                 raise ApiError(404, "no such request")
             return json_response(_public(r))
+        if p == "/api/usage" and m == "GET":
+            project = req.query.get("project", "")
+            if not policy.PROJECT_RE.match(project):
+                raise ApiError(400, "invalid project name")
+            if project not in self.store.projects():
+                raise ApiError(404, f"no project {project}")
+            report = self.usage(project)
+            if "error" in report:
+                raise ApiError(502, f"AWS couldn't report usage: {report['error']}")
+            return json_response(report)
         if p == "/api/credentials" and m == "POST":
             project = str(req.json().get("project", ""))
             if not policy.PROJECT_RE.match(project):
@@ -556,6 +572,27 @@ class App:
             if all(_matches(t, item) for t in terms):
                 out.append(item)
         return out
+
+    def usage(self, project):
+        """When each of the project's grants was last used (IAM Access Advisor). Returns
+        {"preparing": True} while AWS builds the report, and {"error": ...} if AWS fails."""
+        out = {"project": project, "note": usage.DELAY_NOTE}
+        try:
+            grants = self.broker.grants(project)
+            statements = grants["Statement"] if grants else []
+            services = self.broker.last_accessed(project) if statements else []
+        except Exception as e:
+            print(f"Usage report for {project} failed: {e!r}")
+            return {**out, "error": str(e) or type(e).__name__}
+        if services is None:
+            return {**out, "preparing": True}
+        reqs = {}
+        for s in statements:
+            sid = s.get("Sid", "")
+            r = self.store.get(int(sid[3:])) if sid.startswith("Req") and sid[3:].isdigit() else None
+            if r and r["project"] == project:
+                reqs[sid] = r
+        return {**out, "grants": usage.report(statements, reqs, services, time.time())}
 
 
 def _matches(term, item):

@@ -81,6 +81,7 @@ form{margin:0}
 .risk-write{background:var(--write-bg);color:var(--write-fg)}
 .risk-broad{background:var(--broad-bg);color:var(--broad-fg)}
 .risk-full{background:var(--full-bg);color:var(--full-fg)}
+.chip.unused{background:var(--warn-bg);color:var(--warn-fg)}
 .chip.this{margin-left:.4rem;background:var(--note-bg);color:var(--fg)}
 
 /* rows: a list of things that open in place (requests, projects) */

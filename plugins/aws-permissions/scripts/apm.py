@@ -5,6 +5,7 @@
     apm projects [--search TEXT]   projects and what each is allowed to do
     apm request --project P -a ACTION [-r ARN] --reason WHY [--wait]
     apm status [ID] | apm wait ID
+    apm usage PROJECT              when each of a project's grants was last used
     apm use PROJECT                set up AWS profile apm-PROJECT (credentials stay out of view)
     apm credentials PROJECT        AWS credential_process helper (used by the profile)
     apm mcp                        MCP server over stdio (Claude Code, Codex)
@@ -30,7 +31,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 DEFAULT_URL = "https://apm.taylorrowser.com"
 HOME = Path(os.environ.get("APM_HOME", Path.home() / ".apm"))
 CLIENT_FILE = HOME / "client.json"
@@ -154,6 +155,11 @@ def projects(search=""):
 def request(project, actions, resources, reason):
     return call("POST", "/api/requests", {"project": project, "actions": actions,
                                           "resources": resources or ["*"], "reason": reason})
+
+
+def usage(project):
+    from urllib.parse import quote
+    return call("GET", f"/api/usage?project={quote(project)}")
 
 
 def get_request(rid):
@@ -333,6 +339,9 @@ def main(argv=None):
     s = sub.add_parser("wait", help="block until a request is decided")
     s.add_argument("id", type=int)
     s.add_argument("--timeout", type=int, default=1800)
+    s = sub.add_parser("usage", help="when each of a project's grants was last used")
+    s.add_argument("project")
+    s.add_argument("--json", action="store_true")
     s = sub.add_parser("use", help="set up AWS profile apm-PROJECT")
     s.add_argument("project")
     s = sub.add_parser("credentials", help="credential_process helper; prints credentials for the AWS CLI/SDKs")
@@ -411,6 +420,28 @@ def _finish(r):
     return 1
 
 
+def cmd_usage(a):
+    report = usage(a.project)
+    if a.json:
+        print(json.dumps(report, indent=2))
+        return
+    if report.get("preparing"):
+        print("AWS is still preparing the usage report; run this again in a minute.")
+        return
+    if not report["grants"]:
+        print(f"{a.project} has no grants.")
+    for g in report["grants"]:
+        print(f"{g['grant']}: {_when(g['last_used'])}{'  UNUSED' if g['unused'] else ''}")
+        for x in g["actions"]:
+            scope = "" if x["per_action"] else " (service-level)"
+            print(f"  {x['action']}: {_when(x['last_used'])}{scope}")
+    print(report["note"])
+
+
+def _when(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("last used %Y-%m-%d %H:%M UTC") if ts else "not used"
+
+
 def cmd_use(a):
     profile = use(a.project)
     print(f"Profile {profile} is ready: aws --profile {profile} ...  (or AWS_PROFILE={profile})")
@@ -464,6 +495,12 @@ TOOLS = [
      "inputSchema": {"type": "object", "required": ["request_id"], "properties": {
          "request_id": {"type": "integer"},
          "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 120}}}},
+    {"name": "project_usage",
+     "description": "When each grant of a project was last used, from IAM Access Advisor (up to about 4 hours "
+                    "late). per_action=false means AWS only reported the service's last use. Grants marked unused "
+                    "haven't been used for 30 days.",
+     "inputSchema": {"type": "object", "required": ["project"], "properties": {
+         "project": {"type": "string"}}}},
     {"name": "list_requests",
      "description": "List recent permission requests, optionally for one project or status.",
      "inputSchema": {"type": "object", "properties": {
@@ -565,6 +602,12 @@ class McpServer:
         elif r["status"] == "pending":
             out["next"] = "Still waiting for the owner. Call check_request again with wait_seconds=120."
         return json.dumps(out, indent=2)
+
+    def tool_project_usage(self, project):
+        report = usage(project)
+        if report.get("preparing"):
+            return "AWS is still preparing the usage report. Call project_usage again in a minute."
+        return json.dumps(report, indent=2)
 
     def tool_list_requests(self, project=None, status=None):
         from urllib.parse import urlencode

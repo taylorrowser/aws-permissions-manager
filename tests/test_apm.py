@@ -38,6 +38,22 @@ class Missing(Exception):
 class FakeIAM:
     def __init__(self):
         self.roles, self.policies = {}, {}
+        # Access Advisor: every job reports `services` once `job_status` is COMPLETED.
+        self.jobs, self.job_status, self.services, self.advisor_error = [], "COMPLETED", [], None
+
+    def generate_service_last_accessed_details(self, Arn, Granularity):
+        if self.advisor_error:
+            raise self.advisor_error
+        self.jobs.append((Arn, Granularity))
+        return {"JobId": f"job-{len(self.jobs)}"}
+
+    def get_service_last_accessed_details(self, JobId, Marker=None):
+        if self.job_status != "COMPLETED":
+            return {"JobStatus": self.job_status, "ServicesLastAccessed": [], "Error": {"Message": "job broke"}}
+        page = self.services[int(Marker or 0):][:1]  # one service per page, to exercise paging
+        more = int(Marker or 0) + 1 < len(self.services)
+        return {"JobStatus": "COMPLETED", "ServicesLastAccessed": page, "IsTruncated": more,
+                **({"Marker": str(int(Marker or 0) + 1)} if more else {})}
 
     def get_role(self, RoleName):
         if RoleName not in self.roles:
@@ -170,6 +186,11 @@ class PolicyTests(unittest.TestCase):
                      ("myapp", ["s3:GetObject"], ["bucket"], "x"), ("myapp", ["s3:GetObject"], [], "  ")]:
             with self.subTest(args=args), self.assertRaises(ValueError):
                 policy.validate_request(*args)
+
+    def test_broker_can_audit_usage_of_agent_roles_only(self):
+        allows = {s["Sid"]: s for s in policy.broker_policy(ACCOUNT)["Statement"]}
+        self.assertEqual(allows["AuditAgentRoleUsage"]["Action"], "iam:GenerateServiceLastAccessedDetails")
+        self.assertEqual(allows["AuditAgentRoleUsage"]["Resource"], f"arn:aws:iam::{ACCOUNT}:role/agents/*")
 
     def test_broker_can_only_create_roles_with_boundary(self):
         stmt = policy.broker_policy(ACCOUNT)["Statement"][0]
@@ -482,7 +503,7 @@ class PushTests(unittest.TestCase):
                    f"{h}.{c}".encode(), ec.ECDSA(hashes.SHA256()))
 
 
-class WebTests(unittest.TestCase):
+class WebCase(unittest.TestCase):
     def setUp(self):
         self.app, self.iam, self.sts = make_app()
         self.key = self.app.store.create_key("laptop")
@@ -510,6 +531,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(resp.status, 303)
         return resp
 
+
+class WebTests(WebCase):
     def test_api_requires_valid_key(self):
         self.assertEqual(self.api("GET", "/api/projects", key=None)[0], 401)
         self.assertEqual(self.api("GET", "/api/projects", key="apm_wrong")[0], 401)
@@ -678,6 +701,106 @@ def serve_locally(app):
     return server
 
 
+def ago(days):
+    return datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+
+
+class Denied(Exception):
+    response = {"Error": {"Code": "AccessDenied"}}
+
+
+class UsageTests(WebCase):
+    """The usage audit: IAM Access Advisor, read-only."""
+
+    def setUp(self):
+        super().setUp()
+        self.app.broker.usage_wait = 0
+        self.iam.services = [
+            {"ServiceNamespace": "s3", "LastAuthenticated": ago(2), "TrackedActionsLastAccessed": [
+                {"ActionName": "GetObject", "LastAccessedTime": ago(2)}, {"ActionName": "GetBucketPolicy"},
+                {"ActionName": "PutObject", "LastAccessedTime": ago(5)}]},
+            {"ServiceNamespace": "lambda", "LastAuthenticated": ago(40)}]
+
+    def grant(self, actions, resources=("*",), days_ago=0):
+        r = self.request(actions, resources)
+        self.approve(r)
+        self.app.store.t.items[f"req#{r['id']}"]["decided_at"] -= days_ago * 86400
+        return r
+
+    def usage(self, project="myapp"):
+        status, body = self.api("GET", f"/api/usage?project={project}")
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_preparing_then_ready_reusing_one_job(self):
+        self.grant(["s3:GetObject"])
+        self.iam.job_status = "IN_PROGRESS"
+        self.assertTrue(self.usage()["preparing"])
+        self.assertIn("still preparing", self.app(web.Request("GET", "/usage", {"project": "myapp"},
+                                                             cookies=session_cookie(self.app))).body)
+        self.iam.job_status = "COMPLETED"
+        self.assertEqual(self.usage()["grants"][0]["actions"][0]["per_action"], True)
+        self.assertEqual(self.iam.jobs, [(policy.role_arn(ACCOUNT, "myapp"), "ACTION_LEVEL")])  # cached
+        project, (job, started) = next(iter(self.app.broker.usage_jobs.items()))
+        self.app.broker.usage_jobs[project] = (job, started - 601)
+        self.usage()
+        self.assertEqual(len(self.iam.jobs), 2)
+
+    def test_per_action_only_for_exactly_tracked_actions(self):
+        self.grant(["s3:Get*", "s3:GetObject", "s3:ListBucket", "lambda:InvokeFunction", "sqs:SendMessage"])
+        acts = {a["action"]: a for a in self.usage()["grants"][0]["actions"]}
+        self.assertTrue(acts["s3:GetObject"]["per_action"])
+        self.assertNotIn("matched", acts["s3:GetObject"])
+        wild = acts["s3:Get*"]
+        self.assertFalse(wild["per_action"])
+        self.assertEqual(wild["matched"], ["s3:getobject"])  # GetBucketPolicy is tracked but never used
+        self.assertEqual(wild["last_used"], int(self.iam.services[0]["LastAuthenticated"].timestamp()))
+        self.assertFalse(acts["s3:ListBucket"]["per_action"])  # untracked: the service's last use
+        self.assertTrue(acts["s3:ListBucket"]["used"])
+        self.assertFalse(acts["lambda:InvokeFunction"]["per_action"])
+        self.assertEqual(acts["sqs:SendMessage"], {"action": "sqs:SendMessage", "last_used": None,
+                                                    "per_action": False, "used": False})
+
+    def test_unused_needs_30_days_without_use_and_a_30_day_old_grant(self):
+        old_unused = self.grant(["sqs:SendMessage"], days_ago=31)
+        new_unused = self.grant(["sns:Publish"], days_ago=1)
+        old_used = self.grant(["s3:PutObject"], days_ago=31)
+        old_stale = self.grant(["lambda:InvokeFunction"], days_ago=60)
+        grants = {g["request"]: g for g in self.usage()["grants"]}
+        self.assertTrue(grants[old_unused["id"]]["unused"])
+        self.assertFalse(grants[new_unused["id"]]["unused"])
+        self.assertFalse(grants[old_used["id"]]["unused"])
+        self.assertTrue(grants[old_stale["id"]]["unused"])  # last used 40 days ago
+        g = grants[old_used["id"]]
+        self.assertEqual((g["grant"], g["reason"], g["requester"], g["resources"]), (f"Req{old_used['id']}", "because", "laptop", ["*"]))
+        self.assertIsNone(g["expires_at"])
+
+    def test_aws_errors_are_shown_not_raised(self):
+        self.grant(["s3:GetObject"])
+        self.iam.advisor_error = Denied("not authorized to perform iam:GenerateServiceLastAccessedDetails")
+        status, body = self.api("GET", "/api/usage?project=myapp")
+        self.assertEqual(status, 502)
+        self.assertIn("not authorized", body["error"])
+        page = self.app(web.Request("GET", "/usage", {"project": "myapp"}, cookies=session_cookie(self.app)))
+        self.assertEqual(page.status, 200)
+        self.assertIn("not authorized", page.body)
+        self.iam.advisor_error, self.iam.job_status = None, "FAILED"
+        self.assertIn("job broke", self.api("GET", "/api/usage?project=myapp")[1]["error"])
+
+    def test_page_is_linked_from_the_project_and_notes_the_delay(self):
+        self.grant(["s3:GetObject"], days_ago=31)
+        self.grant(["sqs:SendMessage"], days_ago=31)
+        projects = self.app(web.Request("GET", "/projects", cookies=session_cookie(self.app))).body
+        self.assertIn('href="/usage?project=myapp"', projects)
+        page = self.app(web.Request("GET", "/usage", {"project": "myapp"}, cookies=session_cookie(self.app))).body
+        self.assertIn("about 4 hours late", page)
+        self.assertEqual(page.count("chip unused"), 1)
+        self.assertEqual(self.api("GET", "/api/usage?project=nope")[0], 404)
+        missing = self.app(web.Request("GET", "/usage", {"project": "nope"}, cookies=session_cookie(self.app)))
+        self.assertEqual(missing.headers["Location"], "/projects")
+        self.assertEqual(self.iam.policies[("apm-myapp", policy.GRANTS_POLICY)]["Statement"][0]["Sid"], "Req1")
+
+
 class ClientTests(unittest.TestCase):
     """The plugin's stdlib client, run with the system Python like Claude Code/Codex would."""
 
@@ -714,7 +837,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(init["result"]["protocolVersion"], "2025-06-18")
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
         names = [t["name"] for t in rpc(2, "tools/list")["result"]["tools"]]
-        self.assertEqual(names, ["connect", "list_projects", "get_aws_credentials", "request_permissions", "check_request", "list_requests"])
+        self.assertEqual(names, ["connect", "list_projects", "get_aws_credentials", "request_permissions", "check_request", "project_usage", "list_requests"])
 
         def tool(i, name, **args):
             return rpc(i, "tools/call", {"name": name, "arguments": args})["result"]
@@ -880,6 +1003,10 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(run("wait", "1", "--timeout", "5").returncode, 0)
         self.assertIn("web", run("projects").stdout)
         self.assertEqual(run("projects", "--search", "nothing").stdout.strip(), "No matching projects.")
+        self.iam.services = [{"ServiceNamespace": "s3", "TrackedActionsLastAccessed": [{"ActionName": "GetObject"}]}]
+        out = run("usage", "web").stdout
+        self.assertIn("s3:GetObject: not used", out)
+        self.assertIn("4 hours late", out)
 
 
 class AwsConfigEditTests(unittest.TestCase):

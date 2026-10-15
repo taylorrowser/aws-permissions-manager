@@ -228,7 +228,7 @@ def api_deny(api_ref="Api"):
 
 def broker_policy(account, names=None):
     """The broker (the Lambda's role) can only create and edit agent roles, only with the
-    boundary attached, and assume them to hand agents short-lived credentials."""
+    boundary attached, assume them to hand agents short-lived credentials, and read their usage."""
     n = names or NAMES
     roles = agent_roles_arn(account, n)
     return doc(
@@ -238,6 +238,11 @@ def broker_policy(account, names=None):
             "iam:GetRole", "iam:TagRole", "iam:DeleteRole", "iam:ListRolePolicies", "iam:GetRolePolicy",
             "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:ListAttachedRolePolicies"]},
         {"Sid": "VendAgentCredentials", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": roles},
+        # The usage audit: read-only Access Advisor reports on agent roles. Reading a finished job
+        # can't be scoped to a resource; jobs can only be started for agent roles.
+        {"Sid": "AuditAgentRoleUsage", "Effect": "Allow", "Action": "iam:GenerateServiceLastAccessedDetails",
+         "Resource": roles},
+        {"Sid": "ReadUsageReports", "Effect": "Allow", "Action": "iam:GetServiceLastAccessedDetails", "Resource": "*"},
         # Lookups of a role that doesn't exist yet are authorized against an ARN without the path.
         {"Sid": "LookUpAgentRoles", "Effect": "Allow",
          "Resource": f"arn:aws:iam::{account}:role/{n.role_prefix}*",

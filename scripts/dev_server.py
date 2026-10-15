@@ -9,6 +9,7 @@ the server generates throwaway VAPID keys at start-up.
 import argparse
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -39,6 +40,14 @@ def seed(app):
     first = s.add("website", ["s3:GetObject", "s3:PutObject"], ["arn:aws:s3:::example-site/*"],
                   "Upload the built site to the bucket.", "macbook")
     app.decide({"op": "approve", "id": str(first), "digest": s.get(first)["digest"]})
+    old = s.add("website", ["sqs:SendMessage"], ["*"], "Queue rebuilds from the CMS webhook.", "macbook")
+    app.decide({"op": "approve", "id": str(old), "digest": s.get(old)["digest"]})
+    s.t.items[f"req#{old}"]["decided_at"] -= 45 * 86400  # old enough to show as unused
+    now = datetime.now(timezone.utc)
+    app.broker.iam.services = [{"ServiceNamespace": "s3", "LastAuthenticated": now - timedelta(hours=6),
+                                "TrackedActionsLastAccessed": [
+                                    {"ActionName": "GetObject", "LastAccessedTime": now - timedelta(days=3)},
+                                    {"ActionName": "PutObject", "LastAccessedTime": now - timedelta(hours=6)}]}]
     s.add("website", ["cloudfront:CreateInvalidation"], ["*"],
           "Invalidate the CDN after deploying so visitors see the new pages.", "macbook")
     s.add("data-pipeline", ["dynamodb:*"], ["*"], "Create and manage tables for the nightly import job.", "macbook")
