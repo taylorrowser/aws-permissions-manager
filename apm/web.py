@@ -939,7 +939,7 @@ class App:
     def review(self, rid):
         """{"apm_review": <id>}: review one pending request, if a key is set, and store the result.
         An answer that can't be parsed is logged and dropped: the request shows "No AI review"."""
-        r = self.store.get(rid)
+        r = self.store.get(rid, consistent=True)  # written just before this invocation was queued
         if not self.reviewer or not r or r["status"] != "pending" or r.get("review"):
             return {"reviewed": False}
         key = self.reviewer.key()
