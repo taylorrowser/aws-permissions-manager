@@ -554,13 +554,14 @@ if (typeof document !== "undefined") {
   });
 
   document.addEventListener("click", async (event) => {
-    const copy = event.target.closest("#copy-key");
+    const copy = event.target.closest("#copy-key, button.copy");
     if (!copy) return;
+    const target = $(copy.dataset.target);
     try {
-      await navigator.clipboard.writeText($(copy.dataset.target).textContent);
+      await navigator.clipboard.writeText(target.value ?? target.textContent);
       copy.textContent = "Copied";
     } catch (_) {
-      copy.textContent = "Select the key and copy it";
+      copy.textContent = copy.id === "copy-key" ? "Select the key and copy it" : "Select the note and copy it";
     }
   });
 

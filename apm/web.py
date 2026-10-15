@@ -47,6 +47,7 @@ SESSION_COOKIE = "__Host-apm_session"
 OAUTH_COOKIE = "__Host-apm_oauth"
 SESSION_SECONDS = 30 * 24 * 3600
 WORKOS_API = "https://api.workos.com/user_management"
+MAX_REPLACES = 20  # grants one request may supersede
 EXPIRY_ACTOR = "APM (time limit)"  # who the sweep's audit events name
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
@@ -345,14 +346,18 @@ class App:
                 if op == "reject":
                     self.store.set_status(r["id"], "rejected", form.get("note", "")[:500], expect="pending")
                     return f"Rejected request #{r['id']}."
-                grants, now = policy.grants_of(r), int(time.time())
+                grants = policy.grants_of(r)
                 hours = {g["n"]: policy.duration(form.get(f"hours-{g['n']}", "0")) for g in grants}  # one picker each
-                ends = {n: now + h * 3600 if h else 0 for n, h in hours.items()}
-                if r.get("grants"):
-                    self.store.set_status(r["id"], "approved", expect="pending",
-                                          grants=[{**g, "expires_at": ends[g["n"]]} for g in r["grants"]])
-                else:
-                    self.store.set_status(r["id"], "approved", expect="pending", expires_at=ends[1])
+                approved, replaces = self.store.approved(project), r.get("replaces") or []
+                changes, new, problem = self.approval(r, hours, approved)
+                gone = ", ".join(x for x in replaces if x not in _replaced(replaces, approved)[1])  # those still live
+                ids, detail = [r["id"]] + [after["id"] for _, after in changes], f"replaces {gone}" if gone else ""
+                if problem:  # the size check comes first, before anything changes
+                    self.iam_change("approve", project, actor, lambda: _refuse(problem), ids, detail)
+                for change in changes:  # then the grants it replaces are revoked, then it's approved
+                    self._save(change, f"replaced by #{r['id']}")
+                self.store.set_status(r["id"], "approved", expect="pending", expires_at=new["expires_at"],
+                                      grants=new.get("grants"))
 
                 def write():
                     # Checked again, fresh: a stack may have gained a stored role since the request.
@@ -362,10 +367,14 @@ class App:
                         raise BrokerError("refused: " + "; ".join(problems))
                     return self.broker.sync(project, self.store.approved(project))
                 try:
-                    self.iam_change("approve", project, actor, write, [r["id"]])
-                except BrokerError:
+                    self.iam_change("approve", project, actor, write, ids, detail)
+                except BrokerError as e:
                     # Refused before writing anything (a refusal, the size limit): safe to undo.
                     self.store.set_status(r["id"], "pending", expect="approved", expires_at=0, grants=r.get("grants"))
+                    if gone:
+                        raise BrokerError(f"{e}. It's pending again, but the grants it replaces ({gone}) were already "
+                                          f"revoked and IAM may still hold them: open Projects and tap Re-apply "
+                                          f"decisions for {project}.")
                     raise
                 except Exception as e:
                     # The write may or may not have reached IAM (e.g. a timeout after IAM applied
@@ -373,10 +382,11 @@ class App:
                     print(f"IAM sync for {project} failed after approving #{r['id']}: {e!r}")
                     return (f"Error: approved request #{r['id']}, but updating IAM failed ({type(e).__name__}). "
                             f"Open Projects and tap Re-apply decisions for {project}.")
+                also = f" It replaced {gone}." if gone else ""
                 if len(grants) > 1:
                     return f"Approved request #{r['id']} for {project}: " + ", ".join(
-                        f"grant {n} {'for ' + policy.DURATIONS[h].lower() if h else 'permanently'}" for n, h in hours.items()) + "."
-                return f"Approved request #{r['id']} for {project}" + (f" for {policy.DURATIONS[hours[1]]}." if hours[1] else ".")
+                        f"grant {n} {'for ' + policy.DURATIONS[h].lower() if h else 'permanently'}" for n, h in hours.items()) + "." + also
+                return f"Approved request #{r['id']} for {project}" + (f" for {policy.DURATIONS[hours[1]]}." if hours[1] else ".") + also
         if op == "revoke":
             project, sid = form["project"], form["sid"]
             ids, detail = [], ""  # the event names the request only if it belongs to this project
@@ -455,6 +465,22 @@ class App:
             self.store.remove_device(form.get("pk", ""))
             return "Removed the device from notifications."
         return "Unknown action."
+
+    def approval(self, r, hours, approved, now=None):
+        """What approving pending request r, each grant lasting hours[n] (0: permanent), does to its
+        project, given the project's approved requests: (the changes (see _ended) that revoke the grants
+        r replaces, r as approved, and why IAM would refuse the result for its size, or ""). The grants
+        r replaces are left out of the size check."""
+        now = int(now or time.time())
+        ends = {n: now + h * 3600 if h else 0 for n, h in hours.items()}
+        if r.get("grants"):
+            new = {**r, "status": "approved", "expires_at": 0, "grants": [{**g, "expires_at": ends[g["n"]]} for g in r["grants"]]}
+        else:
+            new = {**r, "status": "approved", "expires_at": ends[1]}
+        ending = _replaced(r.get("replaces") or [], approved)[0]
+        changes = {old["id"]: _ended(old, ending[old["id"]], "revoked") for old in approved if old["id"] in ending}
+        after = [changes[old["id"]][1] if old["id"] in changes else old for old in approved]
+        return list(changes.values()), new, policy.size_problem(r["project"], policy.grants_document(after + [new]))
 
     def iam_change(self, op, project, actor, write, targets=(), detail=""):
         """Run `write`, one IAM rewrite of the project's role that returns the policy document it
@@ -724,7 +750,8 @@ class App:
 
     def create_request(self, body, key):
         """One request, one reason: either the flat actions/resources/suggested_hours, or grants: [{actions,
-        resources, suggested_hours}] with 1-9 entries, one per resource set. Not both."""
+        resources, suggested_hours}] with 1-9 entries, one per resource set. Not both. replaces: Sids of
+        the project's approved grants (Req22, Req52g3) that this request supersedes."""
         flat = [k for k in ("actions", "resources", "suggested_hours") if body.get(k) is not None]
         if body.get("grants") is not None:
             asked = body["grants"]
@@ -752,6 +779,15 @@ class App:
             grants.append({"actions": actions, "resources": resources, "suggested_hours": suggested})
         if len(reason) > 1000:
             raise ApiError(400, "reason is too long (max 1000 characters)")
+        replaces = body.get("replaces") or []
+        replaces = [replaces] if isinstance(replaces, str) else replaces
+        if not isinstance(replaces, list) or len(replaces) > MAX_REPLACES or \
+                any(not isinstance(x, str) or not policy.SID_RE.match(x) for x in replaces):
+            raise ApiError(400, f"replaces must list up to {MAX_REPLACES} grants as `apm projects` names them, e.g. Req22 or Req52g3")
+        replaces = list(dict.fromkeys(replaces))
+        missing = _replaced(replaces, self.store.approved(project))[1] if replaces else []
+        if missing:
+            raise ApiError(400, f"replaces: {', '.join(missing)} isn't a grant {project} holds now; see `apm projects`")
         if self.store.pending_count(key["name"]) >= PENDING_LIMIT:
             raise ApiError(429, f"this API key already has {PENDING_LIMIT} pending requests; wait for the owner")
         stacks = self._stack_lister()
@@ -760,11 +796,12 @@ class App:
         if problems:
             raise ApiError(400, "refused: " + "; ".join(problems))
         if len(grants) > 1:
-            rid = self.store.add(project, [], [], reason, key["name"], grants=grants)
+            rid = self.store.add(project, [], [], reason, key["name"], grants=grants, replaces=replaces)
             what = _plural(len(grants), "grant")
         else:
             g = grants[0]
-            rid = self.store.add(project, g["actions"], g["resources"], reason, key["name"], g["suggested_hours"])
+            rid = self.store.add(project, g["actions"], g["resources"], reason, key["name"], g["suggested_hours"],
+                                 replaces=replaces)
             what = _plural(len(g["actions"]), "action")
         self.notify_safely({"title": f"Permission request #{rid}", "body": f"{project}: {what} to review",
                             "url": f"/requests/{rid}", "tag": f"req-{rid}"})
@@ -828,6 +865,8 @@ def _public(r):
     keep = ("id", "project", "actions", "resources", "reason", "status", "note", "requester", "created_at", "decided_at",
             "suggested_hours", "expires_at")
     out = {k: r.get(k) for k in keep}
+    if r.get("replaces"):
+        out["replaces"] = r["replaces"]
     if r.get("grants"):  # several grants: actions and resources above are their union
         out["grants"] = [{k: g[k] for k in ("n", "sid", "actions", "resources", "suggested_hours", "expires_at", "ended")}
                          for g in policy.grants_of(r)]
@@ -846,6 +885,29 @@ def _ended(r, ns, how):
     else:
         status = "expired" if all(g["ended"] == "expired" for g in grants) else "revoked"
     return (status, grants), {**r, "status": status, "grants": grants}
+
+
+def _refuse(problem):
+    raise BrokerError(problem)
+
+
+def _replaced(sids, approved):
+    """({request id: grant numbers, or None for all of them} of the grants these Sids name that are
+    live in the approved requests, [the Sids that name no live grant]). Req<id> on a request with
+    several grants names all of them, as in a revoke."""
+    found, missing = {}, []
+    for x in sids:
+        ref = policy.parse_sid(x)
+        r = next((r for r in approved if ref and r["id"] == ref[0]), None)
+        live = policy.live_grants(r) if r else []
+        ns = None if live and r.get("grants") and ref[1] is None else [g["n"] for g in live if g["sid"] == x]
+        if ns == []:
+            missing.append(x)
+        elif ns is None or found.get(ref[0], []) is None:
+            found[ref[0]] = None
+        else:
+            found[ref[0]] = sorted(set(found.get(ref[0], []) + ns))
+    return found, missing
 
 
 def _grant_names(r, ns):

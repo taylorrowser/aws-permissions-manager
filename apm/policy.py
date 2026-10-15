@@ -499,3 +499,13 @@ def without_sid(policy, statement_sid):
 
 def dumps(policy):
     return json.dumps(policy, separators=(",", ":"))
+
+
+def size_problem(project, document, names=None):
+    """Why IAM would refuse this grants document for being too big (it counts compact JSON), naming
+    the policy and how far over it is, or "" if it fits. Checked before every write and on the card."""
+    size = len(dumps(document))
+    if size <= MAX_INLINE_POLICY_CHARS:
+        return ""
+    return (f"the inline policy {GRANTS_POLICY} on role {role_name(project, names)} would be "
+            f"{size:,} characters, {size - MAX_INLINE_POLICY_CHARS:,} over the {MAX_INLINE_POLICY_CHARS:,}-character limit")

@@ -79,10 +79,11 @@ class Store:
 
     # ---------- requests ----------
 
-    def add(self, project, actions, resources, reason, requester="", suggested_hours=None, grants=None):
+    def add(self, project, actions, resources, reason, requester="", suggested_hours=None, grants=None, replaces=None):
         """grants: for a request with several grants (2-9), [{"actions", "resources", "suggested_hours"
         (optional)}]. Each is stored with its number n, its end and whether it ended; the request's
-        own actions and resources are then their union, for listing."""
+        own actions and resources are then their union, for listing. replaces: Sids of approved grants
+        of the project that approving this request revokes."""
         extra = {"suggested_hours": suggested_hours} if suggested_hours is not None else {}
         if grants:
             extra = {"grants": [{"n": n, "actions": g["actions"], "resources": g["resources"], "expires_at": 0,
@@ -91,6 +92,8 @@ class Store:
                                 for n, g in enumerate(grants, 1)]}
             actions = sorted({a for g in grants for a in g["actions"]})
             resources = sorted({x for g in grants for x in g["resources"]})
+        if replaces:
+            extra["replaces"] = list(replaces)
         rid = int(self.t.update_item(
             Key={"pk": "counter#request"}, UpdateExpression="ADD n :one",
             ExpressionAttributeValues={":one": 1}, ReturnValues="UPDATED_NEW")["Attributes"]["n"])
@@ -322,5 +325,7 @@ def digest(r):
     parts = [r["id"], r["project"], r["actions"], r["resources"], r["reason"]]
     if r.get("grants"):  # which grant asks for what
         parts.append([[g["n"], g["actions"], g["resources"]] for g in r["grants"]])
+    if r.get("replaces"):  # which grants approving it revokes
+        parts.append(r["replaces"])
     body = json.dumps(parts)
     return hashlib.sha256(body.encode()).hexdigest()

@@ -83,6 +83,14 @@ def seed(app):
           "Check which assets are already uploaded before syncing.", "macbook")
     s.add("website", ["s3:PutBucketPolicy"], ["arn:aws:s3:::example-site"],
           "Let CloudFront read the bucket through an origin access control.", "macbook")
+    # Size checks: a project whose policy is near IAM's limit. One more is too big to approve; the
+    # same grants replacing the old ones fit, and the card lists what they replace.
+    media = [f"arn:aws:s3:::media-uploads-{n}/*" for n in range(160)]
+    old = s.add("media", ["s3:GetObject"], media, "Serve uploaded media to the transcoder.", "macbook")
+    decide(old)
+    s.add("media", ["s3:PutObject", "s3:GetObject"], media, "Write transcoded renditions next to each upload.", "macbook")
+    s.add("media", ["s3:PutObject", "s3:GetObject"], media, "Write transcoded renditions next to each upload.", "macbook",
+          replaces=[f"Req{old}"])
     # A stack write approved before its stack had a stored role: Projects shows it blocked.
     decide(s.add("infra", ["cloudformation:UpdateStack"], ["arn:aws:cloudformation:us-east-1:111122223333:stack/web-*/*"],
                  "Update the web stack's parameters.", "macbook"))
