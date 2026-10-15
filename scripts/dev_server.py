@@ -2,9 +2,9 @@
 
     .venv/bin/python scripts/dev_server.py [--port 8765] [--empty]
 
-Open http://localhost:8765/dev/login to sign in as the fake owner. Seeds a few requests, a project,
-an API key and a connect request unless --empty. Push works for real if the browser supports it:
-the server generates throwaway VAPID keys at start-up.
+Open http://localhost:8765/dev/login to sign in as the fake owner. Seeds pending requests of every
+risk, enough decided ones to page, a project, an API key and a connect request unless --empty. Push
+works for real if the browser supports it: the server generates throwaway VAPID keys at start-up.
 """
 import argparse
 import json
@@ -36,12 +36,26 @@ def make_app(port, stage):
 def seed(app):
     s = app.store
     s.create_key("macbook")
+
+    def decide(rid, op="approve"):
+        app.decide({"op": op, "id": str(rid), "digest": s.get(rid)["digest"]})
+
     first = s.add("website", ["s3:GetObject", "s3:PutObject"], ["arn:aws:s3:::example-site/*"],
                   "Upload the built site to the bucket.", "macbook")
-    app.decide({"op": "approve", "id": str(first), "digest": s.get(first)["digest"]})
+    decide(first)
+    for i in range(12):  # enough history for Decided to page
+        rid = s.add("reports", ["athena:StartQueryExecution", "athena:GetQueryResults"], ["*"],
+                    f"Run the weekly usage report ({i + 1}).", "macbook")
+        decide(rid, "reject" if i % 3 else "approve")
     s.add("website", ["cloudfront:CreateInvalidation"], ["*"],
           "Invalidate the CDN after deploying so visitors see the new pages.", "macbook")
     s.add("data-pipeline", ["dynamodb:*"], ["*"], "Create and manage tables for the nightly import job.", "macbook")
+    s.add("orders", ["dynamodb:PutItem", "dynamodb:UpdateItem"], ["arn:aws:dynamodb:us-east-1:111122223333:table/orders"],
+          "Write order status updates from the fulfilment worker.", "macbook")
+    s.add("website", ["s3:GetObject", "s3:ListBucket"], ["arn:aws:s3:::example-site", "arn:aws:s3:::example-site/*"],
+          "Check which assets are already uploaded before syncing.", "macbook")
+    s.add("website", ["s3:PutBucketPolicy"], ["arn:aws:s3:::example-site"],
+          "Let CloudFront read the bucket through an origin access control.", "macbook")
     s.add_connect("codex-cloud", "ab" * 32, "apm_abcdef", "203.0.113.7 apm-client/1.0")
 
 
