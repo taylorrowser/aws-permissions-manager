@@ -349,7 +349,8 @@ class App:
                 grants = policy.grants_of(r)
                 hours = {g["n"]: policy.duration(form.get(f"hours-{g['n']}", "0")) for g in grants}  # one picker each
                 approved, replaces = self.store.approved(project), r.get("replaces") or []
-                changes, new, problem = self.approval(r, hours, approved)
+                changes, new, after = self.approval(r, hours, approved)
+                problem = policy.size_problem(project, after)
                 gone = ", ".join(x for x in replaces if x not in _replaced(replaces, approved)[1])  # those still live
                 ids, detail = [r["id"]] + [after["id"] for _, after in changes], f"replaces {gone}" if gone else ""
                 if problem:  # the size check comes first, before anything changes
@@ -469,8 +470,8 @@ class App:
     def approval(self, r, hours, approved, now=None):
         """What approving pending request r, each grant lasting hours[n] (0: permanent), does to its
         project, given the project's approved requests: (the changes (see _ended) that revoke the grants
-        r replaces, r as approved, and why IAM would refuse the result for its size, or ""). The grants
-        r replaces are left out of the size check."""
+        r replaces, r as approved, and the grants document that results, to size-check; the grants r
+        replaces are left out of it)."""
         now = int(now or time.time())
         ends = {n: now + h * 3600 if h else 0 for n, h in hours.items()}
         if r.get("grants"):
@@ -480,7 +481,7 @@ class App:
         ending = _replaced(r.get("replaces") or [], approved)[0]
         changes = {old["id"]: _ended(old, ending[old["id"]], "revoked") for old in approved if old["id"] in ending}
         after = [changes[old["id"]][1] if old["id"] in changes else old for old in approved]
-        return list(changes.values()), new, policy.size_problem(r["project"], policy.grants_document(after + [new]))
+        return list(changes.values()), new, policy.grants_document(after + [new])
 
     def iam_change(self, op, project, actor, write, targets=(), detail=""):
         """Run `write`, one IAM rewrite of the project's role that returns the policy document it

@@ -525,14 +525,27 @@ def request_pane(app, r, projects, error=""):
         wild = ", ".join(a for g in grants for a in g["actions"] if "*" in a) or "every resource"
         confirm = f"Approve {LABELS[level].lower()} ({wild}) for {project}?" if level in ("full", "broad") else ""
         back = f"/requests/{rid}"
-        # The same size check as at approval, with each grant's duration as the picker starts.
-        too_big = app.approval(r, {g["n"]: g["suggested_hours"] or 0 for g in grants}, held)[2]
+        # The same size check as at approval. With every grant permanent it's as small as it gets;
+        # if that doesn't fit, no time limit will. Each time limit adds a fixed amount, so the page
+        # script re-checks as the pickers change (data-size), starting from the agent's suggestions.
+        smallest = policy.size(app.approval(r, {g["n"]: 0 for g in grants}, held)[2])
+        too_big = policy.size_message(project, smallest)
         if too_big:
             out.append(_too_big(r, too_big, error, back))
             return "".join(out) + "</section>"
-        out.append(f'<div class=pane-actions><div id=flash-slot>{_flash(error)}</div><div class=decide>'
-                   + _form({"op": "approve", "id": rid, "digest": r["digest"]}, "Approve", "approve", confirm, back,
-                           form_id=f"approve-{rid}")
+        timed = smallest + policy.CONDITION_CHARS * sum(1 for g in grants if g["suggested_hours"])
+        over = policy.size_message(project, timed)
+        approve = _form({"op": "approve", "id": rid, "digest": r["digest"]}, "Approve", "approve", confirm, back,
+                        form_id=f"approve-{rid}")
+        approve = approve.replace(f' id="approve-{rid}"', f' id="approve-{rid}" data-size="{smallest}" '
+                                  f'data-per-limit="{policy.CONDITION_CHARS}" data-limit="{policy.MAX_INLINE_POLICY_CHARS}" '
+                                  f'data-policy="{e(policy.GRANTS_POLICY)} on role {e(policy.role_name(project))}"', 1)
+        if over:
+            approve = approve.replace('<button class="approve">', '<button class="approve" disabled>', 1)
+        warn = _over_limits(over) if over else ""
+        out.append(f'<div class=pane-actions><div id=flash-slot>{_flash(error)}</div>'
+                   f'<p class="explain size-warn" id="size-{rid}"{"" if over else " hidden"}>{warn}</p><div class=decide>'
+                   + approve
                    + _form({"op": "reject", "id": rid, "digest": r["digest"]}, "Reject", "reject", "", back)
                    + "</div></div>")
     return "".join(out) + "</section>"
@@ -551,6 +564,11 @@ def _replaces(r, held, pending):
         items.append(f'<li><code>{e(x)}</code>{link}{" " + line if line else ""}</li>')
     lead = "Approving revokes these first:" if pending else "Replaces:"
     return f'<section class=replaces><h3>Replaces</h3><p class=muted>{lead}</p><ul>{"".join(items)}</ul></section>'
+
+
+def _over_limits(problem):
+    """Approve is off until the chosen time limits fit (static/app.js words it the same way)."""
+    return f"Too big with these time limits: {e(problem)}. Make a grant permanent to approve."
 
 
 def _too_big(r, problem, error, back):

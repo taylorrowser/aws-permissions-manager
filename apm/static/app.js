@@ -176,6 +176,16 @@ function keyCommand(e, typing) {
   return { ArrowDown: "next", j: "next", ArrowUp: "prev", k: "prev", a: "approve", r: "reject" }[e.key] || null;
 }
 
+// The size check on the card (pages.request_pane): the grants policy with every grant permanent is
+// `size` characters, and each time-limited grant adds `perLimit`. Returns the warning to show, or "".
+function overLimit(size, perLimit, limit, policyName, hours) {
+  const total = size + perLimit * hours.filter((h) => h !== "0").length;
+  if (total <= limit) return "";
+  const n = (x) => x.toLocaleString("en-US");
+  return `Too big with these time limits: the inline policy ${policyName} would be ${n(total)} characters, ` +
+    `${n(total - limit)} over the ${n(limit)}-character limit. Make a grant permanent to approve.`;
+}
+
 // The row to move to from `current` (an id, or null for none) in `ids`.
 function step(ids, current, dir) {
   if (!ids.length) return null;
@@ -186,7 +196,8 @@ function step(ids, current, dir) {
 
 if (typeof module !== "undefined") {
   module.exports = { isIOS, pushState, deniedHelp, keyBytes, sameKey, legacyTarget, relativeTime, rotateIfKeyChanged,
-    canRefresh, createPager, isInboxPath, afterSubmit, onHistory, digestToSubmit, keepDecided, keyCommand, step };
+    canRefresh, createPager, isInboxPath, afterSubmit, onHistory, digestToSubmit, keepDecided, keyCommand, step,
+    overLimit };
 }
 
 // ---------- page behaviour ----------
@@ -551,6 +562,19 @@ if (typeof document !== "undefined") {
         if (button && button.isConnected) { button.disabled = false; button.textContent = label; }
       }
     });
+  });
+
+  // A duration picker changed: re-check the size, and only offer Approve if it fits.
+  document.addEventListener("change", (event) => {
+    const form = event.target.form;
+    if (!form || !form.dataset.size) return;
+    const d = form.dataset;
+    const hours = [...form.elements].filter((el) => el.tagName === "SELECT").map((el) => el.value);
+    const warning = overLimit(Number(d.size), Number(d.perLimit), Number(d.limit), d.policy, hours);
+    // getAttribute: form.id would be the form's hidden "id" input.
+    const slot = $(form.getAttribute("id").replace("approve-", "size-")), button = form.querySelector("button.approve");
+    if (slot) { slot.textContent = warning; slot.hidden = !warning; }
+    if (button) button.disabled = Boolean(warning);
   });
 
   document.addEventListener("click", async (event) => {

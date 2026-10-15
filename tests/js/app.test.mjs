@@ -241,3 +241,12 @@ test("while a row is loading the pager says so, so a and r can't decide the requ
   assert.equal(await failed, false);
   assert.equal(pager.loading, false);
 });
+
+test("the card's size check counts each time-limited grant", () => {
+  const over = (hours) => app.overLimit(10000, 70, 10240, "apm-grants on role apm-x", hours);
+  assert.equal(over(["0", "0", "0", "0"]), "");
+  assert.equal(over(["1", "24", "168", "0"]), "");
+  assert.equal(over(["1", "24", "168", "3"]),
+    "Too big with these time limits: the inline policy apm-grants on role apm-x would be 10,280 characters, " +
+    "40 over the 10,240-character limit. Make a grant permanent to approve.");
+});

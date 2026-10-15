@@ -1227,6 +1227,20 @@ class SizeAndReplacesTests(unittest.TestCase):
         self.assertIn("<code>Req1</code>", page)
         self.assertIn("Approving revokes these first", page)
 
+    def test_the_card_checks_the_chosen_time_limits(self):
+        self.approve(self.big()["id"])
+        r = self.big("s3:PutObject", suggested_hours=1)
+        smallest = policy.size(self.app.approval(self.app.store.get(r["id"]), {1: 0}, self.app.store.approved("myapp"))[2])
+        with mock.patch.object(policy, "MAX_INLINE_POLICY_CHARS", smallest + 10):  # fits only if permanent
+            page = self.card(r["id"])
+            self.assertNotIn("Too big to approve", page)  # making it permanent fits, so no reject-only card
+            self.assertIn(f'data-size="{smallest}" data-per-limit="{policy.CONDITION_CHARS}"', page)
+            self.assertIn('<button class="approve" disabled>', page)
+            self.assertIn("Too big with these time limits: the inline policy apm-grants on role apm-myapp", page)
+            self.assertIn("62+over", self.app.action({"op": "approve", "id": str(r["id"]), "digest": self.app.store.get(r["id"])["digest"],
+                                                      "hours-1": "1"}, "owner").headers["Location"])
+            self.assertIn("Approved", self.approve(r["id"], **{"hours-1": "0"}))
+
     def test_approving_revokes_the_replaced_grants_then_approves(self):
         self.approve(self.big()["id"])
         status, two = self.ask(grants=[{"actions": ["sqs:SendMessage"], "resources": ["arn:aws:sqs:us-east-1:1:q"]},
@@ -1256,16 +1270,19 @@ class SizeAndReplacesTests(unittest.TestCase):
     def test_a_refused_approval_that_replaced_grants_goes_back_to_pending(self):
         self.approve(self.big()["id"])
         r = self.big("s3:PutObject", replaces=["Req1"])
-        from apm.broker import BrokerError
-        self.app.broker.sync = mock.Mock(side_effect=BrokerError("refused: no"))
+        class LimitExceeded(Exception):  # what boto3 raises when IAM rejects the document
+            response = {"Error": {"Code": "LimitExceeded"}}
+        self.iam.put_role_policy = mock.Mock(side_effect=LimitExceeded("Maximum policy size exceeded"))
         resp = self.owner_post({"op": "approve", "id": str(r["id"]), "digest": self.app.store.get(r["id"])["digest"]})
         msg = parse_qs(urlparse(resp.headers["Location"]).query)["msg"][0]
-        self.assertIn("refused: no. It's pending again, but the grants it replaces (Req1) were already revoked and "
-                      "IAM may still hold them: open Projects and tap Re-apply decisions for myapp.", msg)
+        self.assertIn("IAM refused the policy for apm-myapp (LimitExceeded): Maximum policy size exceeded. It's pending "
+                      "again, but the grants it replaces (Req1) were already revoked and IAM may still hold them: open "
+                      "Projects and tap Re-apply decisions for myapp.", msg)
         self.assertEqual(self.app.store.get(r["id"])["status"], "pending")
         self.assertEqual(self.app.store.get(1)["status"], "revoked")
         self.assertEqual(list(self.statements()), ["Req1"])  # IAM still holds it until Re-apply
-        del self.app.broker.sync
+        self.assertEqual(self.app.store.events()[-1]["outcome"], "refused")
+        del self.iam.put_role_policy
         self.app.decide({"op": "sync_project", "project": "myapp"})
         self.assertEqual(self.statements(), {})
 

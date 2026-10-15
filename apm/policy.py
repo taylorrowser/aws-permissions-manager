@@ -501,10 +501,22 @@ def dumps(policy):
     return json.dumps(policy, separators=(",", ":"))
 
 
+# What a time limit adds to a statement. Every end is written the same way, so it's a constant.
+CONDITION_CHARS = len(dumps(statement("x", [], [], 1))) - len(dumps(statement("x", [], [])))
+
+
+def size(document):
+    """A policy's size as IAM counts it: compact JSON."""
+    return len(dumps(document))
+
+
 def size_problem(project, document, names=None):
-    """Why IAM would refuse this grants document for being too big (it counts compact JSON), naming
-    the policy and how far over it is, or "" if it fits. Checked before every write and on the card."""
-    size = len(dumps(document))
+    """Why IAM would refuse this grants document for being too big, naming the policy and how far
+    over it is, or "" if it fits. Checked before every write and on the card."""
+    return size_message(project, size(document), names)
+
+
+def size_message(project, size, names=None):
     if size <= MAX_INLINE_POLICY_CHARS:
         return ""
     return (f"the inline policy {GRANTS_POLICY} on role {role_name(project, names)} would be "
