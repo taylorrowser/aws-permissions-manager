@@ -527,6 +527,17 @@ class AuditTests(unittest.TestCase):
         self.assertIn("Approved", page)
         self.assertNotIn("Revoked", page)  # request 2 kept its grant
 
+    def test_a_grant_restored_by_another_approval_shows_in_its_history(self):
+        real_put = self.iam.put_role_policy
+        self.iam.put_role_policy = mock.Mock(side_effect=RuntimeError("throttled"))
+        self.approve(self.add())  # recorded as approved, but IAM never got it
+        self.iam.put_role_policy = real_put
+        self.approve(self.add())
+        last = self.events()[-1]
+        self.assertEqual((last["targets"], last["request_ids"], last["agent_keys"]), ([2], [1, 2], ["laptop"]))
+        page = self.app(web.Request("GET", "/requests/1", cookies=session_cookie(self.app))).body
+        self.assertIn("Grant added (approval)", page)
+
     def test_a_failed_live_read_refuses_the_change_before_writing(self):
         self.approve(self.add())
         self.iam.get_role_policy = mock.Mock(side_effect=TimeoutError("read timed out"))

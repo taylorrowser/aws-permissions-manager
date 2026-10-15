@@ -404,7 +404,7 @@ class App:
         event = {"op": op, "outcome": "applied", "error": "", "project": project, "account": self.broker.account,
                  "role_arn": policy.role_arn(self.broker.account, project), "targets": targets,
                  "request_ids": targets, "agent_keys": [], "actor": actor, "at": int(time.time()),
-                 "grants": [], "policy_sha256": ""}
+                 "previous_grants": [], "grants": [], "policy_sha256": ""}
         if detail:
             event["detail"] = detail
         try:
@@ -415,12 +415,13 @@ class App:
             except Exception as e:
                 raise BrokerError(f"couldn't read {project}'s current grants ({type(e).__name__}); "
                                   "nothing was changed, try again") from e
-            event["request_ids"] = sorted(set(targets) | {
-                int(s["Sid"][3:]) for s in live if s.get("Sid", "").startswith("Req") and s["Sid"][3:].isdigit()})
+            event["previous_grants"] = [s.get("Sid", "") for s in live]
+            event["request_ids"] = sorted(set(targets) | _request_ids(event["previous_grants"]))
             doc = write()
             if doc:
                 event["grants"] = [s.get("Sid", "") for s in doc["Statement"]]
                 event["policy_sha256"] = hashlib.sha256(policy.dumps(doc).encode()).hexdigest()
+                event["request_ids"] = sorted(set(event["request_ids"]) | _request_ids(event["grants"]))
         except Exception as e:
             event["outcome"] = "refused" if isinstance(e, BrokerError) else "failed"
             event["error"] = f"{type(e).__name__}: {e}"[:300]
@@ -640,6 +641,10 @@ def state_version(store):
              [(s["pk"], s.get("last_ok_at"), s.get("last_error_at"), s.get("failures")) for s in store.subscriptions()]]
     pending = sum(1 for r in requests if r["status"] == "pending") + len(connects)
     return hashlib.sha256(json.dumps(state, default=str).encode()).hexdigest()[:16], pending
+
+
+def _request_ids(sids):
+    return {int(s[3:]) for s in sids if s.startswith("Req") and s[3:].isdigit()}
 
 
 def _public(r):

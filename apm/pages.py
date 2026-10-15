@@ -318,19 +318,19 @@ EVENT_LABELS = {"approve": ("Approved", "Approval"), "revoke": ("Revoked", "Revo
 
 
 def history(rid, events):
-    """The IAM changes made for this request, plus any change for another request that removed
-    this one's grant (for example a re-apply after a failed revoke). See App.iam_change."""
-    rows = []
+    """The IAM changes made for this request, plus any change for another request that added or
+    removed this one's grant (for example a re-apply after a failed revoke). See App.iam_change."""
+    rows, sid = [], policy.sid(rid)
     for ev in events:
         done, tried = EVENT_LABELS.get(ev["op"], (ev["op"], ev["op"]))
         if rid in ev.get("targets", []):
             what = done if ev["outcome"] == "applied" else f'{tried} {ev["outcome"]}'
             if ev.get("detail"):
                 what += f': {ev["detail"]}'
-        elif ev["outcome"] == "applied" and policy.sid(rid) not in ev.get("grants", []):
-            what = f"Grant removed ({tried.lower()})"
+        elif ev["outcome"] != "applied" or (sid in ev.get("previous_grants", [])) == (sid in ev.get("grants", [])):
+            continue  # another request's change that left this grant as it was
         else:
-            continue  # rewritten alongside another request's change, and kept
+            what = f'Grant {"added" if sid in ev["grants"] else "removed"} ({tried.lower()})'
         error = f'<br><span class=muted>{e(ev["error"])}</span>' if ev.get("error") else ""
         rows.append(f'<li><span><b>{e(what)}</b> <span class=muted>by {e(ev.get("actor") or "unknown")}</span>{error}</span>'
                     f'<span class=right>{_time(ev["at"])}</span></li>')
