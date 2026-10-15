@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
-from apm import pages, push, web
+from apm import pages, policy, push, web
 from test_apm import ORIGIN, OWNER, make_app, session_cookie
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -720,3 +720,14 @@ class ProjectsScreenTests(unittest.TestCase):
         self.assertNotIn('value="narrow"', page)
         self.assertNotIn('value="revoke"', page)
         self.assertNotIn("/usage?project=", page)  # no usage audit in this deployment
+
+    def test_a_flagged_grant_iam_never_got_keeps_its_time_limit_and_row(self):
+        app, iam, _ = make_app()
+        rid = app.store.add("app", ["s3:GetObject"], self.BUCKET, "read exports", "laptop")
+        app.decide({"op": "approve", "id": str(rid), "digest": app.store.get(rid)["digest"], "hours-1": "3"})
+        ends = policy.iso(app.store.get(rid)["expires_at"])
+        iam.policies.clear()  # IAM lost it, and it would be refused now
+        with mock.patch.object(app, "flagged", return_value={f"Req{rid}": ["refused for the test"]}):
+            page = app(web.Request("GET", "/projects", cookies=session_cookie(app))).body
+        self.assertIn(f'id="{pages.row_id("app", "s3", self.BUCKET, ends)}"', page)
+        self.assertIn("data-ends", page)

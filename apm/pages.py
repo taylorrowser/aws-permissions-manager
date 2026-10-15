@@ -803,7 +803,8 @@ def projects_page(app, owner, msg=""):
         # A flagged approval IAM never received (its write failed) still blocks credentials: list it
         # too, so it can be revoked.
         held = {s.get("Sid", "") for s in statements}
-        shown = statements + [policy.statement(g["sid"], g["actions"], g["resources"]) for r in store.approved(project)
+        shown = statements + [policy.statement(g["sid"], g["actions"], g["resources"], g["expires_at"])
+                              for r in store.approved(project)
                               for g in policy.live_grants(r) if g["sid"] in flagged and g["sid"] not in held]
         backing = {s.get("Sid", ""): _backing(store, s) for s in shown}
         warn = ('<span class=badge>IAM mismatch</span>' if not synced else "") + \
