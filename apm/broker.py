@@ -39,7 +39,8 @@ class Broker:
         return json.loads(doc) if isinstance(doc, str) else doc
 
     def sync(self, project, approved):
-        """Make the role's grants exactly the given approved requests."""
+        """Make the role's grants exactly the given approved requests. Returns the document written,
+        or None when no grants are left and the policy was deleted."""
         new = policy.grants_document(approved)
         name = policy.role_name(project)
         with _lock:
@@ -49,12 +50,13 @@ class Broker:
                 except Exception as e:
                     if not _is_missing(e):
                         raise
-                return
+                return None
             body = policy.dumps(new)
             if len(body) > policy.MAX_INLINE_POLICY_CHARS:
                 raise BrokerError(f"project {project} would exceed the {policy.MAX_INLINE_POLICY_CHARS}-char inline policy limit; revoke or consolidate grants first")
             self._ensure_role(project)
             self.iam.put_role_policy(RoleName=name, PolicyName=policy.GRANTS_POLICY, PolicyDocument=body)
+            return new
 
     def remove_project(self, project):
         """Delete every inline policy, then the role. Succeeds only once the role is gone."""

@@ -161,6 +161,6 @@ Then reload the dashboard on a signed-in device: it should ask you to sign in ag
 
 ## Where to look
 
-- **Logs:** CloudWatch log group `/aws/lambda/apm`, kept 90 days. Push delivery logs one JSON line per device (`"event": "push"`). Errors are printed with a traceback, and the request still gets a 500 page.
+- **Logs:** CloudWatch log group `/aws/lambda/apm`, kept 90 days. Push delivery logs one JSON line per device (`"event": "push"`). Every IAM change (approve, revoke, re-apply, project removal) logs one `"event": "iam_change"` line with its outcome (`applied`, `refused` or `failed`), the request ids it touched (including any `Req<id>` grants IAM held just before) and the SHA-256 of the policy written, then saves the same record to the table, where it feeds each request's History. If that save fails, an `"event": "audit_store_failed"` line follows, and the change itself still stands. Errors are printed with a traceback, and the request still gets a 500 page.
 - **Health:** `apm-admin smoke --url https://apm.taylorrowser.com`, or `curl https://apm.taylorrowser.com/healthz`.
 - **What's deployed:** `aws s3 cp s3://$BUCKET/deployments/prod/current.json -`.

@@ -308,7 +308,29 @@ def request_page(app, owner, r, msg="", st=None):
                 f'<p class=reason>{e(r["reason"])}</p>'
                 f'<p class=line>{_risk_chip(r["actions"], r["resources"])}<span class=muted>{e(_summary(r["actions"], r["resources"]))}</span></p>'
                 + request_body(app, r, app.store.projects(), back=f"/requests/{rid}") + "</article>")
+    body.append(history(app.store.events(rid)))
     return layout(app, owner, "requests", f"Request #{rid}", "".join(body), st, msg, back=("/", "Requests"))
+
+
+# What each IAM change is called in a request's History: (done, attempted).
+EVENT_LABELS = {"approve": ("Approved", "Approval"), "revoke": ("Revoked", "Revoke"),
+                "sync_project": ("Re-applied", "Re-apply"), "remove_project": ("Project deleted", "Project deletion")}
+
+
+def history(events):
+    """Every IAM change that named this request, oldest first (see App.iam_change)."""
+    if not events:
+        return ""
+    out = ['<h2 class=section>History</h2><ul class="list history">']
+    for ev in events:
+        done, tried = EVENT_LABELS.get(ev["op"], (ev["op"], ev["op"]))
+        what = done if ev["outcome"] == "applied" else f'{tried} {ev["outcome"]}'
+        if ev.get("detail"):
+            what += f': {ev["detail"]}'
+        error = f'<br><span class=muted>{e(ev["error"])}</span>' if ev.get("error") else ""
+        out.append(f'<li><span><b>{e(what)}</b> <span class=muted>by {e(ev.get("actor") or "unknown")}</span>{error}</span>'
+                   f'<span class=right>{_time(ev["at"])}</span></li>')
+    return "".join(out) + "</ul>"
 
 
 def connect_page(app, owner, code, msg=""):

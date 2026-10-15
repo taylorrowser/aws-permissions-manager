@@ -122,6 +122,18 @@ class Store:
                 raise Conflict(f"request #{request_id} is no longer {expect}")
             raise
 
+    # ---------- audit events: one per IAM change (see App.iam_change) ----------
+
+    def add_event(self, event):
+        pk = f"event#{time.time_ns()}#{secrets.token_hex(4)}"
+        self.t.put_item(Item={**event, "pk": pk, "kind": "event"})
+        return pk
+
+    def events(self, request_id=None):
+        """Oldest first; with a request id, only the events that name it."""
+        rows = [e for e in self._scan("event") if request_id is None or int(request_id) in e.get("request_ids", [])]
+        return sorted(rows, key=lambda e: e["pk"])
+
     # ---------- agent API keys (only a hash is stored) ----------
 
     def create_key(self, name):
